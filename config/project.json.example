@@ -1,0 +1,37 @@
+{
+  "project_full_name": "Optimization of Attenuation Correction for FDG PET-MR Imaging",
+  "project_common_name": "FDG-PET",
+  "project_alias_4_characters": "FDGP",
+  "modalities": ["Clinical", "Imaging"],
+
+  "clinical_instruments": [
+    "fdg_pet",
+    "fdg_pet_scan_parameter_form"
+  ],
+
+  "imaging_modalities": [
+    "FDG-PET-CT",
+    "FDG-PET-MR"
+  ],
+
+  "data_access": {
+    "mount_enabled": true,
+    "mount_path": "/data/archimedes/FDG-PET"
+  },
+
+  "notification_emails": {
+    "clinical": {
+      "on_success": ["clinical_team@loris.ca"],
+      "on_error": ["clinical_team@loris.ca"]
+    },
+    "imaging": {
+      "on_success": ["imaging_team@loris.ca"],
+      "on_error": ["imaging_team@loris.ca"]
+    }
+  },
+
+  "logging": {
+    "level": "INFO",
+    "log_path": "/data/roject_collection_1/project_1/logs"
+  }
+}

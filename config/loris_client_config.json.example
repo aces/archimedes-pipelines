@@ -1,0 +1,57 @@
+{
+  "api": {
+    "base_url": "https://server_url/api/v0.0.4-dev",
+    "username": "api_user",
+    "password": "SuperSecurePassword123",
+    "token_expiry_minutes": 55
+  },
+
+  "database": {
+    "host": "localhost",
+    "name": "loris",
+    "user": "lorisuser",
+    "password": "db_password"
+  },
+
+  "data_access": {
+    "mode": "local",
+    "base_path": "/data"
+  },
+
+  "logging": {
+    "level": "INFO",
+    "log_dir": "/opt/loris-php-client/logs"
+  },
+
+  "notification_defaults": {
+    "smtp": {
+      "host": "smtp.uottawa.ca",
+      "port": 587,
+      "username": "loris-notify",
+      "password": "smtp_password",
+      "from": "noreply@loris.ca"
+    },
+    "default_on_success": ["data-team@loris.ca"],
+    "default_on_error": ["admin@loris.ca"]
+  },
+
+  "collections": [
+    {
+      "name": "project_collection_1",
+      "base_path": "/data/project_collection_1,
+      "enabled": true,
+      "projects": [
+        {"name": "project_1", "enabled": true},
+        {"name": "project_2", "enabled": true}
+      ]
+    },
+    {
+      "name": ""project_collection_2",
+      "base_path": "/data/project_collection_2",
+      "enabled": true,
+      "projects": [
+        {"name": "project_3", "enabled": true}
+      ]
+    }
+  ]
+}
