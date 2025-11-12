@@ -23,17 +23,16 @@
     "log_dir": "/opt/loris-php-client/logs"
   },
 
-  "notification_defaults": {
-    "smtp": {
-      "host": "smtp.example.org",
-      "port": 587,
-      "username": "loris-notify",
-      "password": "smtp_password_here",
-      "from": "noreply@example.org"
+  "notifications": {
+      "enabled": true,
+      "modalities": {
+        "clinical": { "enabled": true }
+      },
+      "smtp": {
+        "use_native_mail": true,
+        "from": "noreply@server.ca"
+      }
     },
-    "default_on_success": ["data-team@example.org"],
-    "default_on_error": ["admin@example.org"]
-  },
 
   "collections": [
     {

@@ -307,7 +307,7 @@ class ClinicalPipeline
                 if (isset($result['idMapping']) && !empty($result['idMapping']) && $saved > 0) {
                     $newCandidates = count($result['idMapping']);
                     $this->stats['candidates_created'] += $newCandidates;
-                    $this->logger->info("    New Records Created: {$newCandidates}");
+                    $this->logger->info("    New candidates created: {$newCandidates}");
 
                     if ($this->verbose) {
                         foreach ($result['idMapping'] as $mapping) {
@@ -451,28 +451,68 @@ class ClinicalPipeline
     }
 
     /**
-     * Send project notification
+     * Send project notification for clinical modality
+     *
+     * Sends email based on success OR failure for this modality:
+     * - If ANY files failed → send ERROR email
+     * - If ALL successful → send SUCCESS email
+     * - Respects enable/disable flags at all levels
      */
     private function sendProjectNotification(array $project, array $projectStats): void
     {
         $projectName = $project['project_common_name'];
-        $recipients = $project['notification_emails']['clinical'] ?? [];
+        $modality = 'clinical';
 
-        if ($projectStats['failed'] > 0) {
-            $this->notification->sendError(
-                'clinical',
-                $projectName,
-                "Processing completed with errors",
-                $projectStats,
-                $recipients['on_error'] ?? []
-            );
-        } elseif ($projectStats['success'] > 0) {
-            $this->notification->sendSuccess(
-                'clinical',
-                $projectName,
-                $projectStats,
-                $recipients['on_success'] ?? []
-            );
+        // Get notification configuration for this modality
+        $notificationConfig = $project['notification_emails'][$modality] ?? [];
+
+        // Check if notifications are enabled for this modality in project config
+        if (isset($notificationConfig['enabled']) && $notificationConfig['enabled'] === false) {
+            $this->logger->debug("Notifications disabled for {$modality} in project config");
+            return;
+        }
+
+        // Nothing to notify about if nothing was processed
+        $totalProcessed = ($projectStats['total'] ?? 0);
+        if ($totalProcessed === 0) {
+            $this->logger->debug("No files processed for {$modality}, skipping notification");
+            return;
+        }
+
+        // Determine if we should send success or error notification
+        $hasFailures = ($projectStats['failed'] ?? 0) > 0;
+        $hasSuccess = ($projectStats['success'] ?? 0) > 0;
+
+        // Priority: Send error notification if there were ANY failures
+        if ($hasFailures) {
+            $recipients = $notificationConfig['on_error'] ?? [];
+            if (!empty($recipients)) {
+                $this->logger->info("Sending error notification for {$modality} to: " . implode(', ', $recipients));
+                $this->notification->sendError(
+                    $modality,
+                    $projectName,
+                    "Clinical processing completed with errors",
+                    $projectStats,
+                    $recipients
+                );
+            } else {
+                $this->logger->debug("No error recipients configured for {$modality}");
+            }
+        }
+        // Send success notification only if ALL processing succeeded (no failures)
+        elseif ($hasSuccess) {
+            $recipients = $notificationConfig['on_success'] ?? [];
+            if (!empty($recipients)) {
+                $this->logger->info("Sending success notification for {$modality} to: " . implode(', ', $recipients));
+                $this->notification->sendSuccess(
+                    $modality,
+                    $projectName,
+                    $projectStats,
+                    $recipients
+                );
+            } else {
+                $this->logger->debug("No success recipients configured for {$modality}");
+            }
         }
     }
 

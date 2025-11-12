@@ -36,10 +36,12 @@
 
   "notification_emails": {
     "clinical": {
+     "enabled": true,
       "on_success": ["clinical_team@example.org"],
       "on_error": ["clinical_team@example.org"]
     },
     "imaging": {
+     "enabled": true,
       "on_success": ["imaging_team@example.org"],
       "on_error": ["imaging_team@example.org"]
     }
