@@ -1,6 +1,6 @@
 {
   "api": {
-    "base_url": "https://example-loris-instance.ca/api/v0.0.4-dev",
+    "base_url": "https://example-loris-instance.ca/",
     "username": "api_user",
     "password": "secure_password_here",
     "token_expiry_minutes": 55

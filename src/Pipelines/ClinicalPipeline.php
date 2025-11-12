@@ -12,7 +12,7 @@ use Psr\Log\LoggerInterface;
 
 /**
  * Clinical Data Ingestion Pipeline
- * 
+ *
  * Priority:
  * 1. Use API endpoints (PRIMARY)
  * 2. Use LORIS PHP library functions (if no API)
@@ -28,7 +28,7 @@ class ClinicalPipeline
     private Notification $notification;
     private bool $dryRun;
     private bool $verbose;
-    
+
     private array $stats = [
         'total' => 0,
         'success' => 0,
@@ -49,15 +49,15 @@ class ClinicalPipeline
         // Initialize logger
         $logLevel = $verbose ? Logger::DEBUG : Logger::INFO;
         $this->logger = new Logger('clinical');
-        
+
         // Create formatter for clean output (no empty [] [])
         $formatter = new CleanLogFormatter();
-        
+
         // Console handler
         $consoleHandler = new StreamHandler('php://stdout', $logLevel);
         $consoleHandler->setFormatter($formatter);
         $this->logger->pushHandler($consoleHandler);
-        
+
         // Add file handler if log directory configured
         if (isset($config['logging']['log_dir'])) {
             $logFile = $config['logging']['log_dir'] . '/clinical_' . date('Y-m-d') . '.log';
@@ -91,7 +91,7 @@ class ClinicalPipeline
     {
         $this->logger->info("=== CLINICAL DATA INGESTION PIPELINE ===");
         $this->logger->info("Started: " . date('Y-m-d H:i:s'));
-        
+
         if ($this->dryRun) {
             $this->logger->info("DRY RUN MODE - No uploads will be performed");
         }
@@ -237,7 +237,7 @@ class ClinicalPipeline
 
         $this->logger->info("\n  Processing: {$instrument}");
         $this->stats['total']++;
-        
+
         // Log file info
         $fileSize = filesize($csvFile);
         $fileSizeMB = round($fileSize / 1024 / 1024, 2);
@@ -279,17 +279,19 @@ class ClinicalPipeline
             if ($result['success'] ?? false) {
                 // Success - log details
                 $this->logger->info("  ✓ Upload successful");
-                
+
                 // Parse message for statistics
+                $saved = 0;
+                $total = 0;
                 if (isset($result['message'])) {
                     if (preg_match('/Saved (\d+) out of (\d+)/', $result['message'], $matches)) {
-                        $saved = $matches[1];
-                        $total = $matches[2];
+                        $saved = (int)$matches[1];
+                        $total = (int)$matches[2];
                         $skipped = $total - $saved;
-                        
-                        $this->stats['rows_uploaded'] += (int)$saved;
-                        $this->stats['rows_skipped'] += (int)$skipped;
-                        
+
+                        $this->stats['rows_uploaded'] += $saved;
+                        $this->stats['rows_skipped'] += $skipped;
+
                         $this->logger->info("    Rows saved: {$saved}/{$total}");
                         if ($skipped > 0) {
                             $this->logger->info("    Rows skipped: {$skipped} (already exist)");
@@ -298,13 +300,15 @@ class ClinicalPipeline
                         $this->logger->info("    " . $result['message']);
                     }
                 }
-                
-                // Log new candidates created
-                if (isset($result['idMapping']) && !empty($result['idMapping'])) {
+
+                // Log new candidates created - only count if rows were actually uploaded
+                // idMapping can contain entries for both new candidates AND new sessions for existing candidates
+                // Only count as "new candidates" if we actually saved new data rows
+                if (isset($result['idMapping']) && !empty($result['idMapping']) && $saved > 0) {
                     $newCandidates = count($result['idMapping']);
                     $this->stats['candidates_created'] += $newCandidates;
-                    $this->logger->info("    New candidates created: {$newCandidates}");
-                    
+                    $this->logger->info("    New Records Created: {$newCandidates}");
+
                     if ($this->verbose) {
                         foreach ($result['idMapping'] as $mapping) {
                             $this->logger->debug("      StudyID {$mapping['ExtStudyID']} → CandID {$mapping['CandID']}");
@@ -313,28 +317,28 @@ class ClinicalPipeline
                 }
 
                 // Archive
-                $this->archiveFile($project, $csvFile, 'clinical');
+                //$this->archiveFile($project, $csvFile, 'clinical');
                 return 'success';
-                
+
             } else {
                 // Upload failed
                 $this->logger->error("  ✗ Upload failed");
-                
+
                 // Track errors
                 $errorEntry = [
                     'instrument' => $instrument,
                     'file' => $csvFile,
                     'errors' => []
                 ];
-                
+
                 // Log error details
                 if (isset($result['message'])) {
                     if (is_array($result['message'])) {
                         $errorCount = count($result['message']);
                         $this->logger->error("    Errors: {$errorCount}");
-                        
+
                         $errorEntry['errors'] = $result['message'];
-                        
+
                         // Log first few errors
                         $maxErrors = 5;
                         foreach (array_slice($result['message'], 0, $maxErrors) as $i => $error) {
@@ -345,7 +349,7 @@ class ClinicalPipeline
                                 $this->logger->error("      " . ($i + 1) . ". " . $error);
                             }
                         }
-                        
+
                         if ($errorCount > $maxErrors) {
                             $remaining = $errorCount - $maxErrors;
                             $this->logger->error("      ... and {$remaining} more error(s)");
@@ -355,7 +359,7 @@ class ClinicalPipeline
                         $this->logger->error("    " . $result['message']);
                     }
                 }
-                
+
                 $this->stats['errors'][] = $errorEntry;
                 return 'failed';
             }
@@ -366,18 +370,18 @@ class ClinicalPipeline
                 $this->logger->debug("    Stack trace:");
                 $this->logger->debug($e->getTraceAsString());
             }
-            
+
             // Track exception in errors
             $this->stats['errors'][] = [
                 'instrument' => $instrument,
                 'file' => $csvFile,
                 'errors' => [$e->getMessage()]
             ];
-            
+
             return 'failed';
         }
     }
-    
+
     /**
      * Count rows in CSV file (excluding header)
      */
@@ -429,7 +433,7 @@ class ClinicalPipeline
     private function archiveFile(array $project, string $sourceFile, string $modality): bool
     {
         $archiveDir = $project['data_access']['mount_path'] . "/processed/{$modality}/" . date('Y-m-d');
-        
+
         if (!is_dir($archiveDir)) {
             mkdir($archiveDir, 0755, true);
         }
@@ -485,7 +489,7 @@ class ClinicalPipeline
         $this->logger->info("  Successfully uploaded: {$this->stats['success']}");
         $this->logger->info("  Failed: {$this->stats['failed']}");
         $this->logger->info("  Skipped: {$this->stats['skipped']}");
-        
+
         // Data statistics
         if ($this->stats['rows_uploaded'] > 0 || $this->stats['rows_skipped'] > 0) {
             $this->logger->info("----------------------------------------");
@@ -497,20 +501,20 @@ class ClinicalPipeline
             $totalRows = $this->stats['rows_uploaded'] + $this->stats['rows_skipped'];
             $this->logger->info("  Total processed: {$totalRows}");
         }
-        
-        // Candidate creation
+
+        // Candidate creation - only show if candidates were actually created
         if ($this->stats['candidates_created'] > 0) {
             $this->logger->info("----------------------------------------");
             $this->logger->info("New Candidates Created: {$this->stats['candidates_created']}");
         }
-        
+
         // Calculate success rate
         if ($this->stats['total'] > 0) {
             $successRate = round(($this->stats['success'] / $this->stats['total']) * 100, 1);
             $this->logger->info("----------------------------------------");
             $this->logger->info("Success Rate: {$successRate}%");
         }
-        
+
         // Error summary
         if (!empty($this->stats['errors'])) {
             $this->logger->info("----------------------------------------");
@@ -533,7 +537,7 @@ class ClinicalPipeline
                 }
             }
         }
-        
+
         $this->logger->info("========================================");
     }
 }

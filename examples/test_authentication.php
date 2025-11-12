@@ -1,219 +1,139 @@
 #!/usr/bin/env php
 <?php
 /**
- * LORIS API Authentication Diagnostic Tool
- * 
- * Tests authentication against LORIS API and provides detailed debugging info
- * Compare this with curl to identify issues
+ * Simple LORIS API Authentication Diagnostic Tool
+ *
+ * Tests authentication for multiple API versions and verifies token.
  */
 
 require __DIR__ . '/../vendor/autoload.php';
 
 use GuzzleHttp\Client;
 
-// Colors for terminal output
-function colorize($text, $color) {
-    $colors = [
-        'red' => "\033[31m",
-        'green' => "\033[32m",
-        'yellow' => "\033[33m",
-        'blue' => "\033[34m",
-        'reset' => "\033[0m"
-    ];
-    return $colors[$color] . $text . $colors['reset'];
-}
+echo "\n=================================================\n";
+echo "  LORIS API Authentication Diagnostic Tool\n";
+echo "=================================================\n\n";
 
-echo "\n";
-echo colorize("=================================================\n", 'blue');
-echo colorize("  LORIS API Authentication Diagnostic Tool\n", 'blue');
-echo colorize("=================================================\n", 'blue');
-echo "\n";
-
-// Load configuration
+// Load config
 $configFile = __DIR__ . '/../config/loris_client_config.json';
-
 if (!file_exists($configFile)) {
-    echo colorize("✗ Configuration file not found: {$configFile}\n", 'red');
-    echo "Please copy loris_client_config.json.example to loris_client_config.json\n";
+    echo "Configuration file not found: {$configFile}\n";
     exit(1);
 }
 
 $config = json_decode(file_get_contents($configFile), true);
-
 if (json_last_error() !== JSON_ERROR_NONE) {
-    echo colorize("✗ Invalid JSON in config file: " . json_last_error_msg() . "\n", 'red');
+    echo "Invalid JSON in config file: " . json_last_error_msg() . "\n";
     exit(1);
 }
 
-// Extract API config
-$baseUrl = rtrim($config['api']['base_url'], '/');
+$baseUrl  = rtrim($config['api']['base_url'], '/');
 $username = $config['api']['username'];
 $password = $config['api']['password'];
+$versions = ['api/v0.0.3', 'api/v0.0.4', 'api/v0.0.4-dev'];
 
-echo colorize("Configuration:\n", 'yellow');
-echo "  Base URL: {$baseUrl}\n";
-echo "  Username: {$username}\n";
-echo "  Password: " . str_repeat('*', strlen($password)) . "\n";
-echo "\n";
+echo "Configuration:\n";
+echo "  Base URL : {$baseUrl}\n";
+echo "  Username : {$username}\n";
+echo "  Password : " . str_repeat('*', strlen($password)) . "\n\n";
 
-// Test 1: Check if base URL is reachable
-echo colorize("Test 1: Checking if base URL is reachable...\n", 'yellow');
+// Step 1: Check base URL
+echo "Test 1: Checking if base URL is reachable...\n";
 try {
-    $client = new Client([
-        'timeout' => 10,
-        'verify' => false,
-        'http_errors' => false
-    ]);
-    
+    $client = new Client(['timeout' => 10, 'verify' => false, 'http_errors' => false]);
     $response = $client->get($baseUrl);
-    $statusCode = $response->getStatusCode();
-    
-    echo "  Status Code: {$statusCode}\n";
-    
-    if ($statusCode >= 200 && $statusCode < 400) {
-        echo colorize("  ✓ Base URL is reachable\n", 'green');
+    $status = $response->getStatusCode();
+    echo "  Status Code: {$status}\n";
+    if ($status >= 200 && $status < 400) {
+        echo "  Base URL reachable.\n\n";
     } else {
-        echo colorize("  ⚠ Base URL returned non-success status code\n", 'yellow');
+        echo "  Warning: Non-success status returned.\n\n";
     }
 } catch (Exception $e) {
-    echo colorize("  ✗ Cannot reach base URL: " . $e->getMessage() . "\n", 'red');
+    echo "  Error: Cannot reach base URL: " . $e->getMessage() . "\n";
     exit(1);
 }
-echo "\n";
 
-// Test 2: Test /login endpoint with different configurations
-echo colorize("Test 2: Testing authentication endpoint...\n", 'yellow');
+// Step 2: Try authentication for each API version
+echo "Test 2: Attempting authentication for each API version...\n\n";
 
-$testConfigs = [
-    'Standard (with base_uri)' => [
-        'base_uri' => $baseUrl,
-        'endpoint' => '/login',
-        'timeout' => 30,
-        'verify' => false,
-        'http_errors' => false
-    ],
-    'Without base_uri' => [
-        'endpoint' => $baseUrl . '/login',
-        'timeout' => 30,
-        'verify' => false,
-        'http_errors' => false
-    ],
-    'With explicit Content-Type' => [
-        'base_uri' => $baseUrl,
-        'endpoint' => '/login',
-        'timeout' => 30,
-        'verify' => false,
-        'http_errors' => false,
-        'headers' => ['Content-Type' => 'application/json']
-    ]
-];
+foreach ($versions as $version) {
+    $loginUrl = "{$baseUrl}/{$version}/login";
+    echo "Testing {$loginUrl}\n";
 
-foreach ($testConfigs as $configName => $testConfig) {
-    echo "\n  Testing: {$configName}\n";
-    
-    // Extract endpoint and headers
-    $endpoint = $testConfig['endpoint'];
-    unset($testConfig['endpoint']);
-    
-    $headers = $testConfig['headers'] ?? [];
-    unset($testConfig['headers']);
-    
     try {
-        $testClient = new Client($testConfig);
-        
-        $requestOptions = [
+        $client = new Client(['timeout' => 20, 'verify' => false, 'http_errors' => false]);
+        $response = $client->post($loginUrl, [
+            'headers' => [
+                'Content-Type' => 'application/json',
+                'Accept' => 'application/json'
+            ],
             'json' => [
                 'username' => $username,
                 'password' => $password
             ]
-        ];
-        
-        if (!empty($headers)) {
-            $requestOptions['headers'] = $headers;
-        }
-        
-        echo "    Request URL: " . (isset($testConfig['base_uri']) ? $testConfig['base_uri'] . $endpoint : $endpoint) . "\n";
-        echo "    Request Body: " . json_encode($requestOptions['json']) . "\n";
-        
-        $response = $testClient->post($endpoint, $requestOptions);
-        
-        $statusCode = $response->getStatusCode();
+        ]);
+
+        $status = $response->getStatusCode();
         $body = $response->getBody()->getContents();
-        
-        echo "    Response Status: {$statusCode}\n";
-        echo "    Response Headers:\n";
-        foreach ($response->getHeaders() as $name => $values) {
-            echo "      {$name}: " . implode(', ', $values) . "\n";
+
+        echo "  HTTP Status: {$status}\n";
+
+        if ($status !== 200) {
+            echo "  Authentication failed.\n\n";
+            continue;
         }
-        echo "    Response Body: " . substr($body, 0, 500) . "\n";
-        
-        if ($statusCode === 200) {
-            $data = json_decode($body, true);
-            if (isset($data['token'])) {
-                echo colorize("    ✓ Authentication SUCCESSFUL!\n", 'green');
-                echo "    Token (first 20 chars): " . substr($data['token'], 0, 20) . "...\n";
-                
-                // Test 3: Test using the token
-                echo "\n" . colorize("Test 3: Testing token with authenticated request...\n", 'yellow');
-                $token = $data['token'];
-                
-                try {
-                    $authResponse = $testClient->get(
-                        isset($testConfig['base_uri']) ? '/candidates' : $baseUrl . '/candidates',
-                        [
-                            'headers' => [
-                                'Authorization' => 'Bearer ' . $token,
-                                'Accept' => 'application/json'
-                            ]
-                        ]
-                    );
-                    
-                    $authStatusCode = $authResponse->getStatusCode();
-                    echo "  Request: GET " . (isset($testConfig['base_uri']) ? $testConfig['base_uri'] . '/candidates' : $baseUrl . '/candidates') . "\n";
-                    echo "  Status Code: {$authStatusCode}\n";
-                    
-                    if ($authStatusCode === 200) {
-                        echo colorize("  ✓ Token works! Authenticated request successful\n", 'green');
-                    } else {
-                        $authBody = $authResponse->getBody()->getContents();
-                        echo colorize("  ⚠ Token obtained but request failed\n", 'yellow');
-                        echo "  Response: " . substr($authBody, 0, 200) . "\n";
-                    }
-                } catch (Exception $e) {
-                    echo colorize("  ✗ Error using token: " . $e->getMessage() . "\n", 'red');
-                }
-                
-                echo "\n";
-                echo colorize("=================================================\n", 'green');
-                echo colorize("  SUCCESS! Use this configuration:\n", 'green');
-                echo colorize("  Config: {$configName}\n", 'green');
-                echo colorize("=================================================\n", 'green');
-                exit(0);
-            } else {
-                echo colorize("    ✗ No token in response\n", 'red');
-            }
+
+        $data = json_decode($body, true);
+        if (json_last_error() !== JSON_ERROR_NONE) {
+            echo "  Invalid JSON response: " . json_last_error_msg() . "\n\n";
+            continue;
+        }
+
+        if (!isset($data['token'])) {
+            echo "  No token in response.\n\n";
+            continue;
+        }
+
+        $token = $data['token'];
+        echo "  Authentication successful.\n";
+        echo "  Token (first 20 chars): " . substr($token, 0, 20) . "...\n";
+
+        // Step 3: Test token with /candidates
+        $candidatesUrl = "{$baseUrl}/{$version}/candidates";
+        echo "  Testing token on {$candidatesUrl}\n";
+
+        $authResponse = $client->get($candidatesUrl, [
+            'headers' => [
+                'Authorization' => 'Bearer ' . $token,
+                'Accept' => 'application/json'
+            ]
+        ]);
+
+        $authStatus = $authResponse->getStatusCode();
+        echo "  Authenticated Request Status: {$authStatus}\n";
+
+        if ($authStatus === 200) {
+            echo "\nSUCCESS! Working API version: {$version}\n";
+            echo "=================================================\n";
+            exit(0);
         } else {
-            echo colorize("    ✗ Authentication failed (HTTP {$statusCode})\n", 'red');
+            echo "  Token valid but request failed (HTTP {$authStatus}).\n\n";
         }
-        
+
     } catch (Exception $e) {
-        echo colorize("    ✗ Exception: " . $e->getMessage() . "\n", 'red');
+        echo "  Error: " . $e->getMessage() . "\n\n";
     }
 }
 
-echo "\n";
-echo colorize("=================================================\n", 'red');
-echo colorize("  All authentication attempts failed\n", 'red');
-echo colorize("=================================================\n", 'red');
-echo "\n";
+echo "=================================================\n";
+echo "All authentication attempts failed.\n";
+echo "=================================================\n\n";
 
-// Provide curl command for comparison
-echo colorize("For comparison, try this curl command:\n", 'yellow');
-echo "\n";
-echo "curl -X POST '{$baseUrl}/login' \\\n";
+echo "Try manually with curl:\n";
+echo "curl -X POST '{$baseUrl}/api/v0.0.3/login' \\\n";
 echo "  -H 'Content-Type: application/json' \\\n";
 echo "  -d '{\"username\":\"{$username}\",\"password\":\"{$password}\"}' \\\n";
-echo "  -v\n";
-echo "\n";
+echo "  -v\n\n";
 
 exit(1);

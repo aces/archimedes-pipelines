@@ -8,9 +8,7 @@ use Psr\Log\LoggerInterface;
 
 /**
  * Authentication and JWT Token Management
- * Handles LORIS API authentication with token expiry
- * 
- * API Endpoint: POST /login
+ * Handles LORIS API authentication with version fallback
  */
 class Tokens
 {
@@ -22,6 +20,17 @@ class Tokens
     private ?int $tokenExpiry = null;
     private int $tokenExpiryMinutes;
     private LoggerInterface $logger;
+
+    private ?string $activeVersion = null;
+
+    /**
+     * List of API versions to try (in order of preference)
+     */
+    private array $apiVersions = [
+        'api/v0.0.3',
+        'api/v0.0.4',
+        'api/v0.0.4-dev'
+    ];
 
     public function __construct(
         string $baseUrl,
@@ -36,8 +45,7 @@ class Tokens
         $this->tokenExpiryMinutes = $tokenExpiryMinutes;
         $this->logger = $logger ?? new \Psr\Log\NullLogger();
 
-        // IMPORTANT: Don't use base_uri - it causes issues with some LORIS configurations
-        // Instead, use full URLs in each request
+        // Don't use base_uri — causes issues with some LORIS setups
         $this->client = new Client([
             'timeout' => 120,
             'http_errors' => false,
@@ -50,8 +58,7 @@ class Tokens
     }
 
     /**
-     * Authenticate and get JWT token
-     * POST /login
+     * Authenticate and get JWT token (tries multiple API versions)
      */
     public function authenticate(): string
     {
@@ -59,94 +66,66 @@ class Tokens
         $this->logger->debug("Base URL: {$this->baseUrl}");
         $this->logger->debug("Username: {$this->username}");
 
-        try {
-            $requestData = [
-                'username' => $this->username,
-                'password' => $this->password,
-            ];
-            
-            // Use full URL, not relative path (base_uri causes issues)
-            $loginUrl = $this->baseUrl . '/login';
-            
-            $this->logger->debug("Sending POST request to {$loginUrl}");
-            $this->logger->debug("Request data: " . json_encode(['username' => $this->username, 'password' => '***']));
-            
-            $response = $this->client->post($loginUrl, [
-                'json' => $requestData,
-                'headers' => [
-                    'Content-Type' => 'application/json'
-                ]
-            ]);
+        $lastError = null;
 
-            $statusCode = $response->getStatusCode();
-            $body = $response->getBody()->getContents();
-            
-            $this->logger->debug("Response status: {$statusCode}");
-            $this->logger->debug("Response Content-Type: " . $response->getHeaderLine('Content-Type'));
-            $this->logger->debug("Response body (first 500 chars): " . substr($body, 0, 500));
+        foreach ($this->apiVersions as $version) {
+            $loginUrl = "{$this->baseUrl}/{$version}/login";
+            $this->logger->info("🔍 Trying authentication endpoint: {$loginUrl}");
 
-            if ($statusCode !== 200) {
-                // Log response headers for debugging
-                $this->logger->error("Authentication failed with status {$statusCode}");
-                foreach ($response->getHeaders() as $name => $values) {
-                    $this->logger->debug("Response header {$name}: " . implode(', ', $values));
-                }
-                throw new \RuntimeException("Authentication failed (HTTP {$statusCode}): {$body}");
-            }
+            try {
+                $response = $this->client->post($loginUrl, [
+                    'json' => [
+                        'username' => $this->username,
+                        'password' => $this->password,
+                    ],
+                    'headers' => ['Content-Type' => 'application/json']
+                ]);
 
-            $data = json_decode($body, true);
-
-            if (json_last_error() !== JSON_ERROR_NONE) {
-                $this->logger->error("Response is not valid JSON!");
-                $this->logger->error("JSON Error: " . json_last_error_msg());
-                $this->logger->error("Raw response body (first 500 chars):");
-                $this->logger->error($body ? substr($body, 0, 500) : '(empty response)');
-                
-                // Detect common issues
-                if (strpos($body, '<html') !== false || strpos($body, '<!DOCTYPE') !== false) {
-                    $this->logger->error("⚠ Response is HTML, not JSON! This usually means:");
-                    $this->logger->error("  - Wrong API URL (getting web page instead of API endpoint)");
-                    $this->logger->error("  - API endpoint doesn't exist at this path");
-                    $this->logger->error("  - Redirect to login page");
-                    $this->logger->error("Check your base_url in config: {$this->baseUrl}");
-                }
-                
-                throw new \RuntimeException('Invalid JSON in authentication response: ' . json_last_error_msg() . ". Check logs for raw response.");
-            }
-
-            if (!isset($data['token'])) {
-                $this->logger->error("No token in response. Response keys: " . implode(', ', array_keys($data)));
-                throw new \RuntimeException('No token in authentication response');
-            }
-
-            $this->token = $data['token'];
-            $this->tokenExpiry = time() + ($this->tokenExpiryMinutes * 60);
-            
-            $this->logger->info('✓ Authenticated successfully');
-            $this->logger->debug("Token expires in {$this->tokenExpiryMinutes} minutes");
-            $this->logger->debug("Token (first 20 chars): " . substr($this->token, 0, 20) . "...");
-
-            return $this->token;
-            
-        } catch (\GuzzleHttp\Exception\ConnectException $e) {
-            $this->logger->error("Connection failed: Cannot reach {$this->baseUrl}");
-            $this->logger->error("Error: " . $e->getMessage());
-            throw new \RuntimeException("Cannot connect to LORIS API at {$this->baseUrl}. Check base_url in config.");
-        } catch (\GuzzleHttp\Exception\RequestException $e) {
-            $this->logger->error("Request failed: " . $e->getMessage());
-            if ($e->hasResponse()) {
-                $response = $e->getResponse();
+                $statusCode = $response->getStatusCode();
                 $body = $response->getBody()->getContents();
-                $this->logger->error("Response: " . $body);
+
+                $this->logger->debug("Response status: {$statusCode}");
+                $this->logger->debug("Response body (first 200 chars): " . substr($body, 0, 200));
+
+                if ($statusCode !== 200) {
+                    $this->logger->warning("Authentication failed for {$version} (HTTP {$statusCode})");
+                    $lastError = "HTTP {$statusCode}: {$body}";
+                    continue;
+                }
+
+                $data = json_decode($body, true);
+
+                if (json_last_error() !== JSON_ERROR_NONE) {
+                    $this->logger->warning("Invalid JSON for {$version}: " . json_last_error_msg());
+                    $lastError = "Invalid JSON response";
+                    continue;
+                }
+
+                if (!isset($data['token'])) {
+                    $this->logger->warning("No token found in response for {$version}");
+                    $lastError = 'No token key in response';
+                    continue;
+                }
+
+                // ✅ Success
+                $this->token = $data['token'];
+                $this->tokenExpiry = time() + ($this->tokenExpiryMinutes * 60);
+                $this->activeVersion = $version; // store working version
+
+                $this->logger->info("✓ Authenticated successfully using {$version}");
+                $this->logger->debug("Token expires in {$this->tokenExpiryMinutes} minutes");
+                return $this->token;
+
+            } catch (\GuzzleHttp\Exception\ConnectException $e) {
+                $this->logger->warning("Connection failed for {$version}: " . $e->getMessage());
+                $lastError = $e->getMessage();
+            } catch (\Exception $e) {
+                $this->logger->warning("Unexpected error for {$version}: " . $e->getMessage());
+                $lastError = $e->getMessage();
             }
-            throw $e;
-        } catch (\RuntimeException $e) {
-            throw $e;
-        } catch (\Exception $e) {
-            $this->logger->error("Authentication failed: " . $e->getMessage());
-            $this->logger->error("Stack trace: " . $e->getTraceAsString());
-            throw $e;
         }
+
+        throw new \RuntimeException("Authentication failed for all API versions. Last error: {$lastError}");
     }
 
     /**
@@ -154,34 +133,21 @@ class Tokens
      */
     public function getToken(): string
     {
-        // No token yet
-        if ($this->token === null) {
+        if ($this->token === null || ($this->tokenExpiry !== null && time() >= $this->tokenExpiry)) {
+            $this->logger->info('Fetching new token...');
             return $this->authenticate();
         }
-
-        // Token expired - re-authenticate
-        if ($this->tokenExpiry !== null && time() >= $this->tokenExpiry) {
-            $this->logger->info('Token expired, re-authenticating...');
-            return $this->authenticate();
-        }
-
         return $this->token;
     }
 
     /**
-     * Check if token is valid
+     * Check if a valid token exists
      */
     public function hasValidToken(): bool
     {
-        if ($this->token === null) {
-            return false;
-        }
-
-        if ($this->tokenExpiry !== null && time() >= $this->tokenExpiry) {
-            return false;
-        }
-
-        return true;
+        return $this->token !== null &&
+            $this->tokenExpiry !== null &&
+            time() < $this->tokenExpiry;
     }
 
     /**
@@ -196,7 +162,7 @@ class Tokens
     }
 
     /**
-     * Get HTTP client
+     * Return the working HTTP client
      */
     public function getClient(): Client
     {
@@ -204,11 +170,19 @@ class Tokens
     }
 
     /**
-     * Get base URL
+     * Return the base LORIS URL
      */
     public function getBaseUrl(): string
     {
         return $this->baseUrl;
+    }
+
+    /**
+     * Get the active API version that succeeded during authentication
+     */
+    public function getActiveVersion(): string
+    {
+        return $this->activeVersion ?? ($this->apiVersions[0] ?? 'api/v0.0.3');
     }
 
     /**
