@@ -1,37 +1,52 @@
 {
-  "project_full_name": "Optimization of Attenuation Correction for FDG PET-MR Imaging",
-  "project_common_name": "FDG-PET",
-  "project_alias_4_characters": "FDGP",
+  "project_full_name": "Example Multisite Clinical-Imaging Study",
+  "project_common_name": "Example-Study",
+  "project_alias_4_characters": "EMCIS",
+
   "modalities": ["Clinical", "Imaging"],
 
+  "principal_investigators": ["Dr. Jane Doe", "Dr. John Smith"],
+
+  "tier": "Registered",
+  "number_of_sites": 2,
+
+  "sites": [
+    "Example University Hospital (EUH)",
+    "Example Mental Health Centre (EMHC)"
+  ],
+  "site_alias": ["SITE1", "SITE2"],
+
+  "visits": ["V1", "V2"],
+  "cohorts": ["CohortA", "CohortB"],
+
   "clinical_instruments": [
-    "fdg_pet",
-    "fdg_pet_scan_parameter_form"
+    "example_clinical_form",
+    "example_scan_parameter_form"
   ],
 
   "imaging_modalities": [
-    "FDG-PET-CT",
-    "FDG-PET-MR"
+    "Example-MR",
+    "Example-PET"
   ],
 
   "data_access": {
     "mount_enabled": true,
-    "mount_path": "/data/archimedes/FDG-PET"
+    "mount_path": "/data/projects/Example-Study"
   },
 
   "notification_emails": {
     "clinical": {
-      "on_success": ["clinical_team@loris.ca"],
-      "on_error": ["clinical_team@loris.ca"]
+      "on_success": ["clinical_team@example.org"],
+      "on_error": ["clinical_team@example.org"]
     },
     "imaging": {
-      "on_success": ["imaging_team@loris.ca"],
-      "on_error": ["imaging_team@loris.ca"]
+      "on_success": ["imaging_team@example.org"],
+      "on_error": ["imaging_team@example.org"]
     }
   },
 
   "logging": {
     "level": "INFO",
-    "log_path": "/data/roject_collection_1/project_1/logs"
+    "log_path": "/data/projects/Example-Study/logs"
   }
 }

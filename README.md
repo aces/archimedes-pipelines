@@ -1,4 +1,4 @@
-# 🧩 LORIS PHP Client
+#  LORIS PHP Client
 
 A lightweight PHP client for the [LORIS](https://github.com/aces/Loris) REST API.  
 It provides tools for authentication, token management,
@@ -6,7 +6,7 @@ and ingestion of clinical and imaging data through automated pipelines.
 
 ---
 
-## ⚙️ Installation
+## Installation
 
 ```bash
 # Clone repository

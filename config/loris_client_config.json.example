@@ -1,8 +1,8 @@
 {
   "api": {
-    "base_url": "https://server_url/api/v0.0.4-dev",
+    "base_url": "https://example-loris-instance.ca/api/v0.0.4-dev",
     "username": "api_user",
-    "password": "SuperSecurePassword123",
+    "password": "secure_password_here",
     "token_expiry_minutes": 55
   },
 
@@ -10,7 +10,7 @@
     "host": "localhost",
     "name": "loris",
     "user": "lorisuser",
-    "password": "db_password"
+    "password": "db_password_here"
   },
 
   "data_access": {
@@ -25,32 +25,32 @@
 
   "notification_defaults": {
     "smtp": {
-      "host": "smtp.uottawa.ca",
+      "host": "smtp.example.org",
       "port": 587,
       "username": "loris-notify",
-      "password": "smtp_password",
-      "from": "noreply@loris.ca"
+      "password": "smtp_password_here",
+      "from": "noreply@example.org"
     },
-    "default_on_success": ["data-team@loris.ca"],
-    "default_on_error": ["admin@loris.ca"]
+    "default_on_success": ["data-team@example.org"],
+    "default_on_error": ["admin@example.org"]
   },
 
   "collections": [
     {
-      "name": "project_collection_1",
-      "base_path": "/data/project_collection_1,
+      "name": "example_collection_1",
+      "base_path": "/data/example_collection_1",
       "enabled": true,
       "projects": [
-        {"name": "project_1", "enabled": true},
-        {"name": "project_2", "enabled": true}
+        {"name": "example_project_1", "enabled": true},
+        {"name": "example_project_2", "enabled": true}
       ]
     },
     {
-      "name": ""project_collection_2",
-      "base_path": "/data/project_collection_2",
+      "name": "example_collection_2",
+      "base_path": "/data/example_collection_2",
       "enabled": true,
       "projects": [
-        {"name": "project_3", "enabled": true}
+        {"name": "example_project_3", "enabled": true}
       ]
     }
   ]
