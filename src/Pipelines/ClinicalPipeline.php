@@ -241,6 +241,13 @@ class ClinicalPipeline
             return 'skipped';
         }
 
+        $filename = "{$instrument}.csv";
+        if ($this->isAlreadyProcessed($project, $filename, 'clinical')) {
+            $this->logger->info("  ⚠ Already processed earlier → SKIPPING {$filename}");
+            return 'skipped';
+        }
+
+
         $this->logger->info("\n  Processing: {$instrument}");
         $this->stats['total']++;
 
@@ -323,7 +330,7 @@ class ClinicalPipeline
                 }
 
                 // Archive
-                //$this->archiveFile($project, $csvFile, 'clinical');
+                $this->archiveFile($project, $csvFile, 'clinical');
                 return 'success';
 
             } else {
@@ -438,23 +445,40 @@ class ClinicalPipeline
      */
     private function archiveFile(array $project, string $sourceFile, string $modality): bool
     {
-        $archiveDir = $project['data_access']['mount_path'] . "/processed/{$modality}/" . date('Y-m-d');
+        // Build folder: processed/<modality>/YYYY-MM-DD
+        $archiveDir = rtrim($project['data_access']['mount_path'], '/')
+            . "/processed/{$modality}/"
+            . date('Y-m-d');
 
+        // Create directory if missing
         if (!is_dir($archiveDir)) {
-            mkdir($archiveDir, 0755, true);
+            if (!mkdir($archiveDir, 0755, true)) {
+                $this->logger->error("  ✗ Failed to create archive directory: {$archiveDir}");
+                return false;
+            }
         }
 
         $filename = basename($sourceFile);
-        $destFile = $archiveDir . '/' . $filename;
+        $destFile = "{$archiveDir}/{$filename}";
 
+        // If file already exists, prevent overwrite
+        if (file_exists($destFile)) {
+            $uniqueName = time() . "_" . $filename;
+            $destFile   = "{$archiveDir}/{$uniqueName}";
+            $this->logger->warning("  ⚠ File exists, copying as: {$uniqueName}");
+        }
+
+        // COPY ONLY (NO DELETE)
         if (copy($sourceFile, $destFile)) {
-            unlink($sourceFile);
-            $this->logger->info("  ✓ Archived to: {$archiveDir}");
+            $this->logger->info("  ✓ Copied to archive: {$destFile}");
             return true;
         }
 
+        // Copy failed
+        $this->logger->error("  ✗ Failed to copy file: {$sourceFile} → {$destFile}");
         return false;
     }
+
 
     /**
      * Send project notification for clinical modality
@@ -583,4 +607,29 @@ class ClinicalPipeline
 
         $this->logger->info("========================================");
     }
+
+    /**
+     * Check if file already exists in ANY processed/<modality>/<date> folder
+     */
+    private function isAlreadyProcessed(array $project, string $filename, string $modality): bool
+    {
+        $base = rtrim($project['data_access']['mount_path'], '/') . "/processed/{$modality}";
+
+        if (!is_dir($base)) {
+            return false;
+        }
+
+        // Scan all date directories
+        $folders = glob($base . "/*", GLOB_ONLYDIR);
+
+        foreach ($folders as $folder) {
+            if (file_exists($folder . '/' . $filename)) {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+
 }
