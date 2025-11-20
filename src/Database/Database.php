@@ -1,7 +1,7 @@
 <?php
 declare(strict_types=1);
 
-namespace LORIS\Client\Database;
+namespace LORIS\Database;
 
 use PDO;
 use PDOException;

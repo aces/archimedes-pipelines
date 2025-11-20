@@ -1,7 +1,7 @@
 <?php
 declare(strict_types=1);
 
-namespace LORIS\Client\Utils;
+namespace LORIS\Utils;
 
 use PHPMailer\PHPMailer\PHPMailer;
 use PHPMailer\PHPMailer\Exception;

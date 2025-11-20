@@ -8,7 +8,7 @@
 
 require __DIR__ . '/../vendor/autoload.php';
 
-use LORIS\Client\Pipelines\ClinicalPipeline;
+use LORIS\Pipelines\ClinicalPipeline;
 
 // Parse CLI options
 $opts = getopt('', ['collection::', 'project::', 'all::', 'dry-run::', 'verbose::', 'help::']);

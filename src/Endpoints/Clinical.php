@@ -1,7 +1,7 @@
 <?php
 declare(strict_types=1);
 
-namespace LORIS\Client\Endpoints;
+namespace LORIS\Endpoints;
 
 use Psr\Log\LoggerInterface;
 

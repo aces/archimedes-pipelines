@@ -1,11 +1,11 @@
 <?php
 declare(strict_types=1);
 
-namespace LORIS\Client\Pipelines;
+namespace LORIS\Pipelines;
 
-use LORIS\Client\Endpoints\{Tokens, Clinical};
-use LORIS\Client\Database\Database;
-use LORIS\Client\Utils\{Notification, CleanLogFormatter};
+use LORIS\Endpoints\{Tokens, Clinical};
+use LORIS\Database\Database;
+use LORIS\Utils\{Notification, CleanLogFormatter};
 use Monolog\Logger;
 use Monolog\Handler\{StreamHandler, RotatingFileHandler};
 use Psr\Log\LoggerInterface;
