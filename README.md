@@ -1,6 +1,6 @@
 # LORIS-ARCHIMEDES Pipelines
 
-Automated data ingestion pipelines for ARCHIMEDES study using the [oris-php-api-client](https://github.com/aces/loris-php-api-client) library.
+Automated data ingestion pipelines for ARCHIMEDES study using the [loris-php-api-client](https://github.com/aces/loris-php-api-client) library.
 
 This repository provides production-ready pipelines for clinical and imaging data ingestion, with features like bulk CSV upload, automated candidate creation, email notifications, and comprehensive logging.
 
