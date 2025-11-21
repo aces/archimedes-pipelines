@@ -44,7 +44,7 @@ composer install
 ```
 
 This will automatically install:
-- `aces/loris-php-client` - Auto-generated LORIS API client
+- `aces/loris-php-api-client` - Auto-generated LORIS API client
 - `guzzlehttp/guzzle` - HTTP client
 - `monolog/monolog` - Logging
 - `phpmailer/phpmailer` - Email notifications
@@ -70,10 +70,10 @@ Test the pipeline without making any changes:
 
 ```bash
 # Dry run for all projects
-php examples/run_clinical_pipeline.php --all --dry-run --verbose
+php scripts/run_clinical_pipeline.php --all --dry-run --verbose
 
 # Dry run for specific project
-php examples/run_clinical_pipeline.php --collection=example_collection --project=PROJECT_A --dry-run
+php scripts/run_clinical_pipeline.php --collection=example_collection --project=PROJECT_A --dry-run
 ```
 
 #### Process All Data
@@ -81,7 +81,7 @@ php examples/run_clinical_pipeline.php --collection=example_collection --project
 Run the pipeline for all configured projects:
 
 ```bash
-php examples/run_clinical_pipeline.php --all
+php scripts/run_clinical_pipeline.php --all
 ```
 
 #### Process Specific Project
@@ -89,7 +89,7 @@ php examples/run_clinical_pipeline.php --all
 Run the pipeline for a single project:
 
 ```bash
-php examples/run_clinical_pipeline.php --collection=example_collection --project=PROJECT_A
+php scripts/run_clinical_pipeline.php --collection=example_collection --project=PROJECT_A
 ```
 
 #### Process Specific Instrument
@@ -97,7 +97,7 @@ php examples/run_clinical_pipeline.php --collection=example_collection --project
 Run the pipeline for a specific instrument:
 
 ```bash
-php examples/run_clinical_pipeline.php --collection=example_collection --project=PROJECT_A --instrument=demographics
+php scripts/run_clinical_pipeline.php --collection=example_collection --project=PROJECT_A --instrument=demographics
 ```
 
 #### Verbose Output
@@ -105,7 +105,7 @@ php examples/run_clinical_pipeline.php --collection=example_collection --project
 Enable detailed logging output:
 
 ```bash
-php examples/run_clinical_pipeline.php --all --verbose
+php scripts/run_clinical_pipeline.php --all --verbose
 ```
 
 ---
