@@ -28,7 +28,6 @@ class Tokens
      */
     private array $apiVersions = [
         'api/v0.0.3',
-        'api/v0.0.4',
         'api/v0.0.4-dev'
     ];
 
@@ -182,7 +181,7 @@ class Tokens
      */
     public function getActiveVersion(): string
     {
-        return $this->activeVersion ?? ($this->apiVersions[0] ?? 'api/v0.0.3');
+        return $this->activeVersion ?? ($this->apiVersions[0] ?? 'api/v0.0.4-dev');
     }
 
     /**

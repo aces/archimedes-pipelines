@@ -320,7 +320,7 @@ class ClinicalPipeline
                 if (isset($result['idMapping']) && !empty($result['idMapping']) && $saved > 0) {
                     $newCandidates = count($result['idMapping']);
                     $this->stats['candidates_created'] += $newCandidates;
-                    $this->logger->info("    New candidates created: {$newCandidates}");
+                    $this->logger->info("    New Records created: {$newCandidates}");
 
                     if ($this->verbose) {
                         foreach ($result['idMapping'] as $mapping) {
@@ -572,7 +572,7 @@ class ClinicalPipeline
         // Candidate creation - only show if candidates were actually created
         if ($this->stats['candidates_created'] > 0) {
             $this->logger->info("----------------------------------------");
-            $this->logger->info("New Candidates Created: {$this->stats['candidates_created']}");
+            $this->logger->info("New Records Created: {$this->stats['candidates_created']}");
         }
 
         // Calculate success rate
