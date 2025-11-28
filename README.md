@@ -177,6 +177,8 @@ php scripts/run_clinical_pipeline.php --all --verbose
 │   ├── imaging/
 │   │   ├── dicoms/                       # Raw medical imaging data (non-BIDS)
 │   ├── clinical/                         # Patient records & behavioural assessments
+    │   ├── redcap/                       # Redcap Data
+    │   ├── unclassified/                 # Unclassified Clinical Data
     ├── bids/                             # Standardized BIDS structured datasets
 │   ├── eeg/                              # Raw EEG data (non-BIDS)
 │   └── genomics/                         # Genomic & epigenetic sequencing data
@@ -186,6 +188,8 @@ php scripts/run_clinical_pipeline.php --all --verbose
 │   │   ├── dicoms/                       # Raw medical imaging data with LORIS Labels
     ├──  bids/                            # Standardized BIDS structured datasets
 │   ├── clinical/                         # Patient records & behavioural assessments
+    │   ├── redcap/                       # Redcap Data
+    │   ├── unclassified/                 # Unclassified Clinical Data
 │   ├── eeg/                              # EEG signals and event logs
 │   └── genomics/                         # Genomic & epigenetic sequencing data
 │
