@@ -176,15 +176,15 @@ php scripts/run_clinical_pipeline.php --all --verbose
 │   ├── demographics_project.csv          # Additions to the standard form
 │   ├── imaging/
 │   │   ├── dicoms/                       # Raw medical imaging data (non-BIDS)
-│   │   └── bids/                         # Standardized BIDS structured datasets
 │   ├── clinical/                         # Patient records & behavioural assessments
+    ├── bids/                             # Standardized BIDS structured datasets
 │   ├── eeg/                              # Raw EEG data (non-BIDS)
 │   └── genomics/                         # Genomic & epigenetic sequencing data
 │
 ├── deidentified-lorisid/                 # LORIS-relabelled participant data
 │   ├── imaging/
 │   │   ├── dicoms/                       # Raw medical imaging data with LORIS Labels
-│   │   └── bids/                         # Standardized BIDS structured datasets
+    ├──  bids/                            # Standardized BIDS structured datasets
 │   ├── clinical/                         # Patient records & behavioural assessments
 │   ├── eeg/                              # EEG signals and event logs
 │   └── genomics/                         # Genomic & epigenetic sequencing data
