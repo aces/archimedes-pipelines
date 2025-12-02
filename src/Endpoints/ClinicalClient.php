@@ -372,6 +372,7 @@ class ClinicalClient
 
     /**
      * Get expected CSV headers for instrument(s)
+     * Returns empty string on error instead of throwing
      */
     public function getInstrumentDataHeaders(
         string $action = 'CREATE_SESSIONS',
@@ -382,23 +383,46 @@ class ClinicalClient
 
         try {
             $api = $this->getInstrumentManagerApi();
-            return $api->getInstrumentDataHeaders($action, $instrument, $instruments);
+            $result = $api->getInstrumentDataHeaders($action, $instrument, $instruments);
+
+            // Handle if API returns ErrorResponse instead of string
+            if (!is_string($result)) {
+                return '';
+            }
+
+            return $result;
         } catch (\Exception $e) {
-            $this->logger->error("Failed to get headers: " . $e->getMessage());
-            throw $e;
+            $this->logger->debug("Failed to get headers: " . $e->getMessage());
+            return '';
         }
     }
 
     /**
      * Check if instrument exists in LORIS
+     * Uses direct HTTP to avoid type issues with API client
      */
     public function instrumentExists(string $instrument): bool
     {
         try {
             $this->getToken();
-            $this->getInstrumentDataHeaders('VALIDATE_SESSIONS', $instrument);
-            return true;
+
+            // Use direct HTTP GET to check - more reliable than API client
+            $url = "{$this->baseUrl}/instrument_manager/instrument_data";
+            $response = $this->httpClient->get($url, [
+                'headers' => $this->getAuthHeaders(),
+                'query' => [
+                    'action' => 'VALIDATE_SESSIONS',
+                    'instrument' => $instrument
+                ]
+            ]);
+
+            $statusCode = $response->getStatusCode();
+
+            // 200 = instrument exists, 400/404 = doesn't exist
+            return $statusCode >= 200 && $statusCode < 300;
+
         } catch (\Exception $e) {
+            $this->logger->debug("Instrument check failed for '{$instrument}': " . $e->getMessage());
             return false;
         }
     }

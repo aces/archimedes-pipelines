@@ -16,8 +16,7 @@ use Psr\Log\LoggerInterface;
  * Uses ClinicalClient (loris-php-api-client) for:
  * - Authentication
  * - Instrument CSV upload
- *
- * Falls back to web module if API unavailable.
+ * - Auto-install instruments from data dictionary
  */
 class ClinicalPipeline
 {
@@ -37,6 +36,7 @@ class ClinicalPipeline
         'rows_uploaded' => 0,
         'rows_skipped' => 0,
         'candidates_created' => 0,
+        'instruments_installed' => 0,
         'errors' => []
     ];
 
@@ -50,7 +50,7 @@ class ClinicalPipeline
         $logLevel = $verbose ? Logger::DEBUG : Logger::INFO;
         $this->logger = new Logger('clinical');
 
-        // Create formatter for clean output (no empty [] [])
+        // Create formatter for clean output
         $formatter = new CleanLogFormatter();
 
         // Console handler
@@ -66,9 +66,7 @@ class ClinicalPipeline
             $this->logger->pushHandler($fileHandler);
         }
 
-        // ──────────────────────────────────────────────────────────────────
         // Use ClinicalClient (wraps loris-php-api-client)
-        // ──────────────────────────────────────────────────────────────────
         $this->client = new ClinicalClient(
             $config['api']['base_url'],
             $config['api']['username'],
@@ -77,7 +75,7 @@ class ClinicalPipeline
             $this->logger
         );
 
-        // Initialize Database (FALLBACK #3: Direct SQL when needed)
+        // Initialize Database
         $this->db = new Database($config, $this->logger);
 
         $this->notification = new Notification();
@@ -258,22 +256,29 @@ class ClinicalPipeline
         // Validate CSV
         if (!$this->validateCSV($csvFile)) {
             $this->logger->error("  ✗ Invalid CSV file");
+            $this->stats['failed']++;
+            $this->stats['errors'][] = [
+                'instrument' => $instrument,
+                'file' => $csvFile,
+                'errors' => ['Invalid CSV format - missing required columns']
+            ];
             return 'failed';
         }
 
-        // Check instrument exists in LORIS (via API client)
-        $instrumentExists = $this->client->instrumentExists($instrument);
-        if (!$instrumentExists) {
-            $this->logger->warning("  ⚠ Instrument '{$instrument}' may not exist in LORIS");
+        // Check instrument exists in LORIS, try to install if not
+        if (!$this->ensureInstrumentExists($project, $instrument)) {
+            $this->stats['failed']++;
+            return 'failed';
         }
 
         // Dry run
         if ($this->dryRun) {
             $this->logger->info("  DRY RUN - Would upload {$rowCount} row(s)");
+            $this->stats['success']++;
             return 'success';
         }
 
-        // Upload via ClinicalClient (API first, web module fallback)
+        // Upload via ClinicalClient
         try {
             $this->logger->info("  Uploading to LORIS via API (CREATE_SESSIONS mode)...");
             $startTime = microtime(true);
@@ -288,103 +293,203 @@ class ClinicalPipeline
             $this->logger->info("  Upload completed in {$duration}s");
 
             if ($result['success'] ?? false) {
-                // Success - log details
                 $this->logger->info("  ✓ Upload successful");
+                $this->stats['success']++;
 
                 // Parse message for statistics
-                $saved = 0;
-                $total = 0;
-                if (isset($result['message'])) {
-                    if (preg_match('/Saved (\d+) out of (\d+)/', $result['message'], $matches)) {
-                        $saved = (int)$matches[1];
-                        $total = (int)$matches[2];
-                        $skipped = $total - $saved;
-
-                        $this->stats['rows_uploaded'] += $saved;
-                        $this->stats['rows_skipped'] += $skipped;
-
-                        $this->logger->info("    Rows saved: {$saved}/{$total}");
-                        if ($skipped > 0) {
-                            $this->logger->info("    Rows skipped: {$skipped} (already exist)");
-                        }
-                    } else {
-                        $this->logger->info("    " . $result['message']);
-                    }
-                }
-
-                // Log new candidates created
-                if (isset($result['idMapping']) && !empty($result['idMapping']) && $saved > 0) {
-                    $newCandidates = count($result['idMapping']);
-                    $this->stats['candidates_created'] += $newCandidates;
-                    $this->logger->info("    New Records created: {$newCandidates}");
-
-                    if ($this->verbose) {
-                        foreach ($result['idMapping'] as $mapping) {
-                            $this->logger->debug("      StudyID {$mapping['ExtStudyID']} → CandID {$mapping['CandID']}");
-                        }
-                    }
-                }
+                $this->parseUploadResult($result);
 
                 // Archive
                 $this->archiveFile($project, $csvFile, 'clinical');
                 return 'success';
 
             } else {
-                // Upload failed
                 $this->logger->error("  ✗ Upload failed");
+                $this->stats['failed']++;
 
-                $errorEntry = [
-                    'instrument' => $instrument,
-                    'file' => $csvFile,
-                    'errors' => []
-                ];
-
-                if (isset($result['message'])) {
-                    if (is_array($result['message'])) {
-                        $errorCount = count($result['message']);
-                        $this->logger->error("    Errors: {$errorCount}");
-
-                        $errorEntry['errors'] = $result['message'];
-
-                        $maxErrors = 5;
-                        foreach (array_slice($result['message'], 0, $maxErrors) as $i => $error) {
-                            if (is_array($error)) {
-                                $msg = $error['message'] ?? json_encode($error);
-                                $this->logger->error("      " . ($i + 1) . ". " . $msg);
-                            } else {
-                                $this->logger->error("      " . ($i + 1) . ". " . $error);
-                            }
-                        }
-
-                        if ($errorCount > $maxErrors) {
-                            $remaining = $errorCount - $maxErrors;
-                            $this->logger->error("      ... and {$remaining} more error(s)");
-                        }
-                    } else {
-                        $errorEntry['errors'][] = $result['message'];
-                        $this->logger->error("    " . $result['message']);
-                    }
-                }
-
-                $this->stats['errors'][] = $errorEntry;
+                $this->logUploadErrors($instrument, $csvFile, $result);
                 return 'failed';
             }
 
         } catch (\Exception $e) {
             $this->logger->error("  ✗ Upload exception: " . $e->getMessage());
-            if ($this->verbose) {
-                $this->logger->debug("    Stack trace:");
-                $this->logger->debug($e->getTraceAsString());
-            }
-
+            $this->stats['failed']++;
             $this->stats['errors'][] = [
                 'instrument' => $instrument,
                 'file' => $csvFile,
                 'errors' => [$e->getMessage()]
             ];
-
             return 'failed';
         }
+    }
+
+    /**
+     * Ensure instrument exists in LORIS, try to install if not
+     */
+    private function ensureInstrumentExists(array $project, string $instrument): bool
+    {
+        // Check if instrument exists
+        if ($this->client->instrumentExists($instrument)) {
+            $this->logger->debug("    Instrument '{$instrument}' exists in LORIS");
+            return true;
+        }
+
+        $this->logger->warning("  ⚠ Instrument '{$instrument}' not found in LORIS");
+
+        // Try to find definition in data dictionary
+        $ddPath = $project['data_access']['mount_path'] . '/documentation/data_dictionary';
+
+        $linstFile = "{$ddPath}/{$instrument}.linst";
+        $csvFile = "{$ddPath}/{$instrument}.csv";
+
+        $installFile = null;
+        $fileType = null;
+
+        if (file_exists($linstFile)) {
+            $installFile = $linstFile;
+            $fileType = 'LINST';
+            $this->logger->info("    Found data dictionary: {$instrument}.linst");
+        } elseif (file_exists($csvFile)) {
+            $installFile = $csvFile;
+            $fileType = 'REDCap CSV';
+            $this->logger->info("    Found data dictionary: {$instrument}.csv");
+        }
+
+        if ($installFile === null) {
+            $this->logger->error("  ✗ Instrument definition not found in data dictionary");
+            $this->logger->error("    Please install '{$instrument}' manually or add definition to:");
+            $this->logger->error("      {$ddPath}/{$instrument}.linst (LORIS format)");
+            $this->logger->error("      {$ddPath}/{$instrument}.csv (REDCap format)");
+
+            $this->stats['errors'][] = [
+                'instrument' => $instrument,
+                'file' => '',
+                'errors' => [
+                    "Instrument '{$instrument}' not installed in LORIS",
+                    "No definition found in {$ddPath}/",
+                    "Please install manually or add {$instrument}.linst or {$instrument}.csv to data dictionary"
+                ]
+            ];
+            return false;
+        }
+
+        // Try to install
+        if ($this->dryRun) {
+            $this->logger->info("    DRY RUN - Would install instrument from {$fileType}");
+            return true;
+        }
+
+        $this->logger->info("    Installing instrument from {$fileType}...");
+
+        try {
+            $success = $this->client->installInstrument($installFile);
+
+            if ($success) {
+                $this->logger->info("    ✓ Instrument '{$instrument}' installed successfully");
+                $this->stats['instruments_installed']++;
+                return true;
+            } else {
+                $this->logger->error("    ✗ Failed to install instrument");
+                $this->stats['errors'][] = [
+                    'instrument' => $instrument,
+                    'file' => $installFile,
+                    'errors' => ["Failed to install instrument from {$fileType}"]
+                ];
+                return false;
+            }
+
+        } catch (\Exception $e) {
+            $this->logger->error("    ✗ Install exception: " . $e->getMessage());
+            $this->stats['errors'][] = [
+                'instrument' => $instrument,
+                'file' => $installFile,
+                'errors' => ["Install failed: " . $e->getMessage()]
+            ];
+            return false;
+        }
+    }
+
+    /**
+     * Parse upload result and update stats
+     */
+    private function parseUploadResult(array $result): void
+    {
+        $saved = 0;
+        $total = 0;
+
+        if (isset($result['message']) && is_string($result['message'])) {
+            if (preg_match('/Saved (\d+) out of (\d+)/', $result['message'], $matches)) {
+                $saved = (int)$matches[1];
+                $total = (int)$matches[2];
+                $skipped = $total - $saved;
+
+                $this->stats['rows_uploaded'] += $saved;
+                $this->stats['rows_skipped'] += $skipped;
+
+                $this->logger->info("    Rows saved: {$saved}/{$total}");
+                if ($skipped > 0) {
+                    $this->logger->info("    Rows skipped: {$skipped} (already exist)");
+                }
+            } else {
+                $this->logger->info("    " . $result['message']);
+            }
+        }
+
+        // Log new candidates created
+        if (isset($result['idMapping']) && !empty($result['idMapping']) && $saved > 0) {
+            $newCandidates = count($result['idMapping']);
+            $this->stats['candidates_created'] += $newCandidates;
+            $this->logger->info("    New Records created: {$newCandidates}");
+
+            if ($this->verbose) {
+                foreach ($result['idMapping'] as $mapping) {
+                    $extId = $mapping['ExtStudyID'] ?? 'N/A';
+                    $candId = $mapping['CandID'] ?? 'N/A';
+                    $this->logger->debug("      StudyID {$extId} → CandID {$candId}");
+                }
+            }
+        }
+    }
+
+    /**
+     * Log upload errors
+     */
+    private function logUploadErrors(string $instrument, string $csvFile, array $result): void
+    {
+        $errorEntry = [
+            'instrument' => $instrument,
+            'file' => $csvFile,
+            'errors' => []
+        ];
+
+        if (isset($result['message'])) {
+            if (is_array($result['message'])) {
+                $errorCount = count($result['message']);
+                $this->logger->error("    Errors: {$errorCount}");
+
+                $errorEntry['errors'] = $result['message'];
+
+                $maxErrors = 5;
+                foreach (array_slice($result['message'], 0, $maxErrors) as $i => $error) {
+                    if (is_array($error)) {
+                        $msg = $error['message'] ?? json_encode($error);
+                        $this->logger->error("      " . ($i + 1) . ". " . $msg);
+                    } else {
+                        $this->logger->error("      " . ($i + 1) . ". " . $error);
+                    }
+                }
+
+                if ($errorCount > $maxErrors) {
+                    $remaining = $errorCount - $maxErrors;
+                    $this->logger->error("      ... and {$remaining} more error(s)");
+                }
+            } else {
+                $errorEntry['errors'][] = $result['message'];
+                $this->logger->error("    " . $result['message']);
+            }
+        }
+
+        $this->stats['errors'][] = $errorEntry;
     }
 
     /**
@@ -517,6 +622,11 @@ class ClinicalPipeline
         $this->logger->info("  Successfully uploaded: {$this->stats['success']}");
         $this->logger->info("  Failed: {$this->stats['failed']}");
         $this->logger->info("  Skipped: {$this->stats['skipped']}");
+
+        if ($this->stats['instruments_installed'] > 0) {
+            $this->logger->info("----------------------------------------");
+            $this->logger->info("Instruments auto-installed: {$this->stats['instruments_installed']}");
+        }
 
         if ($this->stats['rows_uploaded'] > 0 || $this->stats['rows_skipped'] > 0) {
             $this->logger->info("----------------------------------------");
