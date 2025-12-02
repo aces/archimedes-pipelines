@@ -3,7 +3,7 @@ declare(strict_types=1);
 
 namespace LORIS\Pipelines;
 
-use LORIS\Endpoints\{Tokens, Clinical};
+use LORIS\Endpoints\ClinicalClient;
 use LORIS\Database\Database;
 use LORIS\Utils\{Notification, CleanLogFormatter};
 use Monolog\Logger;
@@ -13,17 +13,17 @@ use Psr\Log\LoggerInterface;
 /**
  * Clinical Data Ingestion Pipeline
  *
- * Priority:
- * 1. Use API endpoints (PRIMARY)
- * 2. Use LORIS PHP library functions (if no API)
- * 3. Use direct SQL (FALLBACK only)
+ * Uses ClinicalClient (loris-php-api-client) for:
+ * - Authentication
+ * - Instrument CSV upload
+ *
+ * Falls back to web module if API unavailable.
  */
 class ClinicalPipeline
 {
     private array $config;
     private LoggerInterface $logger;
-    private Tokens $tokens;
-    private Clinical $clinicalAPI;
+    private ClinicalClient $client;
     private Database $db;
     private Notification $notification;
     private bool $dryRun;
@@ -66,16 +66,16 @@ class ClinicalPipeline
             $this->logger->pushHandler($fileHandler);
         }
 
-        // Initialize API client (PRIORITY #1: USE API)
-        $this->tokens = new Tokens(
+        // ──────────────────────────────────────────────────────────────────
+        // Use ClinicalClient (wraps loris-php-api-client)
+        // ──────────────────────────────────────────────────────────────────
+        $this->client = new ClinicalClient(
             $config['api']['base_url'],
             $config['api']['username'],
             $config['api']['password'],
             $config['api']['token_expiry_minutes'] ?? 55,
             $this->logger
         );
-
-        $this->clinicalAPI = new Clinical($this->tokens, $this->logger);
 
         // Initialize Database (FALLBACK #3: Direct SQL when needed)
         $this->db = new Database($config, $this->logger);
@@ -96,8 +96,8 @@ class ClinicalPipeline
         }
 
         try {
-            // Authenticate
-            $this->tokens->authenticate();
+            // Authenticate via loris-php-api-client
+            $this->client->authenticate();
 
             // Discover projects
             $projects = $this->discoverProjects($filters);
@@ -220,13 +220,12 @@ class ClinicalPipeline
         foreach ($instruments as $instrument) {
             $result = $this->processInstrument($project, $instrument, $clinicalDir);
 
-            $projectStats['total']++;   // ADD THIS
-            $projectStats[$result]++;   // success/failed/skipped
+            $projectStats['total']++;
+            $projectStats[$result]++;
         }
 
         // Send notification
         $this->sendProjectNotification($project, $projectStats);
-        echo "sdsdsds";
     }
 
     /**
@@ -247,7 +246,6 @@ class ClinicalPipeline
             return 'skipped';
         }
 
-
         $this->logger->info("\n  Processing: {$instrument}");
         $this->stats['total']++;
 
@@ -263,8 +261,8 @@ class ClinicalPipeline
             return 'failed';
         }
 
-        // Check instrument exists in LORIS (API call)
-        $instrumentExists = $this->clinicalAPI->instrumentExists($instrument);
+        // Check instrument exists in LORIS (via API client)
+        $instrumentExists = $this->client->instrumentExists($instrument);
         if (!$instrumentExists) {
             $this->logger->warning("  ⚠ Instrument '{$instrument}' may not exist in LORIS");
         }
@@ -275,15 +273,15 @@ class ClinicalPipeline
             return 'success';
         }
 
-        // Upload via API (PRIMARY METHOD with CREATE_SESSIONS)
+        // Upload via ClinicalClient (API first, web module fallback)
         try {
             $this->logger->info("  Uploading to LORIS via API (CREATE_SESSIONS mode)...");
             $startTime = microtime(true);
 
-            $result = $this->clinicalAPI->uploadInstrumentCSV(
+            $result = $this->client->uploadInstrumentCSV(
                 $instrument,
                 $csvFile,
-                'CREATE_SESSIONS'  // Always create non-existent sessions
+                'CREATE_SESSIONS'
             );
 
             $duration = round(microtime(true) - $startTime, 2);
@@ -314,9 +312,7 @@ class ClinicalPipeline
                     }
                 }
 
-                // Log new candidates created - only count if rows were actually uploaded
-                // idMapping can contain entries for both new candidates AND new sessions for existing candidates
-                // Only count as "new candidates" if we actually saved new data rows
+                // Log new candidates created
                 if (isset($result['idMapping']) && !empty($result['idMapping']) && $saved > 0) {
                     $newCandidates = count($result['idMapping']);
                     $this->stats['candidates_created'] += $newCandidates;
@@ -337,14 +333,12 @@ class ClinicalPipeline
                 // Upload failed
                 $this->logger->error("  ✗ Upload failed");
 
-                // Track errors
                 $errorEntry = [
                     'instrument' => $instrument,
                     'file' => $csvFile,
                     'errors' => []
                 ];
 
-                // Log error details
                 if (isset($result['message'])) {
                     if (is_array($result['message'])) {
                         $errorCount = count($result['message']);
@@ -352,7 +346,6 @@ class ClinicalPipeline
 
                         $errorEntry['errors'] = $result['message'];
 
-                        // Log first few errors
                         $maxErrors = 5;
                         foreach (array_slice($result['message'], 0, $maxErrors) as $i => $error) {
                             if (is_array($error)) {
@@ -384,7 +377,6 @@ class ClinicalPipeline
                 $this->logger->debug($e->getTraceAsString());
             }
 
-            // Track exception in errors
             $this->stats['errors'][] = [
                 'instrument' => $instrument,
                 'file' => $csvFile,
@@ -403,9 +395,7 @@ class ClinicalPipeline
         $count = 0;
         $handle = fopen($csvFile, 'r');
         if ($handle) {
-            // Skip header
             fgetcsv($handle);
-            // Count data rows
             while (fgetcsv($handle) !== false) {
                 $count++;
             }
@@ -423,13 +413,11 @@ class ClinicalPipeline
             return false;
         }
 
-        // Get headers
         $handle = fopen($csvFile, 'r');
         $headers = fgetcsv($handle);
         fclose($handle);
 
-        // Check required columns
-        $required = ['PSCID', 'Visit_label'];
+        $required = ['Visit_label'];
         foreach ($required as $col) {
             if (!in_array($col, $headers)) {
                 $this->logger->error("  Missing required column: {$col}");
@@ -445,12 +433,10 @@ class ClinicalPipeline
      */
     private function archiveFile(array $project, string $sourceFile, string $modality): bool
     {
-        // Build folder: processed/<modality>/YYYY-MM-DD
         $archiveDir = rtrim($project['data_access']['mount_path'], '/')
             . "/processed/{$modality}/"
             . date('Y-m-d');
 
-        // Create directory if missing
         if (!is_dir($archiveDir)) {
             if (!mkdir($archiveDir, 0755, true)) {
                 $this->logger->error("  ✗ Failed to create archive directory: {$archiveDir}");
@@ -461,66 +447,44 @@ class ClinicalPipeline
         $filename = basename($sourceFile);
         $destFile = "{$archiveDir}/{$filename}";
 
-        // If file already exists, prevent overwrite
         if (file_exists($destFile)) {
             $uniqueName = time() . "_" . $filename;
             $destFile   = "{$archiveDir}/{$uniqueName}";
             $this->logger->warning("  ⚠ File exists, copying as: {$uniqueName}");
         }
 
-        // COPY ONLY (NO DELETE)
         if (copy($sourceFile, $destFile)) {
             $this->logger->info("  ✓ Copied to archive: {$destFile}");
             return true;
         }
 
-        // Copy failed
         $this->logger->error("  ✗ Failed to copy file: {$sourceFile} → {$destFile}");
         return false;
     }
 
-
-    /**
-     * Send project notification for clinical modality
-     *
-     * Sends email based on success OR failure for this modality:
-     * - If ANY files failed → send ERROR email
-     * - If ALL successful → send SUCCESS email
-     * - Respects enable/disable flags at all levels
-     */
     /**
      * Send project notification for clinical modality
      */
     private function sendProjectNotification(array $project, array $projectStats): void
     {
-        echo "\n=== DEBUG: Entering sendProjectNotification() ===\n";
-
         $modality = 'clinical';
         $projectName = $project['project_common_name'];
 
-        // Determine success or failure
         $hasFailures = ($projectStats['failed'] ?? 0) > 0;
 
-        // Read email lists from project.json
         $successEmails = $project['notification_emails'][$modality]['on_success'] ?? [];
         $errorEmails   = $project['notification_emails'][$modality]['on_error'] ?? [];
 
-        // Choose which email list to use
         $emailsToSend = $hasFailures ? $errorEmails : $successEmails;
 
         if (empty($emailsToSend)) {
-            echo "DEBUG: No email defined. Skipping.\n";
             return;
         }
 
-        echo "DEBUG: Email list found → " . implode(", ", $emailsToSend) . "\n";
-
-        // Build subject
         $subject = $hasFailures
             ? "FAILED: $projectName Clinical Ingestion"
             : "SUCCESS: $projectName Clinical Ingestion";
 
-        // Build body
         $body  = "Project: $projectName\n";
         $body .= "Modality: $modality\n\n";
         $body .= "Files Processed: {$projectStats['total']}\n";
@@ -535,13 +499,10 @@ class ClinicalPipeline
             $body .= "✔ Ingestion completed successfully.\n";
         }
 
-        // SEND EMAIL(S) — using simple mail()
         foreach ($emailsToSend as $emailTo) {
-            echo "DEBUG: Sending email to: $emailTo\n";
             $this->notification->send($emailTo, $subject, $body);
         }
     }
-
 
     /**
      * Print summary
@@ -557,7 +518,6 @@ class ClinicalPipeline
         $this->logger->info("  Failed: {$this->stats['failed']}");
         $this->logger->info("  Skipped: {$this->stats['skipped']}");
 
-        // Data statistics
         if ($this->stats['rows_uploaded'] > 0 || $this->stats['rows_skipped'] > 0) {
             $this->logger->info("----------------------------------------");
             $this->logger->info("Data Rows:");
@@ -569,20 +529,17 @@ class ClinicalPipeline
             $this->logger->info("  Total processed: {$totalRows}");
         }
 
-        // Candidate creation - only show if candidates were actually created
         if ($this->stats['candidates_created'] > 0) {
             $this->logger->info("----------------------------------------");
             $this->logger->info("New Records Created: {$this->stats['candidates_created']}");
         }
 
-        // Calculate success rate
         if ($this->stats['total'] > 0) {
             $successRate = round(($this->stats['success'] / $this->stats['total']) * 100, 1);
             $this->logger->info("----------------------------------------");
             $this->logger->info("Success Rate: {$successRate}%");
         }
 
-        // Error summary
         if (!empty($this->stats['errors'])) {
             $this->logger->info("----------------------------------------");
             $this->logger->error("Errors Encountered:");
@@ -619,7 +576,6 @@ class ClinicalPipeline
             return false;
         }
 
-        // Scan all date directories
         $folders = glob($base . "/*", GLOB_ONLYDIR);
 
         foreach ($folders as $folder) {
@@ -630,6 +586,4 @@ class ClinicalPipeline
 
         return false;
     }
-
-
 }
