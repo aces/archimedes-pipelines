@@ -10,14 +10,14 @@ The pipelines are expected to be installed on the predefined data mount for the 
 
 ## Features
 
--  **Clinical Data Ingestion** - Automated CSV processing and upload
--  **Candidate Management** - Automatic candidate and visit creation
--  **Bulk Operations** - Process multiple files and projects
--  **Email Notifications** - Success/failure reports via email
--  **Comprehensive Logging** - Detailed execution logs with rotation
--  **Dry Run Mode** - Test without making actual changes
--  **Imaging Data Ingestion** - BIDS data set Ingestion
--  **Multi-Project Support** - Handle multiple projects and collections
+- **Clinical Data Ingestion** - Automated CSV processing and upload
+- **Clinical Instrument Install** - Install REDCap or LINST instruments
+- **Bulk Operations** - Process multiple files and projects
+- **Email Notifications** - Success/failure reports via email
+- **Comprehensive Logging** - Detailed execution logs with rotation
+- **Dry Run Mode** - Test without making actual changes
+- **Imaging Data Ingestion** - BIDS dataset ingestion
+- **Multi-Project Support** - Handle multiple projects and collections
 
 ---
 
@@ -25,7 +25,7 @@ The pipelines are expected to be installed on the predefined data mount for the 
 
 - PHP >= 8.1
 - Composer
--  [loris-php-api-client](https://github.com/aces/loris-php-api-client) (installed automatically)
+- [loris-php-api-client](https://github.com/aces/loris-php-api-client) (installed automatically)
 - MySQL/MariaDB (for database fallback operations)
 - Extensions: `curl`, `json`, `pdo`, `mbstring`
 
@@ -34,12 +34,9 @@ The pipelines are expected to be installed on the predefined data mount for the 
 ## Installation
 
 ```bash
-# Clone repository
 cd /opt
 git clone https://github.com/aces/archimedes-pipelines.git
-cd loris-pipelines
-
-# Install dependencies (including loris-php-client)
+cd archimedes-pipelines
 composer install
 ```
 
@@ -55,167 +52,161 @@ This will automatically install:
 
 ### Main Configuration
 
-Copy the example config file and edit your LORIS credentials:
+Copy the example config file and edit your LORIS credentials and collections:
 
 ```bash
 cp config/loris_client_config.json.example config/loris_client_config.json
 nano config/loris_client_config.json
 ```
 
-### Run Clinical Pipeline
+### Project Configuration
 
-#### Dry Run Mode (Recommended First)
+Each project requires a `project.json` file at its root. See `config/project.json.example` for reference.
 
-Test the pipeline without making any changes:
+---
 
-```bash
-# Dry run for all projects
-php scripts/run_clinical_pipeline.php --all --dry-run --verbose
+## Clinical Ingestion Workflow
 
-# Dry run for specific project
-php scripts/run_clinical_pipeline.php --collection=example_collection --project=PROJECT_A --dry-run
+The clinical pipeline follows this process:
+
+```
+1. Load Collections from Config
+   └── Read collections array from loris_client_config.json
+       ├── Collection A
+       │   ├── Project 1 (enabled)
+       │   └── Project 2 (disabled)
+       └── Collection B
+           └── Project 1 (enabled)
+
+2. For each enabled Collection:
+   └── For each enabled Project:
+       ├── Load project.json configuration
+       ├── Check if modality (clinical) is enabled
+       └── Continue to instrument processing
+
+3. For each Instrument:
+   ├── Check if instrument is installed in LORIS
+   ├── If NOT installed:
+   │   ├── Look for definition in documentation/data_dictionary/
+   │   ├── Find .linst file OR REDCap data dictionary CSV
+   │   └── Install instrument via API
+   └── If installed:
+       └── Continue to data ingestion
+
+4. Data Ingestion:
+   ├── Read CSV from deidentified-raw/clinical/
+   ├── Validate data against instrument schema
+   ├── Create candidates (if not exist)
+   ├── Create visits (if not exist)
+   └── Upload instrument data via API
+
+5. Post-Processing:
+   ├── Move processed files to processed/clinical/
+   ├── Log results
+   └── Send email notification (if enabled)
 ```
 
-#### Process All Data
+### Collections Configuration
 
-Run the pipeline for all configured projects:
+Collections and projects are defined in `loris_client_config.json`. Each collection has a base path and a list of projects that can be individually enabled or disabled. See `config/loris_client_config.json.example` for reference.
+
+### Instrument Definition Location
+
+Instrument definitions should be placed in the project's `documentation/data_dictionary/` folder. The pipeline automatically detects the format (LINST or REDCap CSV) and installs accordingly.
+
+---
+
+## Running the Clinical Pipeline
+
+### Dry Run Mode (Recommended First)
+
+```bash
+php scripts/run_clinical_pipeline.php --all --dry-run --verbose
+```
+
+### Process All Projects
 
 ```bash
 php scripts/run_clinical_pipeline.php --all
 ```
 
-#### Process Specific Project
-
-Run the pipeline for a single project:
+### Process Specific Project
 
 ```bash
-php scripts/run_clinical_pipeline.php --collection=example_collection --project=PROJECT_A
+php scripts/run_clinical_pipeline.php --collection=COLLECTION_NAME --project=PROJECT_NAME
 ```
 
-#### Process Specific Instrument
-
-Run the pipeline for a specific instrument:
+### Process Specific Instrument
 
 ```bash
-php scripts/run_clinical_pipeline.php --collection=example_collection --project=PROJECT_A --instrument=demographics
-```
-
-#### Verbose Output
-
-Enable detailed logging output:
-
-```bash
-php scripts/run_clinical_pipeline.php --all --verbose
+php scripts/run_clinical_pipeline.php --collection=COLLECTION_NAME --project=PROJECT_NAME --instrument=INSTRUMENT_NAME
 ```
 
 ---
 
-### Command-Line Options
+## Command-Line Options
 
-| Option | Description | Example                          |
-|--------|-------------|----------------------------------|
-| `--all` | Process all projects | `--all`                          |
-| `--collection=NAME` | Specific collection | `--collection=example_collection` |
-| `--project=NAME` | Specific project | `--project=PROJECT_A`            |
-| `--instrument=NAME` | Specific instrument | `--instrument=instr`             |
-| `--dry-run` | Test without changes | `--dry-run`                      |
-| `--verbose` | Detailed output | `--verbose`                      |
-| `--help` | Show help | `--help`                         |
-
----
-
-
-## Pipeline Architecture
-
-```
-┌─────────────────────────────────────┐
-│     loris-pipelines                 │
-│  ┌───────────────────────────────┐  │
-│  │  ClinicalPipeline.php         │  │
-│  │  ├─ Read CSV files            │  │
-│  │  ├─ Validate data             │  │
-│  │  ├─ Create candidates         │  │
-│  │  ├─ Create visits             │  │
-│  │  └─ Upload instrument data    │  │
-│  └───────────┬───────────────────┘  │
-│              │ uses                 │
-│              ▼                       │
-│  ┌───────────────────────────────┐  │
-│  │  Email notifications          │  │
-│  │  Logging infrastructure       │  │
-│  └───────────────────────────────┘  │
-└──────────────┬──────────────────────┘
-               │ depends on
-               ▼
-┌──────────────────────────────────────┐
-│     aces/loris-php-client            │
-│  ┌────────────────────────────────┐  │
-│  │  AuthenticationApi             │  │
-│  │  ClinicalApi                   │  │
-│  │  Auto-generated from OpenAPI   │  │
-│  └────────────────────────────────┘  │
-└──────────────┬───────────────────────┘
-               │ HTTP calls
-               ▼
-┌──────────────────────────────────────┐
-│      LORIS API Server                │
-│   https://your-loris.org/api/v0.0.4  │
-└──────────────────────────────────────┘
-```
+| Option | Description |
+|--------|-------------|
+| `--all` | Process all projects |
+| `--collection=NAME` | Specific collection |
+| `--project=NAME` | Specific project |
+| `--instrument=NAME` | Specific instrument |
+| `--dry-run` | Test without changes |
+| `--verbose` | Detailed output |
+| `--help` | Show help |
 
 ---
 
-### Directory Structure
+
+---
+
+## Directory Structure
 
 ```
-/BHI_CBIG_SharedStorage/Projects/{ProjectName}/
-├── project.json                          # Project metadata & configuration
+{collection_base_path}/{ProjectName}/
+├── project.json                          # Project configuration
 │
-├── deidentified-raw/                     # Fully de-identified participant data
-│   ├── demographics_archimedes.csv       # Standard demographics for all projects
-│   ├── demographics_project.csv          # Additions to the standard form
+├── deidentified-raw/                     # De-identified participant data
+│   ├── clinical/                         # Clinical instrument CSVs
 │   ├── imaging/
-│   │   ├── dicoms/                       # Raw medical imaging data (non-BIDS)
-│   ├── clinical/                         # Patient records & behavioural assessments
-|   ├── bids/                             # Standardized BIDS structured datasets
-│   └── genomics/                         # Genomic & epigenetic sequencing data
+│   │   └── dicoms/
+│   ├── bids/
+│   └── genomics/
 │
-├── deidentified-lorisid/                 # LORIS-relabelled participant data
+├── deidentified-lorisid/                 # LORIS-relabelled data
+│   ├── clinical/
 │   ├── imaging/
-│   │   ├── dicoms/                       # Raw medical imaging data with LORIS Labels
-    ├──  bids/                            # Standardized BIDS structured datasets
-│   ├── clinical/                         # Patient records & behavioural assessments
-│   └── genomics/                         # Genomic & epigenetic sequencing data
+│   ├── bids/
+│   └── genomics/
 │
-├── deidentified-OPENID/                  # Different ID than LORIS ID (same subdivision)
-│   └── bids/                             # Standardized BIDS structured datasets
+├── processed/                            # Pipeline outputs
+│   ├── clinical/
+│   ├── imaging/
+│   ├── bids/
+│   │   └── derivatives/
+│   └── freesurfer-output/
 │
-├── processed/                            # Data after CBIG/LORIS processing
-│   ├── freesurfer-output/                # Converted & cleaned data (NIfTI, MINC)
-│   ├── bids/                             # Processed BIDS data
-│   │   ├── subjects/                     # Various subjects for BIDS
-│   │   └── derivatives/                  # Processed EEG data
-│   └── .imaging_processed/               # Hidden directory for processing markers
+├── logs/                                 # Execution logs
 │
-└── documentation/                        # Ethics, informed consent, and protocols
-    ├── data_dictionary/                  # Variable descriptions & mappings
-    └── readme.txt                        # Information about data structure
+└── documentation/
+    ├── data_dictionary/                  # Instrument definitions (.linst, REDCap CSV)
+    └── readme.txt
 ```
 
 ---
 
 ## Logging
 
-All pipeline executions are logged automatically:
+Logs are stored in each project's `logs/` directory.
 
 ```bash
 # View today's log
 tail -f logs/clinical_$(date +%Y-%m-%d).log
 
-# View specific date
-tail -f logs/clinical_2024-11-18.log
-
 # Search for errors
-grep "ERROR" logs/clinical_2024-11-18.log
-
+grep "ERROR" logs/clinical_YYYY-MM-DD.log
 ```
+
+---
+
