@@ -90,7 +90,23 @@ class ClinicalPipeline
         $this->logger->info("Started: " . date('Y-m-d H:i:s'));
 
         if ($this->dryRun) {
-            $this->logger->info("DRY RUN MODE - No uploads will be performed");
+            $this->logger->info("MODE: DRY RUN - No uploads will be performed");
+        }
+
+        if ($this->verbose) {
+            $this->logger->info("MODE: VERBOSE - Debug logging enabled");
+        }
+
+        // Log filters if any
+        if (!empty($filters)) {
+            $filterStr = [];
+            if (isset($filters['collection'])) {
+                $filterStr[] = "collection={$filters['collection']}";
+            }
+            if (isset($filters['project'])) {
+                $filterStr[] = "project={$filters['project']}";
+            }
+            $this->logger->info("Filters: " . implode(', ', $filterStr));
         }
 
         try {
@@ -102,6 +118,7 @@ class ClinicalPipeline
 
             if (empty($projects)) {
                 $this->logger->warning("No projects found to process");
+                $this->logger->info("  Check your filters or project configuration");
                 return 0;
             }
 
@@ -120,7 +137,8 @@ class ClinicalPipeline
             return $this->stats['failed'] > 0 ? 1 : 0;
 
         } catch (\Exception $e) {
-            $this->logger->error("FATAL: " . $e->getMessage());
+            $this->logger->error("FATAL ERROR: " . $e->getMessage());
+            $this->logger->debug("Stack trace: " . $e->getTraceAsString());
             return 1;
         }
     }
@@ -133,8 +151,11 @@ class ClinicalPipeline
         $projects = [];
         $collections = $this->config['collections'] ?? [];
 
+        $this->logger->debug("Discovering projects from " . count($collections) . " collection(s)");
+
         foreach ($collections as $collection) {
             if (!($collection['enabled'] ?? true)) {
+                $this->logger->debug("  Skipping disabled collection: {$collection['name']}");
                 continue;
             }
 
@@ -142,8 +163,11 @@ class ClinicalPipeline
                 continue;
             }
 
+            $this->logger->debug("  Scanning collection: {$collection['name']}");
+
             foreach ($collection['projects'] ?? [] as $projectConfig) {
                 if (!($projectConfig['enabled'] ?? true)) {
+                    $this->logger->debug("    Skipping disabled project: {$projectConfig['name']}");
                     continue;
                 }
 
@@ -156,19 +180,21 @@ class ClinicalPipeline
                 $projectJsonPath = $projectPath . '/project.json';
 
                 if (!file_exists($projectJsonPath)) {
-                    $this->logger->warning("Project config not found: {$projectJsonPath}");
+                    $this->logger->warning("    Project config not found: {$projectJsonPath}");
                     continue;
                 }
 
                 $projectData = json_decode(file_get_contents($projectJsonPath), true);
                 if (json_last_error() !== JSON_ERROR_NONE) {
-                    $this->logger->warning("Invalid JSON in: {$projectJsonPath}");
+                    $this->logger->warning("    Invalid JSON in: {$projectJsonPath}");
                     continue;
                 }
 
                 $projectData['_collection'] = $collection['name'];
                 $projectData['_projectPath'] = $projectPath;
                 $projects[] = $projectData;
+
+                $this->logger->debug("    ✓ Loaded: {$projectConfig['name']}");
             }
         }
 
@@ -180,30 +206,40 @@ class ClinicalPipeline
      */
     private function processProject(array $project): void
     {
+        $projectName = $project['project_common_name'] ?? 'Unknown';
+
         $this->logger->info("\n========================================");
-        $this->logger->info("Project: {$project['project_common_name']}");
+        $this->logger->info("Project: {$projectName}");
+        $this->logger->info("========================================");
 
         // Get clinical data directory
         $clinicalDir = $project['data_access']['mount_path'] . '/deidentified-lorisid/clinical';
 
+        $this->logger->debug("Clinical data directory: {$clinicalDir}");
+
         if (!is_dir($clinicalDir)) {
-            $this->logger->warning("Clinical directory not found: {$clinicalDir}");
+            $this->logger->warning("  ✗ Clinical directory not found: {$clinicalDir}");
+            $this->logger->info("    Expected path: {$clinicalDir}");
+            $this->logger->info("    Ensure deidentified data has been placed in the correct location");
             return;
         }
 
-        // Get instruments
+        // Get instruments from project.json
         $instruments = $project['clinical_instruments'] ?? [];
 
         if (empty($instruments)) {
-            $this->logger->warning("No clinical instruments defined in project.json");
+            $this->logger->warning("  ✗ No clinical_instruments defined in project.json");
+            $this->logger->info("    Add instruments to project.json under 'clinical_instruments' array");
             return;
         }
 
-        $this->logger->info("Instruments: " . implode(', ', $instruments));
+        $this->logger->info("Instruments defined in project.json: " . count($instruments));
+        $this->logger->info("  → " . implode(', ', $instruments));
 
         // Setup project-specific logging
         if (isset($project['logging']['log_path'])) {
             $projectLogFile = $project['logging']['log_path'] . '/clinical.log';
+            $this->logger->debug("Project log: {$projectLogFile}");
             $this->logger->pushHandler(new RotatingFileHandler($projectLogFile, 30));
         }
 
@@ -215,12 +251,20 @@ class ClinicalPipeline
             'skipped' => 0
         ];
 
+        $this->logger->info("\nProcessing instruments:");
+        $this->logger->info("----------------------------------------");
+
         foreach ($instruments as $instrument) {
             $result = $this->processInstrument($project, $instrument, $clinicalDir);
 
             $projectStats['total']++;
             $projectStats[$result]++;
         }
+
+        // Project summary
+        $this->logger->info("\n----------------------------------------");
+        $this->logger->info("Project '{$projectName}' completed:");
+        $this->logger->info("  Total: {$projectStats['total']}, Success: {$projectStats['success']}, Failed: {$projectStats['failed']}, Skipped: {$projectStats['skipped']}");
 
         // Send notification
         $this->sendProjectNotification($project, $projectStats);
@@ -233,54 +277,109 @@ class ClinicalPipeline
     {
         $csvFile = "{$clinicalDir}/{$instrument}.csv";
 
+        // ─────────────────────────────────────────────────────────────
+        // CHECK 1: Does the CSV data file exist?
+        // ─────────────────────────────────────────────────────────────
         if (!file_exists($csvFile)) {
-            $this->logger->info("\n  ⚠ {$instrument}.csv not found (skipping)");
+            // Check if instrument definition exists in data_dictionary
+            $ddPath = $project['data_access']['mount_path'] . '/documentation/data_dictionary';
+            $linstFile = "{$ddPath}/{$instrument}.linst";
+            $ddCsvFile = "{$ddPath}/{$instrument}.csv";
+
+            $linstExists = file_exists($linstFile);
+            $ddCsvExists = file_exists($ddCsvFile);
+
+            if ($linstExists || $ddCsvExists) {
+                // DD exists but no data to ingest
+                $ddType = $linstExists ? '.linst' : '.csv';
+                $this->logger->info("\n  ⚠ {$instrument}:");
+                $this->logger->info("      Status: SKIPPED - No data to ingest");
+                $this->logger->info("      DD definition: ✓ Found ({$ddType})");
+                $this->logger->info("      Data CSV: ✗ Not found in deidentified folder");
+                $this->logger->debug("      Expected: {$csvFile}");
+            } else {
+                // Neither DD nor data exists
+                $this->logger->info("\n  ⚠ {$instrument}:");
+                $this->logger->info("      Status: SKIPPED - Missing DD and data");
+                $this->logger->info("      DD definition: ✗ Not found");
+                $this->logger->info("      Data CSV: ✗ Not found");
+                $this->logger->info("      Note: Defined in project.json but no files exist");
+                $this->logger->debug("      DD path checked: {$ddPath}");
+                $this->logger->debug("      Data path checked: {$csvFile}");
+            }
+
+            $this->stats['skipped']++;
             return 'skipped';
         }
 
+        // ─────────────────────────────────────────────────────────────
+        // CHECK 2: Has this file already been processed?
+        // ─────────────────────────────────────────────────────────────
         $filename = "{$instrument}.csv";
         if ($this->isAlreadyProcessed($project, $filename, 'clinical')) {
-            $this->logger->info("  ⚠ Already processed earlier → SKIPPING {$filename}");
+            $this->logger->info("\n  ⚠ {$instrument}:");
+            $this->logger->info("      Status: SKIPPED - Already processed");
+            $this->logger->info("      File found in processed/ archive folder");
+            $this->logger->debug("      Source: {$csvFile}");
+
+            $this->stats['skipped']++;
             return 'skipped';
         }
 
-        $this->logger->info("\n  Processing: {$instrument}");
+        // ─────────────────────────────────────────────────────────────
+        // FILE FOUND - Process it
+        // ─────────────────────────────────────────────────────────────
+        $this->logger->info("\n  → {$instrument}:");
         $this->stats['total']++;
 
         // Log file info
         $fileSize = filesize($csvFile);
         $fileSizeMB = round($fileSize / 1024 / 1024, 2);
+        $fileSizeKB = round($fileSize / 1024, 2);
         $rowCount = $this->countCSVRows($csvFile);
-        $this->logger->info("    File: {$instrument}.csv ({$fileSizeMB} MB, {$rowCount} rows)");
 
-        // Validate CSV
+        $sizeStr = $fileSizeMB >= 1 ? "{$fileSizeMB} MB" : "{$fileSizeKB} KB";
+        $this->logger->info("      File: {$instrument}.csv ({$sizeStr}, {$rowCount} rows)");
+
+        // ─────────────────────────────────────────────────────────────
+        // CHECK 3: Validate CSV structure
+        // ─────────────────────────────────────────────────────────────
         if (!$this->validateCSV($csvFile)) {
-            $this->logger->error("  ✗ Invalid CSV file");
+            $this->logger->error("      Status: FAILED - Invalid CSV format");
             $this->stats['failed']++;
             $this->stats['errors'][] = [
                 'instrument' => $instrument,
                 'file' => $csvFile,
-                'errors' => ['Invalid CSV format - missing required columns']
+                'errors' => ['Invalid CSV format - missing required columns (Visit_label)']
             ];
             return 'failed';
         }
 
-        // Check instrument exists in LORIS, try to install if not
+        $this->logger->debug("      CSV validation: ✓ Passed");
+
+        // ─────────────────────────────────────────────────────────────
+        // CHECK 4: Ensure instrument exists in LORIS (auto-install if needed)
+        // ─────────────────────────────────────────────────────────────
         if (!$this->ensureInstrumentExists($project, $instrument)) {
+            $this->logger->error("      Status: FAILED - Instrument not installed in LORIS");
             $this->stats['failed']++;
             return 'failed';
         }
 
-        // Dry run
+        // ─────────────────────────────────────────────────────────────
+        // DRY RUN - Don't actually upload
+        // ─────────────────────────────────────────────────────────────
         if ($this->dryRun) {
-            $this->logger->info("  DRY RUN - Would upload {$rowCount} row(s)");
+            $this->logger->info("      Status: DRY RUN - Would upload {$rowCount} row(s)");
             $this->stats['success']++;
             return 'success';
         }
 
-        // Upload via ClinicalClient
+        // ─────────────────────────────────────────────────────────────
+        // UPLOAD via ClinicalClient
+        // ─────────────────────────────────────────────────────────────
         try {
-            $this->logger->info("  Uploading to LORIS via API (CREATE_SESSIONS mode)...");
+            $this->logger->info("      Uploading to LORIS (CREATE_SESSIONS mode)...");
             $startTime = microtime(true);
 
             $result = $this->client->uploadInstrumentCSV(
@@ -290,29 +389,28 @@ class ClinicalPipeline
             );
 
             $duration = round(microtime(true) - $startTime, 2);
-            $this->logger->info("  Upload completed in {$duration}s");
 
             if ($result['success'] ?? false) {
-                $this->logger->info("  ✓ Upload successful");
+                $this->logger->info("      Status: SUCCESS ({$duration}s)");
                 $this->stats['success']++;
 
                 // Parse message for statistics
-                $this->parseUploadResult($result);
+                $this->parseUploadResult($result, $instrument);
 
-                // Archive
+                // Archive the processed file
                 $this->archiveFile($project, $csvFile, 'clinical');
                 return 'success';
 
             } else {
-                $this->logger->error("  ✗ Upload failed");
+                $this->logger->error("      Status: FAILED ({$duration}s)");
                 $this->stats['failed']++;
-
                 $this->logUploadErrors($instrument, $csvFile, $result);
                 return 'failed';
             }
 
         } catch (\Exception $e) {
-            $this->logger->error("  ✗ Upload exception: " . $e->getMessage());
+            $this->logger->error("      Status: FAILED - Exception");
+            $this->logger->error("      Error: " . $e->getMessage());
             $this->stats['failed']++;
             $this->stats['errors'][] = [
                 'instrument' => $instrument,
@@ -330,11 +428,11 @@ class ClinicalPipeline
     {
         // Check if instrument exists
         if ($this->client->instrumentExists($instrument)) {
-            $this->logger->debug("    Instrument '{$instrument}' exists in LORIS");
+            $this->logger->debug("      LORIS instrument: ✓ Exists");
             return true;
         }
 
-        $this->logger->warning("  ⚠ Instrument '{$instrument}' not found in LORIS");
+        $this->logger->warning("      LORIS instrument: ✗ Not found - attempting auto-install");
 
         // Try to find definition in data dictionary
         $ddPath = $project['data_access']['mount_path'] . '/documentation/data_dictionary';
@@ -348,18 +446,20 @@ class ClinicalPipeline
         if (file_exists($linstFile)) {
             $installFile = $linstFile;
             $fileType = 'LINST';
-            $this->logger->info("    Found data dictionary: {$instrument}.linst");
+            $this->logger->info("      DD found: {$instrument}.linst (LORIS format)");
         } elseif (file_exists($csvFile)) {
             $installFile = $csvFile;
             $fileType = 'REDCap CSV';
-            $this->logger->info("    Found data dictionary: {$instrument}.csv");
+            $this->logger->info("      DD found: {$instrument}.csv (REDCap format)");
         }
 
         if ($installFile === null) {
-            $this->logger->error("  ✗ Instrument definition not found in data dictionary");
-            $this->logger->error("    Please install '{$instrument}' manually or add definition to:");
-            $this->logger->error("      {$ddPath}/{$instrument}.linst (LORIS format)");
-            $this->logger->error("      {$ddPath}/{$instrument}.csv (REDCap format)");
+            $this->logger->error("      ✗ Cannot auto-install: No instrument definition found");
+            $this->logger->error("        Checked locations:");
+            $this->logger->error("          - {$ddPath}/{$instrument}.linst");
+            $this->logger->error("          - {$ddPath}/{$instrument}.csv");
+            $this->logger->info("        Action required: Install '{$instrument}' manually in LORIS");
+            $this->logger->info("        Or add definition file to data_dictionary folder");
 
             $this->stats['errors'][] = [
                 'instrument' => $instrument,
@@ -367,29 +467,30 @@ class ClinicalPipeline
                 'errors' => [
                     "Instrument '{$instrument}' not installed in LORIS",
                     "No definition found in {$ddPath}/",
-                    "Please install manually or add {$instrument}.linst or {$instrument}.csv to data dictionary"
+                    "Add {$instrument}.linst or {$instrument}.csv to data_dictionary, or install manually"
                 ]
             ];
             return false;
         }
 
-        // Try to install
+        // Dry run - don't actually install
         if ($this->dryRun) {
-            $this->logger->info("    DRY RUN - Would install instrument from {$fileType}");
+            $this->logger->info("      DRY RUN - Would install instrument from {$fileType}");
             return true;
         }
 
-        $this->logger->info("    Installing instrument from {$fileType}...");
+        // Try to install
+        $this->logger->info("      Installing instrument from {$fileType}...");
 
         try {
             $success = $this->client->installInstrument($installFile);
 
             if ($success) {
-                $this->logger->info("    ✓ Instrument '{$instrument}' installed successfully");
+                $this->logger->info("      ✓ Instrument '{$instrument}' installed successfully");
                 $this->stats['instruments_installed']++;
                 return true;
             } else {
-                $this->logger->error("    ✗ Failed to install instrument");
+                $this->logger->error("      ✗ Failed to install instrument");
                 $this->stats['errors'][] = [
                     'instrument' => $instrument,
                     'file' => $installFile,
@@ -399,7 +500,7 @@ class ClinicalPipeline
             }
 
         } catch (\Exception $e) {
-            $this->logger->error("    ✗ Install exception: " . $e->getMessage());
+            $this->logger->error("      ✗ Install exception: " . $e->getMessage());
             $this->stats['errors'][] = [
                 'instrument' => $instrument,
                 'file' => $installFile,
@@ -412,7 +513,7 @@ class ClinicalPipeline
     /**
      * Parse upload result and update stats
      */
-    private function parseUploadResult(array $result): void
+    private function parseUploadResult(array $result, string $instrument): void
     {
         $saved = 0;
         $total = 0;
@@ -426,12 +527,9 @@ class ClinicalPipeline
                 $this->stats['rows_uploaded'] += $saved;
                 $this->stats['rows_skipped'] += $skipped;
 
-                $this->logger->info("    Rows saved: {$saved}/{$total}");
-                if ($skipped > 0) {
-                    $this->logger->info("    Rows skipped: {$skipped} (already exist)");
-                }
+                $this->logger->info("      Rows: {$saved}/{$total} saved" . ($skipped > 0 ? " ({$skipped} already exist)" : ""));
             } else {
-                $this->logger->info("    " . $result['message']);
+                $this->logger->info("      Result: " . $result['message']);
             }
         }
 
@@ -439,13 +537,13 @@ class ClinicalPipeline
         if (isset($result['idMapping']) && !empty($result['idMapping']) && $saved > 0) {
             $newCandidates = count($result['idMapping']);
             $this->stats['candidates_created'] += $newCandidates;
-            $this->logger->info("    New Records created: {$newCandidates}");
+            $this->logger->info("      New records created: {$newCandidates}");
 
             if ($this->verbose) {
                 foreach ($result['idMapping'] as $mapping) {
                     $extId = $mapping['ExtStudyID'] ?? 'N/A';
                     $candId = $mapping['CandID'] ?? 'N/A';
-                    $this->logger->debug("      StudyID {$extId} → CandID {$candId}");
+                    $this->logger->debug("        StudyID {$extId} → CandID {$candId}");
                 }
             }
         }
@@ -465,7 +563,7 @@ class ClinicalPipeline
         if (isset($result['message'])) {
             if (is_array($result['message'])) {
                 $errorCount = count($result['message']);
-                $this->logger->error("    Errors: {$errorCount}");
+                $this->logger->error("      Errors: {$errorCount} issue(s)");
 
                 $errorEntry['errors'] = $result['message'];
 
@@ -473,19 +571,19 @@ class ClinicalPipeline
                 foreach (array_slice($result['message'], 0, $maxErrors) as $i => $error) {
                     if (is_array($error)) {
                         $msg = $error['message'] ?? json_encode($error);
-                        $this->logger->error("      " . ($i + 1) . ". " . $msg);
+                        $this->logger->error("        " . ($i + 1) . ". " . $msg);
                     } else {
-                        $this->logger->error("      " . ($i + 1) . ". " . $error);
+                        $this->logger->error("        " . ($i + 1) . ". " . $error);
                     }
                 }
 
                 if ($errorCount > $maxErrors) {
                     $remaining = $errorCount - $maxErrors;
-                    $this->logger->error("      ... and {$remaining} more error(s)");
+                    $this->logger->error("        ... and {$remaining} more error(s)");
                 }
             } else {
                 $errorEntry['errors'][] = $result['message'];
-                $this->logger->error("    " . $result['message']);
+                $this->logger->error("      Error: " . $result['message']);
             }
         }
 
@@ -500,7 +598,7 @@ class ClinicalPipeline
         $count = 0;
         $handle = fopen($csvFile, 'r');
         if ($handle) {
-            fgetcsv($handle);
+            fgetcsv($handle); // Skip header
             while (fgetcsv($handle) !== false) {
                 $count++;
             }
@@ -515,6 +613,7 @@ class ClinicalPipeline
     private function validateCSV(string $csvFile): bool
     {
         if (!is_readable($csvFile)) {
+            $this->logger->error("      CSV not readable: {$csvFile}");
             return false;
         }
 
@@ -522,12 +621,24 @@ class ClinicalPipeline
         $headers = fgetcsv($handle);
         fclose($handle);
 
+        if (empty($headers)) {
+            $this->logger->error("      CSV has no headers");
+            return false;
+        }
+
         $required = ['Visit_label'];
+        $missing = [];
+
         foreach ($required as $col) {
             if (!in_array($col, $headers)) {
-                $this->logger->error("  Missing required column: {$col}");
-                return false;
+                $missing[] = $col;
             }
+        }
+
+        if (!empty($missing)) {
+            $this->logger->error("      Missing required column(s): " . implode(', ', $missing));
+            $this->logger->debug("      Found columns: " . implode(', ', $headers));
+            return false;
         }
 
         return true;
@@ -544,9 +655,10 @@ class ClinicalPipeline
 
         if (!is_dir($archiveDir)) {
             if (!mkdir($archiveDir, 0755, true)) {
-                $this->logger->error("  ✗ Failed to create archive directory: {$archiveDir}");
+                $this->logger->error("      ✗ Failed to create archive directory: {$archiveDir}");
                 return false;
             }
+            $this->logger->debug("      Created archive directory: {$archiveDir}");
         }
 
         $filename = basename($sourceFile);
@@ -555,15 +667,15 @@ class ClinicalPipeline
         if (file_exists($destFile)) {
             $uniqueName = time() . "_" . $filename;
             $destFile   = "{$archiveDir}/{$uniqueName}";
-            $this->logger->warning("  ⚠ File exists, copying as: {$uniqueName}");
+            $this->logger->warning("      Archive file exists, using: {$uniqueName}");
         }
 
         if (copy($sourceFile, $destFile)) {
-            $this->logger->info("  ✓ Copied to archive: {$destFile}");
+            $this->logger->info("      Archived: {$filename} → processed/{$modality}/" . date('Y-m-d') . "/");
             return true;
         }
 
-        $this->logger->error("  ✗ Failed to copy file: {$sourceFile} → {$destFile}");
+        $this->logger->error("      ✗ Failed to archive file");
         return false;
     }
 
@@ -583,6 +695,7 @@ class ClinicalPipeline
         $emailsToSend = $hasFailures ? $errorEmails : $successEmails;
 
         if (empty($emailsToSend)) {
+            $this->logger->debug("  No notification emails configured for {$modality}");
             return;
         }
 
@@ -591,7 +704,8 @@ class ClinicalPipeline
             : "SUCCESS: $projectName Clinical Ingestion";
 
         $body  = "Project: $projectName\n";
-        $body .= "Modality: $modality\n\n";
+        $body .= "Modality: $modality\n";
+        $body .= "Timestamp: " . date('Y-m-d H:i:s') . "\n\n";
         $body .= "Files Processed: {$projectStats['total']}\n";
         $body .= "Successfully Uploaded: {$projectStats['success']}\n";
         $body .= "Failed: {$projectStats['failed']}\n";
@@ -604,6 +718,8 @@ class ClinicalPipeline
             $body .= "✔ Ingestion completed successfully.\n";
         }
 
+        $this->logger->debug("  Sending notification to: " . implode(', ', $emailsToSend));
+
         foreach ($emailsToSend as $emailTo) {
             $this->notification->send($emailTo, $subject, $body);
         }
@@ -615,22 +731,22 @@ class ClinicalPipeline
     private function printSummary(): void
     {
         $this->logger->info("\n========================================");
-        $this->logger->info("Pipeline Summary:");
-        $this->logger->info("----------------------------------------");
-        $this->logger->info("Files:");
+        $this->logger->info("PIPELINE SUMMARY");
+        $this->logger->info("========================================");
+
+        $this->logger->info("\nFiles:");
         $this->logger->info("  Total processed: {$this->stats['total']}");
         $this->logger->info("  Successfully uploaded: {$this->stats['success']}");
         $this->logger->info("  Failed: {$this->stats['failed']}");
         $this->logger->info("  Skipped: {$this->stats['skipped']}");
 
         if ($this->stats['instruments_installed'] > 0) {
-            $this->logger->info("----------------------------------------");
-            $this->logger->info("Instruments auto-installed: {$this->stats['instruments_installed']}");
+            $this->logger->info("\nInstruments:");
+            $this->logger->info("  Auto-installed: {$this->stats['instruments_installed']}");
         }
 
         if ($this->stats['rows_uploaded'] > 0 || $this->stats['rows_skipped'] > 0) {
-            $this->logger->info("----------------------------------------");
-            $this->logger->info("Data Rows:");
+            $this->logger->info("\nData Rows:");
             $this->logger->info("  Uploaded: {$this->stats['rows_uploaded']}");
             if ($this->stats['rows_skipped'] > 0) {
                 $this->logger->info("  Skipped (already exist): {$this->stats['rows_skipped']}");
@@ -640,28 +756,30 @@ class ClinicalPipeline
         }
 
         if ($this->stats['candidates_created'] > 0) {
-            $this->logger->info("----------------------------------------");
-            $this->logger->info("New Records Created: {$this->stats['candidates_created']}");
+            $this->logger->info("\nNew Records:");
+            $this->logger->info("  Created: {$this->stats['candidates_created']}");
         }
 
         if ($this->stats['total'] > 0) {
             $successRate = round(($this->stats['success'] / $this->stats['total']) * 100, 1);
-            $this->logger->info("----------------------------------------");
-            $this->logger->info("Success Rate: {$successRate}%");
+            $this->logger->info("\nSuccess Rate: {$successRate}%");
         }
 
         if (!empty($this->stats['errors'])) {
-            $this->logger->info("----------------------------------------");
-            $this->logger->error("Errors Encountered:");
+            $this->logger->info("\n----------------------------------------");
+            $this->logger->error("ERRORS ENCOUNTERED:");
             foreach ($this->stats['errors'] as $errorEntry) {
-                $this->logger->error("  Instrument: {$errorEntry['instrument']}");
+                $this->logger->error("\n  Instrument: {$errorEntry['instrument']}");
+                if (!empty($errorEntry['file'])) {
+                    $this->logger->error("  File: " . basename($errorEntry['file']));
+                }
                 if (is_array($errorEntry['errors'])) {
                     foreach (array_slice($errorEntry['errors'], 0, 3) as $error) {
                         if (is_array($error)) {
                             $msg = $error['message'] ?? json_encode($error);
-                            $this->logger->error("    - {$msg}");
+                            $this->logger->error("    • {$msg}");
                         } else {
-                            $this->logger->error("    - {$error}");
+                            $this->logger->error("    • {$error}");
                         }
                     }
                     if (count($errorEntry['errors']) > 3) {
@@ -672,7 +790,7 @@ class ClinicalPipeline
             }
         }
 
-        $this->logger->info("========================================");
+        $this->logger->info("\n========================================");
     }
 
     /**
@@ -690,6 +808,7 @@ class ClinicalPipeline
 
         foreach ($folders as $folder) {
             if (file_exists($folder . '/' . $filename)) {
+                $this->logger->debug("      Found in archive: {$folder}/{$filename}");
                 return true;
             }
         }
