@@ -248,7 +248,16 @@ class ClinicalPipeline
             'total'   => 0,
             'success' => 0,
             'failed'  => 0,
-            'skipped' => 0
+            'skipped' => 0,
+            'instruments' => [
+                'success' => [],
+                'failed'  => [],
+                'skipped' => []
+            ],
+            'reasons' => [
+                'failed'  => [],
+                'skipped' => []
+            ]
         ];
 
         $this->logger->info("\nProcessing instruments:");
@@ -257,8 +266,20 @@ class ClinicalPipeline
         foreach ($instruments as $instrument) {
             $result = $this->processInstrument($project, $instrument, $clinicalDir);
 
+            // Result can be 'success', 'failed', 'skipped' or array with reason
+            if (is_array($result)) {
+                $status = $result['status'];
+                $reason = $result['reason'] ?? '';
+                $projectStats[$status]++;
+                $projectStats['instruments'][$status][] = $instrument;
+                if ($reason && isset($projectStats['reasons'][$status])) {
+                    $projectStats['reasons'][$status][$instrument] = $reason;
+                }
+            } else {
+                $projectStats[$result]++;
+                $projectStats['instruments'][$result][] = $instrument;
+            }
             $projectStats['total']++;
-            $projectStats[$result]++;
         }
 
         // Project summary
@@ -273,7 +294,7 @@ class ClinicalPipeline
     /**
      * Process single instrument CSV file
      */
-    private function processInstrument(array $project, string $instrument, string $clinicalDir): string
+    private function processInstrument(array $project, string $instrument, string $clinicalDir): string|array
     {
         $csvFile = "{$clinicalDir}/{$instrument}.csv";
 
@@ -290,26 +311,34 @@ class ClinicalPipeline
             $ddCsvExists = file_exists($ddCsvFile);
 
             if ($linstExists || $ddCsvExists) {
-                // DD exists but no data to ingest
+                // DD exists but no data to ingest - this is OK, just skip
                 $ddType = $linstExists ? '.linst' : '.csv';
                 $this->logger->info("\n  ⚠ {$instrument}:");
                 $this->logger->info("      Status: SKIPPED - No data to ingest");
                 $this->logger->info("      DD definition: ✓ Found ({$ddType})");
                 $this->logger->info("      Data CSV: ✗ Not found in deidentified folder");
                 $this->logger->debug("      Expected: {$csvFile}");
+
+                $this->stats['skipped']++;
+                return ['status' => 'skipped', 'reason' => 'no data'];
             } else {
-                // Neither DD nor data exists
-                $this->logger->info("\n  ⚠ {$instrument}:");
-                $this->logger->info("      Status: SKIPPED - Missing DD and data");
+                // Neither DD nor data exists - this is a FAILURE
+                $this->logger->info("\n  ✗ {$instrument}:");
+                $this->logger->info("      Status: FAILED - No DD found");
                 $this->logger->info("      DD definition: ✗ Not found");
                 $this->logger->info("      Data CSV: ✗ Not found");
                 $this->logger->info("      Note: Defined in project.json but no files exist");
                 $this->logger->debug("      DD path checked: {$ddPath}");
                 $this->logger->debug("      Data path checked: {$csvFile}");
-            }
 
-            $this->stats['skipped']++;
-            return 'skipped';
+                $this->stats['failed']++;
+                $this->stats['errors'][] = [
+                    'instrument' => $instrument,
+                    'file' => '',
+                    'errors' => ["No data dictionary (.linst or .csv) found in {$ddPath}/"]
+                ];
+                return ['status' => 'failed', 'reason' => 'no DD found'];
+            }
         }
 
         // ─────────────────────────────────────────────────────────────
@@ -323,7 +352,7 @@ class ClinicalPipeline
             $this->logger->debug("      Source: {$csvFile}");
 
             $this->stats['skipped']++;
-            return 'skipped';
+            return ['status' => 'skipped', 'reason' => 'already processed'];
         }
 
         // ─────────────────────────────────────────────────────────────
@@ -352,7 +381,7 @@ class ClinicalPipeline
                 'file' => $csvFile,
                 'errors' => ['Invalid CSV format - missing required columns (Visit_label)']
             ];
-            return 'failed';
+            return ['status' => 'failed', 'reason' => 'invalid CSV'];
         }
 
         $this->logger->debug("      CSV validation: ✓ Passed");
@@ -363,7 +392,7 @@ class ClinicalPipeline
         if (!$this->ensureInstrumentExists($project, $instrument)) {
             $this->logger->error("      Status: FAILED - Instrument not installed in LORIS");
             $this->stats['failed']++;
-            return 'failed';
+            return ['status' => 'failed', 'reason' => 'not in LORIS'];
         }
 
         // ─────────────────────────────────────────────────────────────
@@ -372,7 +401,7 @@ class ClinicalPipeline
         if ($this->dryRun) {
             $this->logger->info("      Status: DRY RUN - Would upload {$rowCount} row(s)");
             $this->stats['success']++;
-            return 'success';
+            return ['status' => 'success', 'reason' => 'dry run'];
         }
 
         // ─────────────────────────────────────────────────────────────
@@ -399,13 +428,13 @@ class ClinicalPipeline
 
                 // Archive the processed file
                 $this->archiveFile($project, $csvFile, 'clinical');
-                return 'success';
+                return ['status' => 'success', 'reason' => 'uploaded'];
 
             } else {
                 $this->logger->error("      Status: FAILED ({$duration}s)");
                 $this->stats['failed']++;
                 $this->logUploadErrors($instrument, $csvFile, $result);
-                return 'failed';
+                return ['status' => 'failed', 'reason' => 'upload error'];
             }
 
         } catch (\Exception $e) {
@@ -417,7 +446,7 @@ class ClinicalPipeline
                 'file' => $csvFile,
                 'errors' => [$e->getMessage()]
             ];
-            return 'failed';
+            return ['status' => 'failed', 'reason' => 'exception'];
         }
     }
 
@@ -706,16 +735,59 @@ class ClinicalPipeline
         $body  = "Project: $projectName\n";
         $body .= "Modality: $modality\n";
         $body .= "Timestamp: " . date('Y-m-d H:i:s') . "\n\n";
-        $body .= "Files Processed: {$projectStats['total']}\n";
-        $body .= "Successfully Uploaded: {$projectStats['success']}\n";
-        $body .= "Failed: {$projectStats['failed']}\n";
-        $body .= "Skipped: {$projectStats['skipped']}\n\n";
 
+        $body .= "Instruments Processed: {$projectStats['total']}\n";
+
+        // Uploaded
+        $body .= "  ✔ Uploaded: {$projectStats['success']}";
+        if (!empty($projectStats['instruments']['success'])) {
+            $body .= " (" . implode(', ', $projectStats['instruments']['success']) . ")";
+        }
+        $body .= "\n";
+
+        // Failed - group by reason
+        $body .= "  ✗ Failed: {$projectStats['failed']}";
+        if (!empty($projectStats['instruments']['failed'])) {
+            $failedByReason = [];
+            foreach ($projectStats['instruments']['failed'] as $inst) {
+                $reason = $projectStats['reasons']['failed'][$inst] ?? 'error';
+                $failedByReason[$reason][] = $inst;
+            }
+            $failedParts = [];
+            foreach ($failedByReason as $reason => $insts) {
+                $failedParts[] = implode(', ', $insts) . " [{$reason}]";
+            }
+            $body .= " (" . implode('; ', $failedParts) . ")";
+        }
+        $body .= "\n";
+
+        // Skipped - group by reason
+        $body .= "  ⚠ Skipped: {$projectStats['skipped']}";
+        if (!empty($projectStats['instruments']['skipped'])) {
+            $skippedByReason = [];
+            foreach ($projectStats['instruments']['skipped'] as $inst) {
+                $reason = $projectStats['reasons']['skipped'][$inst] ?? 'unknown';
+                $skippedByReason[$reason][] = $inst;
+            }
+            $skippedParts = [];
+            foreach ($skippedByReason as $reason => $insts) {
+                $skippedParts[] = implode(', ', $insts) . " [{$reason}]";
+            }
+            $body .= " (" . implode('; ', $skippedParts) . ")";
+        }
+        $body .= "\n\n";
+
+        // Outlook / Status message
         if ($hasFailures) {
-            $body .= "⚠ Some files failed to ingest.\n";
+            $body .= "⚠ Some instruments failed to ingest.\n";
             $body .= "Check logs for details.\n";
-        } else {
+        } elseif ($projectStats['success'] > 0) {
             $body .= "✔ Ingestion completed successfully.\n";
+        } elseif ($projectStats['skipped'] > 0 && $projectStats['success'] === 0) {
+            $body .= "✔ Ingestion completed. All instruments were skipped\n";
+            $body .= "   (already processed or no new data available).\n";
+        } else {
+            $body .= "✔ Ingestion completed. No instruments to process.\n";
         }
 
         $this->logger->debug("  Sending notification to: " . implode(', ', $emailsToSend));
