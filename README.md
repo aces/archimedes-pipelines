@@ -158,24 +158,165 @@ php scripts/run_clinical_pipeline.php --collection=COLLECTION_NAME --project=PRO
 
 ---
 
-## Imaging Pipeline
+## BIDS/Imaging Ingestion Workflow
 
-Processes BIDS imaging data from `deidentified-lorisid/bids/` using ScriptApi `bidsimport` endpoint.
+The BIDS pipeline automates candidate creation, reidentification, and imaging import in three distinct steps:
 
-### Usage
+```
+1. Load Collections from Config
+   └── Read collections array from loris_client_config.json
+       ├── Collection A
+       │   ├── Project 1 (enabled)
+       │   └── Project 2 (disabled)
+       └── Collection B
+           └── Project 1 (enabled)
 
-```bash
-# Process all projects
-php scripts/run_imaging_pipeline.php --all
+2. For each enabled Collection:
+   └── For each enabled Project:
+       ├── Load project.json configuration
+       ├── Check if modality (imaging) is enabled
+       ├── Setup logging to project logs/bids_*_YYYY-MM-DD.log
+       └── Continue to BIDS processing
 
-# Process specific project
-php scripts/run_imaging_pipeline.php --collection=COLLECTION --project=PROJECT
+3. STEP 1: Participant Sync (Create LORIS Candidates)
+   ├── Script: run_bids_participant_sync.php
+   ├── Read deidentified-raw/bids/participants.tsv
+   ├── Validate BIDS structure (orphan/missing directories)
+   ├── Check if candidate exists (CBIGR mapper)
+   ├── Create candidate (LORIS API)
+   ├── Link ExternalID to candidate
+   └── Log to logs/bids_participant_sync_YYYY-MM-DD.log
 
-# Dry run (recommended first)
-php scripts/run_imaging_pipeline.php --all --dry-run --verbose
+4. STEP 2: BIDS Reidentification (Map ExternalID → PSCID)
+   ├── Script: run_bids_reidentifier.php
+   ├── Extract ID pattern from participants.tsv
+   ├── Execute CBIGR Script API: bidsreidentifier
+   ├── Rename: sub-{ExternalID} → sub-{PSCID}
+   ├── Copy to deidentified-lorisid/bids/
+   └── Log to logs/bids_reidentifier_YYYY-MM-DD.log
+
+5. STEP 3: BIDS Import (Ingest into LORIS-MRI)
+   ├── Script: run_imaging_pipeline.php
+   ├── Scan deidentified-lorisid/bids/ for new sessions
+   ├── Execute CBIGR Script API: bidsimport
+   ├── Mark sessions as processed
+   ├── Log to logs/imaging_YYYY-MM-DD.log
+   └── Send email notification (if enabled)
 ```
 
-### Options
+### Collections Configuration
+
+Collections and projects are defined in `loris_client_config.json`. Each collection has a base path and a list of projects that can be individually enabled or disabled. See `config/loris_client_config.json.example` for reference.
+
+### Required participants.tsv Format
+
+Participant metadata must be in BIDS `participants.tsv` file with required columns:
+
+```tsv
+participant_id	age	sex	group	external_id	site	dob
+sub-EXTERNAL001	28	Female	control	EXTERNAL-001	UOHI	1995-01-15
+sub-EXTERNAL002	34	Male	patient	EXTERNAL-002	UOHI	1989-06-20
+```
+
+**Required columns:**
+- `participant_id` - BIDS subject ID (e.g., sub-EXTERNAL001)
+- `external_id` - External study identifier
+- `sex` - Male/Female (required by LORIS)
+- `site` - LORIS site name (must match database)
+- `dob` - Date of birth in YYYY-MM-DD format
+- `project` - LORIS project name (optional if in project.json)
+
+---
+
+## Running the BIDS Pipeline
+
+### Step 1: Participant Sync
+
+Create LORIS candidates and link ExternalIDs.
+
+```bash
+# Dry run (recommended first)
+php scripts/run_bids_participant_sync.php \
+  /data/archimedes/FDG-PET/deidentified-raw/bids \
+  --project="PROJECT" \
+  --dry-run -v
+
+# Live run
+php scripts/run_bids_participant_sync.php \
+  /data/archimedes/FDG-PET/deidentified-raw/bids \
+  --project="PROJECT"
+```
+
+### Step 2: BIDS Reidentification
+
+Map ExternalIDs to PSCIDs and copy to lorisid directory.
+
+```bash
+# Dry run (recommended first)
+php scripts/run_bids_reidentifier.php \
+  {collection_base_path}/{ProjectName}/deidentified-raw/bids \
+  {collection_base_path}/{ProjectName}//deidentified-lorisid/bids \
+  --dry-run -v
+
+# Live run 
+php scripts/run_bids_reidentifier.php \
+  {collection_base_path}/{ProjectName}/deidentified-raw/bids \
+  {collection_base_path}/{ProjectName}/deidentified-lorisid/bids
+
+# Or with explicit project name
+php scripts/run_bids_reidentifier.php \
+  {collection_base_path}/{ProjectName}/deidentified-raw/bids \
+  {collection_base_path}/{ProjectName}/deidentified-lorisid/bids \
+  --project="PROJECT"
+```
+
+### Step 3: BIDS Import
+
+Import imaging data into LORIS-MRI.
+
+```bash
+# Dry run (recommended first)
+php scripts/run_imaging_pipeline.php \
+  --collection={collection} \
+  --project={project} \
+  --dry-run --verbose
+
+# Process specific project
+php scripts/run_imaging_pipeline.php \
+  --collection={collection} \
+  --project={project} \
+
+# Process all projects
+php scripts/run_imaging_pipeline.php --all
+```
+
+---
+
+## Command-Line Options
+
+### Participant Sync (Step 1)
+
+| Option | Description |
+|--------|-------------|
+| `<bids_directory>` | Path to BIDS root (required) |
+| `--project=NAME` | Override project name from project.json |
+| `--dry-run` | Test without changes |
+| `-v, --verbose` | Detailed output |
+| `--help` | Show help |
+
+### BIDS Reidentifier (Step 2)
+
+| Option | Description |
+|--------|-------------|
+| `<source_dir>` | deidentified-raw/bids (required) |
+| `<target_dir>` | deidentified-lorisid/bids (required) |
+| `--project=NAME` | Project name (overrides project.json) |
+| `--dry-run` | Test without execution |
+| `--force` | Overwrite target if exists |
+| `-v, --verbose` | Detailed output |
+| `-h, --help` | Show help |
+
+### Imaging Pipeline (Step 3)
 
 | Option | Description |
 |--------|-------------|
@@ -189,45 +330,8 @@ php scripts/run_imaging_pipeline.php --all --dry-run --verbose
 | `--verbose` | Detailed output |
 | `--help` | Show help |
 
-### Workflow
-
-```
-┌─────────────────────────────────────────────────────────────┐
-│  1. Load config → Check imaging.enabled                     │
-└─────────────────────────────────────────────────────────────┘
-                              ↓
-┌─────────────────────────────────────────────────────────────┐
-│  2. For each project:                                       │
-│     • Load project.json                                     │
-│     • Find BIDS directory (deidentified-lorisid/bids/)      │
-└─────────────────────────────────────────────────────────────┘
-                              ↓
-┌─────────────────────────────────────────────────────────────┐
-│  3. Scan for new data:                                      │
-│     • Find sub-*/ses-*/ directories                         │
-│     • Check processed/.imaging_processed.json               │
-│     • Skip already processed (unless --force)               │
-└─────────────────────────────────────────────────────────────┘
-                              ↓
-┌─────────────────────────────────────────────────────────────┐
-│  4. BIDS import:                                            │
-│     • POST /cbigr_api/script/bidsimport                     │
-│     • Auto-create candidates/sessions                       │
-└─────────────────────────────────────────────────────────────┘
-                              ↓
-┌─────────────────────────────────────────────────────────────┐
-│  5. Post-processing:                                        │
-│     • Write record to processed/imaging/{scan}.json         │
-│     • Update processed/.imaging_processed.json              │
-│     • Log to logs/imaging_YYYY-MM-DD.log                    │
-│     • Send email notification                               │
-└─────────────────────────────────────────────────────────────┘
-```
-
 ---
 
-
----
 
 ## Directory Structure
 
@@ -239,13 +343,13 @@ php scripts/run_imaging_pipeline.php --all --dry-run --verbose
 │   ├── clinical/                         # Clinical instrument CSVs
 │   ├── imaging/
 │   │   └── dicoms/
-│   ├── bids/
+│   ├── bids/                             # MRI and EEG Data (Raw)
 │   └── genomics/
 │
 ├── deidentified-lorisid/                 # LORIS-relabelled data
 │   ├── clinical/
 │   ├── imaging/
-│   ├── bids/
+│   ├── bids/                             #  Reidentified MRI and EEG Data
 │   └── genomics/
 │
 ├── processed/                            # Pipeline outputs
