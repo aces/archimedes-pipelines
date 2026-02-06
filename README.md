@@ -237,13 +237,13 @@ Create LORIS candidates and link ExternalIDs.
 ```bash
 # Dry run (recommended first)
 php scripts/run_bids_participant_sync.php \
-  /data/archimedes/FDG-PET/deidentified-raw/bids \
+  {collection_base_path}/{ProjectName}/deidentified-raw/bids \
   --project="PROJECT" \
   --dry-run -v
 
 # Live run
 php scripts/run_bids_participant_sync.php \
-  /data/archimedes/FDG-PET/deidentified-raw/bids \
+  {collection_base_path}/{ProjectName}/deidentified-raw/bids \
   --project="PROJECT"
 ```
 
@@ -255,7 +255,7 @@ Map ExternalIDs to PSCIDs and copy to lorisid directory.
 # Dry run (recommended first)
 php scripts/run_bids_reidentifier.php \
   {collection_base_path}/{ProjectName}/deidentified-raw/bids \
-  {collection_base_path}/{ProjectName}//deidentified-lorisid/bids \
+  {collection_base_path}/{ProjectName}/deidentified-lorisid/bids \
   --dry-run -v
 
 # Live run 
