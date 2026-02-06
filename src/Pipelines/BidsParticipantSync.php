@@ -99,25 +99,61 @@ class BidsParticipantSync
             'Y-m-d H:i:s'
         );
 
-        // Console
+        // Console handler (always enabled)
         $console = new StreamHandler('php://stdout', Logger::INFO);
         $console->setFormatter($formatter);
         $logger->pushHandler($console);
 
-        // File (rotated daily)
-        $logDir = $this->config['logging']['directory'] ?? '/tmp/archimedes-logs';
-        if (!is_dir($logDir)) {
-            mkdir($logDir, 0755, true);
-        }
-        $file = new RotatingFileHandler(
-            "{$logDir}/bids_participant_sync.log",
-            14,
-            Logger::DEBUG
-        );
-        $file->setFormatter($formatter);
-        $logger->pushHandler($file);
-
+        // File handler will be added after project.json is loaded
         return $logger;
+    }
+
+    /**
+     * Setup file logging after project.json is loaded.
+     * Creates date-stamped log files: bids_participant_sync_2026-02-06.log
+     */
+    private function setupFileLogging(): void
+    {
+        // Priority 1: project.json
+        $logDir = null;
+        if ($this->projectDefaults && isset($this->projectDefaults['logging']['log_path'])) {
+            $logDir = $this->projectDefaults['logging']['log_path'];
+            $this->logger->debug("  Using log path from project.json: {$logDir}");
+        }
+
+        // Priority 2: config
+        if (!$logDir && isset($this->config['logging']['directory'])) {
+            $logDir = $this->config['logging']['directory'];
+            $this->logger->debug("  Using log path from config: {$logDir}");
+        }
+
+        // Priority 3: default
+        if (!$logDir) {
+            $logDir = '/tmp/archimedes-logs';
+        }
+
+        // Create directory
+        if (!is_dir($logDir)) {
+            if (!@mkdir($logDir, 0755, true)) {
+                $logDir = '/tmp/archimedes-logs';
+                @mkdir($logDir, 0755, true);
+            }
+        }
+
+        // Date-stamped filename
+        $dateStamp = date('Y-m-d');
+        $logFile = "{$logDir}/bids_participant_sync_{$dateStamp}.log";
+
+        $formatter = new LineFormatter(
+            "[%datetime%] %channel%.%level_name%: %message%\n",
+            'Y-m-d H:i:s'
+        );
+
+        $file = new StreamHandler($logFile, Logger::DEBUG);
+        $file->setFormatter($formatter);
+        $this->logger->pushHandler($file);
+
+        $this->logger->info("  Log file: {$logFile}");
     }
 
     // =====================================================================
@@ -843,6 +879,9 @@ class BidsParticipantSync
 
         // ── Load project defaults from project.json ──────────────────────
         $this->projectDefaults = $this->loadProjectDefaults($bidsDir);
+
+        // ── Setup file logging (uses project.json log_path if available) ─
+        $this->setupFileLogging();
 
         // ── Authenticate ─────────────────────────────────────────────────
         $this->authenticate();

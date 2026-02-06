@@ -51,4 +51,7 @@
     "level": "INFO",
     "log_path": "/data/projects/Example-Study/logs"
   }
+  "project_mappings": {
+      "PROJECT": "1"
+    }
 }
