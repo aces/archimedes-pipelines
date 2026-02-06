@@ -343,13 +343,12 @@ php scripts/run_imaging_pipeline.php --all
 │   ├── clinical/                         # Clinical instrument CSVs
 │   ├── imaging/
 │   │   └── dicoms/
-│   ├── bids/                             # MRI and EEG Data (Raw)
+│   ├── bids/                             # Deidentified MRI and EEG Data (ExternalIDs)
 │   └── genomics/
 │
 ├── deidentified-lorisid/                 # LORIS-relabelled data
-│   ├── clinical/
 │   ├── imaging/
-│   ├── bids/                             #  Reidentified MRI and EEG Data
+│   ├── bids/                             #  Reidentified MRI and EEG Data (LORISIDs)
 │   └── genomics/
 │
 ├── processed/                            # Pipeline outputs
