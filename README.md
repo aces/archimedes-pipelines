@@ -87,7 +87,7 @@ The clinical pipeline follows this process:
 3. For each Instrument:
    ├── Check if instrument is installed in LORIS
    ├── If NOT installed:
-   │   ├── Look for definition in documentation/data_dictionary/
+   │   ├── Look for Data Dictionary in documentation/data_dictionary/
    │   ├── Find .linst file OR REDCap data dictionary CSV
    │   └── Install instrument via API
    └── If installed:
@@ -110,9 +110,9 @@ The clinical pipeline follows this process:
 
 Collections and projects are defined in `loris_client_config.json`. Each collection has a base path and a list of projects that can be individually enabled or disabled. See `config/loris_client_config.json.example` for reference.
 
-### Instrument Definition Location
+### Instrument Data Dictionary Location
 
-Instrument definitions should be placed in the project's `documentation/data_dictionary/` folder. The pipeline automatically detects the format (LINST or REDCap CSV) and installs accordingly.
+Instrument Data Dictionary should be placed in the project's `documentation/data_dictionary/` folder. The pipeline automatically detects the format (LINST or REDCap CSV) and installs accordingly.
 
 ---
 
@@ -184,7 +184,7 @@ The BIDS pipeline automates candidate creation, reidentification, and imaging im
    ├── Validate BIDS structure (orphan/missing directories)
    ├── Check if candidate exists (CBIGR mapper)
    ├── Create candidate (LORIS API)
-   ├── Link ExternalID to candidate
+   ├── Link ExternalID to candidate 
    └── Log to logs/bids_participant_sync_YYYY-MM-DD.log
 
 4. STEP 2: BIDS Reidentification (Map ExternalID → PSCID)
@@ -361,7 +361,7 @@ php scripts/run_imaging_pipeline.php --all
 ├── logs/                                 # Execution logs
 │
 └── documentation/
-    ├── data_dictionary/                  # Instrument definitions (.linst, REDCap CSV)
+    ├── data_dictionary/                  # Instrument Data Dictionary (.linst, REDCap CSV)
     └── readme.txt
 ```
 
