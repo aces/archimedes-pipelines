@@ -213,7 +213,7 @@ class ClinicalPipeline
         $this->logger->info("========================================");
 
         // Get clinical data directory
-        $clinicalDir = $project['data_access']['mount_path'] . '/deidentified-lorisid/clinical';
+        $clinicalDir = $project['data_access']['mount_path'] . '/deidentified-raw/clinical';
 
         $this->logger->debug("Clinical data directory: {$clinicalDir}");
 
