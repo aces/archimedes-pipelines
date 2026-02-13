@@ -3,525 +3,439 @@ declare(strict_types=1);
 
 namespace LORIS\Endpoints;
 
-use LORISClient\Configuration;
-use LORISClient\Api\AuthenticationApi;
-use LORISClient\Api\InstrumentManagerApi;
-use LORISClient\Model\LoginRequest;
-use GuzzleHttp\Client;
+use GuzzleHttp\Exception\RequestException;
 use Psr\Log\LoggerInterface;
-use Psr\Log\NullLogger;
-use SplFileObject;
+use GuzzleHttp\Client as GuzzleClient;
 
 /**
- * Clinical Data Ingestion Client
+ * Clinical Data Upload Client
  *
- * Uses loris-php-api-client for:
- * - Authentication (AuthenticationApi)
- * - Instrument upload (InstrumentManagerApi) with HTTP fallback
+ * Strategy: Try using LORISClient generated API classes first, fall back to raw Guzzle on any error
+ *
+ * This ensures maximum compatibility - uses the clean generated API when available,
+ * but always has a working fallback.
  */
 class ClinicalClient
 {
-    private Configuration $apiConfig;
-    private Configuration $moduleConfig;
-    private Client $httpClient;
-    private LoggerInterface $logger;
-
     private string $baseUrl;
     private string $username;
     private string $password;
     private int $tokenExpiryMinutes;
+    private LoggerInterface $logger;
+
+    private ?GuzzleClient $httpClient = null;
+    private ?object $config = null;
+    private ?object $authApi = null;
+    private ?object $instrumentManagerApi = null;
+    private ?object $instrumentsApi = null;
 
     private ?string $token = null;
     private ?int $tokenExpiry = null;
-    private ?string $activeVersion = null;
 
-    private array $apiVersions = ['v0.0.4-dev', 'v0.0.4', 'v0.0.3'];
+    // Track if we should skip trying generated API (after first failure)
+    private bool $useGuzzleOnly = false;
 
     public function __construct(
         string $baseUrl,
         string $username,
         string $password,
-        int $tokenExpiryMinutes = 55,
-        ?LoggerInterface $logger = null
+        int $tokenExpiryMinutes,
+        LoggerInterface $logger
     ) {
         $this->baseUrl = rtrim($baseUrl, '/');
         $this->username = $username;
         $this->password = $password;
         $this->tokenExpiryMinutes = $tokenExpiryMinutes;
-        $this->logger = $logger ?? new NullLogger();
+        $this->logger = $logger;
+    }
 
-        $this->httpClient = new Client([
-            'timeout' => 120,
-            'http_errors' => false,
+    /**
+     * Authenticate - try generated API first, fall back to Guzzle
+     */
+    public function authenticate(): void
+    {
+        $this->logger->debug("Authenticating with LORIS API...");
+
+        // Create HTTP client (used by both approaches)
+        $this->httpClient = new GuzzleClient([
             'verify' => false,
+            'timeout' => 60,
+            'connect_timeout' => 10,
         ]);
 
-        $this->apiConfig = new Configuration();
-        $this->moduleConfig = new Configuration();
-        $this->moduleConfig->setHost($this->baseUrl);
+        // Try generated API first (unless we've already determined it won't work)
+        if (!$this->useGuzzleOnly) {
+            try {
+                $this->authenticateWithGeneratedAPI();
+                return; // Success!
+            } catch (\Exception $e) {
+                $this->logger->debug("Generated API authentication failed: " . $e->getMessage());
+                $this->logger->debug("Falling back to raw Guzzle");
+                $this->useGuzzleOnly = true; // Skip generated API for future calls
+            }
+        }
+
+        // Fall back to raw Guzzle
+        $this->authenticateWithGuzzle();
     }
 
-    // ──────────────────────────────────────────────────────────────────
-    // AUTHENTICATION
-    // ──────────────────────────────────────────────────────────────────
-
-    public function authenticate(): string
+    /**
+     * Try authentication with generated LORISClient API
+     */
+    private function authenticateWithGeneratedAPI(): void
     {
-        $this->logger->info('Authenticating with LORIS API...');
+        // Check if classes exist
+        if (!class_exists('\\LORISClient\\Configuration')) {
+            throw new \RuntimeException("LORISClient\\Configuration not found");
+        }
 
-        $lastError = null;
+        $configClass = '\\LORISClient\\Configuration';
+        $authApiClass = '\\LORISClient\\Api\\AuthenticationApi';
+        $loginRequestClass = '\\LORISClient\\Model\\LoginRequest';
 
-        foreach ($this->apiVersions as $version) {
-            $apiHost = "{$this->baseUrl}/api/{$version}";
-            $this->logger->info("Trying API version: {$version}");
+        // Configure for REST API endpoints
+        $this->config = $configClass::getDefaultConfiguration();
+        $this->config->setHost($this->baseUrl . '/api/v0.0.3');
 
-            try {
-                $this->apiConfig = new Configuration();
-                $this->apiConfig->setHost($apiHost);
+        // Create authentication API
+        $this->authApi = new $authApiClass($this->httpClient, $this->config);
 
-                $authApi = new AuthenticationApi($this->httpClient, $this->apiConfig);
-                $response = $authApi->login(new LoginRequest([
+        // Login request
+        $loginRequest = new $loginRequestClass([
+            'username' => $this->username,
+            'password' => $this->password
+        ]);
+
+        $loginResponse = $this->authApi->login($loginRequest);
+        $this->token = $loginResponse->getToken();
+        $this->tokenExpiry = time() + ($this->tokenExpiryMinutes * 60);
+
+        // Update configuration with token
+        $this->config->setAccessToken($this->token);
+
+        // Initialize other API instances
+        $moduleConfig = clone $this->config;
+        $moduleConfig->setHost($this->baseUrl);
+
+        if (class_exists('\\LORISClient\\Api\\InstrumentManagerApi')) {
+            $this->instrumentManagerApi = new \LORISClient\Api\InstrumentManagerApi($this->httpClient, $moduleConfig);
+        }
+
+        if (class_exists('\\LORISClient\\Api\\InstrumentsApi')) {
+            $this->instrumentsApi = new \LORISClient\Api\InstrumentsApi($this->httpClient, $this->config);
+        }
+
+        $this->logger->debug("✓ Authenticated using LORISClient API");
+        $this->logger->debug("  Token expires in {$this->tokenExpiryMinutes} minutes");
+    }
+
+    /**
+     * Authenticate with raw Guzzle (fallback)
+     */
+    private function authenticateWithGuzzle(): void
+    {
+        try {
+            $loginUrl = $this->baseUrl . '/api/v0.0.3/login';
+
+            $response = $this->httpClient->post($loginUrl, [
+                'json' => [
                     'username' => $this->username,
                     'password' => $this->password
-                ]));
-
-                $this->token = $response->getToken();
-
-                if (empty($this->token)) {
-                    $lastError = 'Empty token in response';
-                    continue;
-                }
-
-                $this->apiConfig->setAccessToken($this->token);
-                $this->moduleConfig->setAccessToken($this->token);
-                $this->tokenExpiry = time() + ($this->tokenExpiryMinutes * 60);
-                $this->activeVersion = $version;
-
-                $this->logger->info("✓ Authenticated using {$version}");
-                return $this->token;
-
-            } catch (\LORISClient\ApiException $e) {
-                $this->logger->warning("API error for {$version}: " . $e->getMessage());
-                $lastError = $e->getMessage();
-            } catch (\Exception $e) {
-                $this->logger->warning("Error for {$version}: " . $e->getMessage());
-                $lastError = $e->getMessage();
-            }
-        }
-
-        throw new \RuntimeException("Authentication failed. Last error: {$lastError}");
-    }
-
-    public function getToken(): string
-    {
-        if ($this->token === null || ($this->tokenExpiry !== null && time() >= $this->tokenExpiry)) {
-            return $this->authenticate();
-        }
-        return $this->token;
-    }
-
-    public function hasValidToken(): bool
-    {
-        return $this->token !== null
-            && $this->tokenExpiry !== null
-            && time() < $this->tokenExpiry;
-    }
-
-    private function getAuthHeaders(): array
-    {
-        return [
-            'Authorization' => 'Bearer ' . $this->token,
-            'Accept' => 'application/json',
-        ];
-    }
-
-    // ──────────────────────────────────────────────────────────────────
-    // INSTRUMENT MANAGER
-    // ──────────────────────────────────────────────────────────────────
-
-    private function getInstrumentManagerApi(): InstrumentManagerApi
-    {
-        if (empty($this->moduleConfig->getAccessToken()) && $this->token) {
-            $this->moduleConfig->setAccessToken($this->token);
-        }
-        return new InstrumentManagerApi($this->httpClient, $this->moduleConfig);
-    }
-
-    /**
-     * Upload instrument CSV - tries API client first, falls back to HTTP
-     */
-    public function uploadInstrumentCSV(
-        string $instrument,
-        string $csvFilePath,
-        string $action = 'CREATE_SESSIONS'
-    ): array {
-        if (!file_exists($csvFilePath)) {
-            throw new \RuntimeException("CSV file not found: {$csvFilePath}");
-        }
-
-        $this->getToken();
-        $this->logger->info("Uploading: {$instrument}");
-
-        // Try API client first
-        try {
-            $result = $this->uploadViaApiClient($instrument, $csvFilePath, $action);
-            if ($result !== null) {
-                return $result;
-            }
-        } catch (\Exception $e) {
-            $this->logger->warning("API client failed: " . $e->getMessage() . " - trying HTTP fallback");
-        }
-
-        // Fallback to direct HTTP
-        return $this->uploadViaHttp($instrument, $csvFilePath, $action);
-    }
-
-    /**
-     * Upload via loris-php-api-client InstrumentManagerApi
-     */
-    private function uploadViaApiClient(
-        string $instrument,
-        string $csvFilePath,
-        string $action
-    ): ?array {
-        $api = $this->getInstrumentManagerApi();
-
-        $result = $api->uploadInstrumentData(
-            $action,
-            new SplFileObject($csvFilePath, 'r'),
-            $instrument,
-            null
-        );
-
-        $success = $result->getSuccess();
-        $idMappingRaw = $result->getIdMapping() ?? [];
-
-        // Convert idMapping objects to arrays
-        $idMapping = [];
-        foreach ($idMappingRaw as $map) {
-            $idMapping[] = [
-                'ExtStudyID' => $map->getExtStudyId(),
-                'CandID' => $map->getCandId()
-            ];
-        }
-
-        // Build message - API client returns empty object, so generate from data
-        $totalRows = count($idMapping);
-        $message = $totalRows > 0
-            ? "Saved {$totalRows} out of {$totalRows} rows to the database."
-            : $this->extractMessage($result->getMessage());
-
-        $this->logger->info($success ? "✓ Upload successful (API client)" : "✗ Upload failed");
-
-        return [
-            'success' => $success,
-            'message' => $message,
-            'idMapping' => $idMapping
-        ];
-    }
-
-    /**
-     * Upload via direct HTTP (fallback)
-     */
-    private function uploadViaHttp(
-        string $instrument,
-        string $csvFilePath,
-        string $action
-    ): array {
-        $url = "{$this->baseUrl}/instrument_manager/instrument_data";
-
-        $fileHandle = fopen($csvFilePath, 'r');
-        if ($fileHandle === false) {
-            throw new \RuntimeException("Failed to open CSV file: {$csvFilePath}");
-        }
-
-        try {
-            $response = $this->httpClient->post($url, [
-                'headers' => $this->getAuthHeaders(),
-                'multipart' => [
-                    ['name' => 'instrument', 'contents' => $instrument],
-                    ['name' => 'action', 'contents' => $action],
-                    [
-                        'name' => 'data_file',
-                        'contents' => $fileHandle,
-                        'filename' => basename($csvFilePath)
-                    ]
+                ],
+                'headers' => [
+                    'Content-Type' => 'application/json',
+                    'Accept' => 'application/json'
                 ]
             ]);
 
-            if (is_resource($fileHandle)) {
-                fclose($fileHandle);
+            $result = json_decode($response->getBody()->getContents(), true);
+
+            if (!isset($result['token'])) {
+                throw new \RuntimeException("No token received from authentication");
             }
 
-            $result = $this->parseHttpResponse($response);
-            $this->logger->info($result['success'] ? "✓ Upload successful (HTTP)" : "✗ Upload failed");
+            $this->token = $result['token'];
+            $this->tokenExpiry = time() + ($this->tokenExpiryMinutes * 60);
 
-            return $result;
+            $this->logger->debug("✓ Authenticated using raw Guzzle");
+            $this->logger->debug("  Token expires in {$this->tokenExpiryMinutes} minutes");
 
-        } catch (\Exception $e) {
-            if (is_resource($fileHandle)) {
-                fclose($fileHandle);
-            }
-            $this->logger->error("HTTP upload failed: " . $e->getMessage());
-            throw $e;
+        } catch (RequestException $e) {
+            $statusCode = $e->getResponse() ? $e->getResponse()->getStatusCode() : 0;
+            $responseBody = $e->getResponse() ? $e->getResponse()->getBody()->getContents() : '';
+            $this->logger->error("✗ Authentication failed (HTTP {$statusCode}): " . $e->getMessage());
+            $this->logger->debug("Response: " . $responseBody);
+            throw new \RuntimeException("Failed to authenticate with LORIS API: " . $e->getMessage());
         }
     }
 
     /**
-     * Upload multi-instrument CSV
+     * Ensure client is authenticated (refresh token if needed)
      */
-    public function uploadMultiInstrumentCSV(
-        string $csvFilePath,
-        string $action = 'CREATE_SESSIONS'
-    ): array {
-        if (!file_exists($csvFilePath)) {
-            throw new \RuntimeException("CSV file not found: {$csvFilePath}");
-        }
-
-        $this->getToken();
-        $this->logger->info("Uploading multi-instrument CSV");
-
-        // Try API client first
-        try {
-            $api = $this->getInstrumentManagerApi();
-            $result = $api->uploadInstrumentData(
-                $action,
-                new SplFileObject($csvFilePath, 'r'),
-                null,
-                'true'
-            );
-
-            $idMappingRaw = $result->getIdMapping() ?? [];
-            $idMapping = [];
-            foreach ($idMappingRaw as $map) {
-                $idMapping[] = [
-                    'ExtStudyID' => $map->getExtStudyId(),
-                    'CandID' => $map->getCandId()
-                ];
-            }
-
-            $totalRows = count($idMapping);
-            $message = $totalRows > 0
-                ? "Saved {$totalRows} out of {$totalRows} rows to the database."
-                : $this->extractMessage($result->getMessage());
-
-            return [
-                'success' => $result->getSuccess(),
-                'message' => $message,
-                'idMapping' => $idMapping
-            ];
-
-        } catch (\Exception $e) {
-            $this->logger->warning("API client failed: " . $e->getMessage() . " - trying HTTP");
-        }
-
-        // Fallback to HTTP
-        $url = "{$this->baseUrl}/instrument_manager/instrument_data";
-        $fileHandle = fopen($csvFilePath, 'r');
-
-        try {
-            $response = $this->httpClient->post($url, [
-                'headers' => $this->getAuthHeaders(),
-                'multipart' => [
-                    ['name' => 'action', 'contents' => $action],
-                    ['name' => 'multi-instrument', 'contents' => 'true'],
-                    [
-                        'name' => 'data_file',
-                        'contents' => $fileHandle,
-                        'filename' => basename($csvFilePath)
-                    ]
-                ]
-            ]);
-
-            if (is_resource($fileHandle)) {
-                fclose($fileHandle);
-            }
-
-            return $this->parseHttpResponse($response);
-
-        } catch (\Exception $e) {
-            if (is_resource($fileHandle)) {
-                fclose($fileHandle);
-            }
-            throw $e;
-        }
-    }
-
-    /**
-     * Install instrument from LINST file or REDCap CSV
-     */
-    public function installInstrument(string $filePath): bool
+    private function ensureAuthenticated(): void
     {
-        if (!file_exists($filePath)) {
-            throw new \RuntimeException("File not found: {$filePath}");
+        if ($this->httpClient === null || $this->token === null) {
+            throw new \RuntimeException("Not authenticated. Call authenticate() first.");
         }
 
-        $this->getToken();
-        $this->logger->info("Installing instrument from: " . basename($filePath));
-
-        try {
-            $api = $this->getInstrumentManagerApi();
-            $api->installInstrument(new SplFileObject($filePath, 'r'));
-            $this->logger->info("✓ Instrument installed");
-            return true;
-        } catch (\Exception $e) {
-            $this->logger->error("Install failed: " . $e->getMessage());
-            return false;
+        // Refresh token if expired or about to expire (5 min buffer)
+        if ($this->tokenExpiry !== null && time() >= ($this->tokenExpiry - 300)) {
+            $this->logger->debug("Token expiring soon, re-authenticating...");
+            $this->authenticate();
         }
     }
 
     /**
-     * Get expected CSV headers for instrument(s)
-     * Returns empty string on error instead of throwing
-     */
-    public function getInstrumentDataHeaders(
-        string $action = 'CREATE_SESSIONS',
-        ?string $instrument = null,
-        ?string $instruments = null
-    ): string {
-        $this->getToken();
-
-        try {
-            $api = $this->getInstrumentManagerApi();
-            $result = $api->getInstrumentDataHeaders($action, $instrument, $instruments);
-
-            // Handle if API returns ErrorResponse instead of string
-            if (!is_string($result)) {
-                return '';
-            }
-
-            return $result;
-        } catch (\Exception $e) {
-            $this->logger->debug("Failed to get headers: " . $e->getMessage());
-            return '';
-        }
-    }
-
-    /**
-     * Check if instrument exists in LORIS
-     * Uses direct HTTP to avoid type issues with API client
+     * Check if instrument exists - always use Guzzle (API method doesn't exist)
      */
     public function instrumentExists(string $instrument): bool
     {
-        try {
-            $this->getToken();
+        $this->ensureAuthenticated();
 
-            // Use direct HTTP GET to check - more reliable than API client
-            $url = "{$this->baseUrl}/instrument_manager/instrument_data";
+        $this->logger->debug("Checking if instrument '{$instrument}' exists in LORIS...");
+
+        // Use raw Guzzle (getInstrument method doesn't exist in current API)
+        try {
+            $url = $this->baseUrl . "/api/v0.0.3/instruments/{$instrument}";
+
             $response = $this->httpClient->get($url, [
-                'headers' => $this->getAuthHeaders(),
-                'query' => [
-                    'action' => 'VALIDATE_SESSIONS',
-                    'instrument' => $instrument
-                ]
+                'headers' => [
+                    'Authorization' => 'Bearer ' . $this->token,
+                    'Accept' => 'application/json'
+                ],
+                'http_errors' => false
             ]);
 
             $statusCode = $response->getStatusCode();
 
-            // 200 = instrument exists, 400/404 = doesn't exist
-            return $statusCode >= 200 && $statusCode < 300;
+            if ($statusCode === 200) {
+                $this->logger->debug("  ✓ Instrument '{$instrument}' exists");
+                return true;
+            } elseif ($statusCode === 404) {
+                $this->logger->debug("  ✗ Instrument '{$instrument}' not found (404)");
+                return false;
+            }
+
+            $this->logger->warning("  Unexpected status code {$statusCode} checking instrument");
+            return false;
 
         } catch (\Exception $e) {
-            $this->logger->debug("Instrument check failed for '{$instrument}': " . $e->getMessage());
+            $this->logger->warning("  Exception checking instrument: " . $e->getMessage());
             return false;
         }
     }
 
-    // ──────────────────────────────────────────────────────────────────
-    // HELPERS
-    // ──────────────────────────────────────────────────────────────────
-
     /**
-     * Extract message string from various formats
+     * Install instrument - try API first, fall back to Guzzle
      */
-    private function extractMessage($message): string
+    public function installInstrument(string $filePath): bool
     {
-        if (is_string($message)) {
-            return $message;
+        $this->ensureAuthenticated();
+
+        if (!file_exists($filePath)) {
+            throw new \InvalidArgumentException("Instrument file not found: {$filePath}");
         }
-        if (is_null($message)) {
-            return '';
-        }
-        if (is_array($message)) {
-            return json_encode($message);
-        }
-        if (is_object($message)) {
-            if (method_exists($message, '__toString')) {
-                return (string) $message;
+
+        $extension = strtolower(pathinfo($filePath, PATHINFO_EXTENSION));
+
+        $instrumentType = match($extension) {
+            'linst' => 'linst',
+            'csv' => 'redcap',
+            'json' => 'bids',
+            default => throw new \InvalidArgumentException("Unsupported file type: {$extension}")
+        };
+
+        $this->logger->debug("Installing instrument from {$instrumentType} file: " . basename($filePath));
+
+        // Try generated API first
+        if (!$this->useGuzzleOnly && $this->instrumentManagerApi) {
+            try {
+                $result = $this->instrumentManagerApi->installInstrument(
+                    $instrumentType,
+                    fopen($filePath, 'r')
+                );
+
+                if (isset($result['ok']) && $result['ok'] === 'ok') {
+                    $this->logger->debug("  ✓ Instrument installed successfully");
+                    return true;
+                }
+            } catch (\Exception $e) {
+                $this->logger->debug("Generated API failed: " . $e->getMessage() . ", using Guzzle");
             }
-            if (method_exists($message, 'getMessage')) {
-                return $this->extractMessage($message->getMessage());
-            }
-            if ($message instanceof \JsonSerializable) {
-                $data = $message->jsonSerialize();
-                return is_string($data) ? $data : json_encode($data);
-            }
-            return json_encode($message);
         }
-        return (string) $message;
+
+        // Fall back to raw Guzzle
+        return $this->installInstrumentWithGuzzle($filePath, $instrumentType);
     }
 
     /**
-     * Parse HTTP response into standard array format
+     * Install instrument with raw Guzzle
      */
-    private function parseHttpResponse($response): array
+    private function installInstrumentWithGuzzle(string $filePath, string $instrumentType): bool
     {
-        $statusCode = $response->getStatusCode();
-        $body = $response->getBody()->getContents();
+        try {
+            $url = $this->baseUrl . '/instrument_manager';
 
-        if (empty($body)) {
-            return [
-                'success' => $statusCode >= 200 && $statusCode < 300,
-                'message' => "HTTP {$statusCode}",
-                'idMapping' => []
-            ];
+            $response = $this->httpClient->post($url, [
+                'multipart' => [
+                    [
+                        'name' => 'instrument_type',
+                        'contents' => $instrumentType
+                    ],
+                    [
+                        'name' => 'install_file',
+                        'contents' => fopen($filePath, 'r'),
+                        'filename' => basename($filePath)
+                    ]
+                ],
+                'headers' => [
+                    'Authorization' => 'Bearer ' . $this->token,
+                    'Accept' => 'application/json'
+                ]
+            ]);
+
+            $statusCode = $response->getStatusCode();
+            $result = json_decode($response->getBody()->getContents(), true);
+
+            if ($statusCode === 201 && isset($result['ok']) && $result['ok'] === 'ok') {
+                $this->logger->debug("  ✓ Instrument installed successfully");
+                return true;
+            }
+
+            $this->logger->error("  ✗ Install failed (HTTP {$statusCode}): " . json_encode($result));
+            return false;
+
+        } catch (RequestException $e) {
+            $statusCode = $e->getResponse() ? $e->getResponse()->getStatusCode() : 0;
+            $responseBody = $e->getResponse() ? $e->getResponse()->getBody()->getContents() : '';
+            $this->logger->error("  ✗ Install request failed (HTTP {$statusCode}): " . $e->getMessage());
+            $this->logger->debug("  Response: " . $responseBody);
+            return false;
+        } catch (\Exception $e) {
+            $this->logger->error("  ✗ Install exception: " . $e->getMessage());
+            return false;
+        }
+    }
+
+    /**
+     * Upload instrument data - always use Guzzle (needs format parameter)
+     *
+     * The generated API likely doesn't have the updated schema with format parameter,
+     * so we always use raw Guzzle for this to ensure compatibility.
+     */
+    public function uploadInstrumentData(
+        string $instrument,
+        string $filePath,
+        string $action = 'CREATE_SESSIONS',
+        string $format = 'LORIS_CSV'
+    ): array {
+        $this->ensureAuthenticated();
+
+        if (!file_exists($filePath)) {
+            throw new \InvalidArgumentException("Data file not found: {$filePath}");
         }
 
-        $data = json_decode($body, true);
-        if (json_last_error() !== JSON_ERROR_NONE) {
-            return [
-                'success' => $statusCode >= 200 && $statusCode < 300,
-                'message' => $body,
-                'idMapping' => []
-            ];
+        if (!in_array($action, ['CREATE_SESSIONS', 'VALIDATE_SESSIONS'])) {
+            throw new \InvalidArgumentException("Invalid action: {$action}");
         }
 
-        if ($statusCode >= 400) {
+        if (!in_array($format, ['LORIS_CSV', 'BIDS_TSV'])) {
+            throw new \InvalidArgumentException("Invalid format: {$format}");
+        }
+
+        // CRITICAL: BIDS_TSV cannot create sessions
+        if ($format === 'BIDS_TSV' && $action === 'CREATE_SESSIONS') {
+            $this->logger->warning("BIDS_TSV format cannot use CREATE_SESSIONS, forcing VALIDATE_SESSIONS");
+            $action = 'VALIDATE_SESSIONS';
+        }
+
+        $this->logger->debug("Uploading instrument data: {$instrument}");
+        $this->logger->debug("  File: " . basename($filePath));
+        $this->logger->debug("  Action: {$action}");
+        $this->logger->debug("  Format: {$format}");
+
+        // Always use Guzzle for instrument data upload (needs format parameter)
+        try {
+            $url = $this->baseUrl . '/instrument_manager/instrument_data';
+
+            $response = $this->httpClient->post($url, [
+                'multipart' => [
+                    [
+                        'name' => 'action',
+                        'contents' => $action
+                    ],
+                    [
+                        'name' => 'format',
+                        'contents' => $format
+                    ],
+                    [
+                        'name' => 'instrument',
+                        'contents' => $instrument
+                    ],
+                    [
+                        'name' => 'data_file',
+                        'contents' => fopen($filePath, 'r'),
+                        'filename' => basename($filePath)
+                    ]
+                ],
+                'headers' => [
+                    'Authorization' => 'Bearer ' . $this->token,
+                    'Accept' => 'application/json'
+                ]
+            ]);
+
+            $statusCode = $response->getStatusCode();
+            $result = json_decode($response->getBody()->getContents(), true);
+
+            if ($statusCode === 201 && isset($result['success']) && $result['success'] === true) {
+                $this->logger->debug("  ✓ Upload successful");
+                return $result;
+            }
+
+            if ($statusCode === 200 && isset($result['success']) && $result['success'] === false) {
+                $this->logger->debug("  ✗ Upload failed (validation errors)");
+                return $result;
+            }
+
+            $this->logger->warning("  ⚠ Unexpected response (HTTP {$statusCode})");
             return [
                 'success' => false,
-                'message' => $data['message'] ?? $data['error'] ?? "HTTP {$statusCode}",
-                'idMapping' => []
+                'message' => 'Unexpected API response: ' . json_encode($result)
+            ];
+
+        } catch (RequestException $e) {
+            $statusCode = $e->getResponse() ? $e->getResponse()->getStatusCode() : 0;
+            $responseBody = $e->getResponse() ? $e->getResponse()->getBody()->getContents() : '';
+
+            $this->logger->error("  ✗ Upload request failed (HTTP {$statusCode})");
+            $this->logger->debug("  Response: " . $responseBody);
+
+            $errorData = json_decode($responseBody, true);
+            $errorMessage = $errorData['error'] ?? $errorData['message'] ?? $e->getMessage();
+
+            return [
+                'success' => false,
+                'message' => $errorMessage
+            ];
+
+        } catch (\Exception $e) {
+            $this->logger->error("  ✗ Upload exception: " . $e->getMessage());
+
+            return [
+                'success' => false,
+                'message' => $e->getMessage()
             ];
         }
-
-        return [
-            'success' => $data['success'] ?? true,
-            'message' => $data['message'] ?? 'OK',
-            'idMapping' => $data['idMapping'] ?? []
-        ];
     }
 
-    // ──────────────────────────────────────────────────────────────────
-    // ACCESSORS
-    // ──────────────────────────────────────────────────────────────────
-
-    public function getBaseUrl(): string
-    {
-        return $this->baseUrl;
-    }
-
-    public function getActiveVersion(): string
-    {
-        return $this->activeVersion ?? $this->apiVersions[0];
-    }
-
-    public function getApiConfig(): Configuration
-    {
-        return $this->apiConfig;
-    }
-
-    public function getModuleConfig(): Configuration
-    {
-        return $this->moduleConfig;
+    /**
+     * Legacy method - maintained for backward compatibility
+     */
+    public function uploadInstrumentCSV(
+        string $instrument,
+        string $csvFile,
+        string $action = 'CREATE_SESSIONS'
+    ): array {
+        return $this->uploadInstrumentData($instrument, $csvFile, $action, 'LORIS_CSV');
     }
 }
