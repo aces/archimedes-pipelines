@@ -340,23 +340,24 @@ php scripts/run_imaging_pipeline.php --all
 ├── project.json                          # Project configuration
 │
 ├── deidentified-raw/                     # De-identified participant data
-│   ├── clinical/                         # Clinical instrument CSVs
+│   ├── clinical/                         # Raw Patient records & clinical assessment in csv/tsv
 │   ├── imaging/
-│   │   └── dicoms/
+│   │   └── dicoms/                       # Raw medical imaging data (non-BIDS)
 │   ├── bids/                             # Deidentified MRI and EEG Data (ExternalIDs)
 │   └── genomics/
 │
 ├── deidentified-lorisid/                 # LORIS-relabelled data
 │   ├── imaging/
-│   ├── bids/                             #  Reidentified MRI and EEG Data (LORISIDs)
+    │   └── dicoms/                       # Raw medical imaging data with LORIS IDs
+│   ├── bids/                             # Reidentified MRI and EEG Data with LORIS IDs
 │   └── genomics/
 │
-├── processed/                            # Pipeline outputs
+├── processed/                            # Data after CBIG/LORIS processing
 │   ├── clinical/
 │   ├── imaging/
-│   ├── bids/
+│   ├── bids/         
 │   │   └── derivatives/
-│   └── freesurfer-output/
+│   └── freesurfer-output/                # Converted & cleaned data (NIfTI, MINC)
 │
 ├── logs/                                 # Execution logs
 │
