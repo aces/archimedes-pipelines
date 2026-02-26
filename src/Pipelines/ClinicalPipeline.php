@@ -4,69 +4,102 @@ declare(strict_types=1);
 namespace LORIS\Pipelines;
 
 use LORIS\Endpoints\ClinicalClient;
-use LORIS\Database\Database;
 use LORIS\Utils\{Notification, CleanLogFormatter};
 use Monolog\Logger;
-use Monolog\Handler\{StreamHandler, RotatingFileHandler};
+use Monolog\Handler\StreamHandler;
 use Psr\Log\LoggerInterface;
 
 /**
  * Clinical Data Ingestion Pipeline
  *
- * Uses ClinicalClient (loris-php-api-client) for:
- * - Authentication
- * - Instrument CSV upload
- * - Auto-install instruments from data dictionary
+ * Logging:
+ *   1. Console        → stdout (always)
+ *   2. Run log        → logs/clinical/clinical_run_{timestamp}.log  (per run, all detail)
+ *   3. Error log      → logs/clinical/clinical_errors_{timestamp}.log (per run, only if errors)
+ *   4. Email          → success or failure notification with full summary
+ *
+ * Run log and error log share the same timestamp so they pair up.
  */
 class ClinicalPipeline
 {
     private array $config;
     private LoggerInterface $logger;
     private ClinicalClient $client;
-    private Database $db;
     private Notification $notification;
     private bool $dryRun;
     private bool $verbose;
 
+    /** Timestamp for this pipeline run — shared across log files */
+    private string $runTimestamp;
+
+    /** @var resource|null Error log — opened lazily on first error */
+    private $errorFh = null;
+    private ?string $errorLogPath = null;
+
+    /** @var resource|null Run log — opened per project */
+    private $runLogFh = null;
+    private ?string $runLogPath = null;
+
+    private ?string $logDir = null;
+
+    // ── Tracking ─────────────────────────────────────────────────────
+
+    /** Install results per file: filename → {status, type, time, error} */
+    private array $installResults = [];
+
+    /** Data upload results per file: filename → {status, reason, instruments, rows, ...} */
+    private array $dataResults = [];
+
+    /** Global stats across all projects in this run */
     private array $stats = [
-        'total' => 0,
-        'success' => 0,
-        'failed' => 0,
-        'skipped' => 0,
-        'rows_uploaded' => 0,
-        'rows_skipped' => 0,
-        'candidates_created' => 0,
-        'instruments_installed' => 0,
-        'errors' => []
+        'dd_files_found'        => 0,
+        'dd_installed'          => 0,
+        'dd_already_existed'    => 0,
+        'dd_failed'             => 0,
+        'data_files_found'      => 0,
+        'data_uploaded'         => 0,
+        'data_failed'           => 0,
+        'data_skipped'          => 0,
+        'rows_uploaded'         => 0,
+        'rows_skipped'          => 0,
+        'candidates_created'    => 0,
     ];
+
+    /** DD extensions → instrument_type for LORIS */
+    private const DD_EXTENSIONS = [
+        'csv'   => 'redcap',
+        'linst' => 'linst',
+        'json'  => 'bids',
+    ];
+
+    /** Data file extensions → format for LORIS */
+    private const DATA_EXTENSIONS = [
+        'csv' => 'LORIS_CSV',
+        'tsv' => 'BIDS_TSV',
+    ];
+
+    /** Admin forms to exclude */
+    private const DEFAULT_EXCLUDE_FORMS = ['nip_connector', 'project_request_form'];
+
+    // ──────────────────────────────────────────────────────────────────
+    // Constructor
+    // ──────────────────────────────────────────────────────────────────
 
     public function __construct(array $config, bool $dryRun = false, bool $verbose = false)
     {
-        $this->config = $config;
-        $this->dryRun = $dryRun;
-        $this->verbose = $verbose;
+        $this->config       = $config;
+        $this->dryRun       = $dryRun;
+        $this->verbose      = $verbose;
+        $this->runTimestamp  = date('Y-m-d_H-i-s');
 
-        // Initialize logger
         $logLevel = $verbose ? Logger::DEBUG : Logger::INFO;
         $this->logger = new Logger('clinical');
-
-        // Create formatter for clean output
         $formatter = new CleanLogFormatter();
 
-        // Console handler
-        $consoleHandler = new StreamHandler('php://stdout', $logLevel);
-        $consoleHandler->setFormatter($formatter);
-        $this->logger->pushHandler($consoleHandler);
+        $console = new StreamHandler('php://stdout', $logLevel);
+        $console->setFormatter($formatter);
+        $this->logger->pushHandler($console);
 
-        // Add file handler if log directory configured
-        if (isset($config['logging']['log_dir'])) {
-            $logFile = $config['logging']['log_dir'] . '/clinical_' . date('Y-m-d') . '.log';
-            $fileHandler = new RotatingFileHandler($logFile, 30, Logger::DEBUG);
-            $fileHandler->setFormatter($formatter);
-            $this->logger->pushHandler($fileHandler);
-        }
-
-        // Use ClinicalClient (wraps loris-php-api-client)
         $this->client = new ClinicalClient(
             $config['api']['base_url'],
             $config['api']['username'],
@@ -75,816 +108,1004 @@ class ClinicalPipeline
             $this->logger
         );
 
-        // Initialize Database
-        $this->db = new Database($config, $this->logger);
-
         $this->notification = new Notification();
     }
 
-    /**
-     * Run clinical ingestion pipeline
-     */
+    // ──────────────────────────────────────────────────────────────────
+    // Main entry
+    // ──────────────────────────────────────────────────────────────────
+
     public function run(array $filters = []): int
     {
         $this->logger->info("=== CLINICAL DATA INGESTION PIPELINE ===");
-        $this->logger->info("Started: " . date('Y-m-d H:i:s'));
-
+        $this->logger->info("Run: {$this->runTimestamp}");
         if ($this->dryRun) {
-            $this->logger->info("MODE: DRY RUN - No uploads will be performed");
-        }
-
-        if ($this->verbose) {
-            $this->logger->info("MODE: VERBOSE - Debug logging enabled");
-        }
-
-        // Log filters if any
-        if (!empty($filters)) {
-            $filterStr = [];
-            if (isset($filters['collection'])) {
-                $filterStr[] = "collection={$filters['collection']}";
-            }
-            if (isset($filters['project'])) {
-                $filterStr[] = "project={$filters['project']}";
-            }
-            $this->logger->info("Filters: " . implode(', ', $filterStr));
+            $this->logger->info("MODE: DRY RUN");
         }
 
         try {
-            // Authenticate via loris-php-api-client
             $this->client->authenticate();
 
-            // Discover projects
             $projects = $this->discoverProjects($filters);
-
             if (empty($projects)) {
-                $this->logger->warning("No projects found to process");
-                $this->logger->info("  Check your filters or project configuration");
+                $this->logger->warning("No projects found");
                 return 0;
             }
 
-            $this->logger->info("Found " . count($projects) . " project(s) to process");
+            $this->logger->info("Found " . count($projects) . " project(s)");
 
-            // Process each project
             foreach ($projects as $project) {
                 $this->processProject($project);
             }
 
-            // Print summary
-            $this->printSummary();
-            $this->logger->info("Completed: " . date('Y-m-d H:i:s'));
-            $this->logger->info("=== Complete ===");
+            $this->writeFinalSummary();
+            $this->closeAllLogs();
 
-            return $this->stats['failed'] > 0 ? 1 : 0;
+            return ($this->stats['data_failed'] > 0 || $this->stats['dd_failed'] > 0) ? 1 : 0;
 
         } catch (\Exception $e) {
-            $this->logger->error("FATAL ERROR: " . $e->getMessage());
-            $this->logger->debug("Stack trace: " . $e->getTraceAsString());
+            $this->writeError("FATAL", $e->getMessage());
+            $this->logger->debug($e->getTraceAsString());
+            $this->closeAllLogs();
             return 1;
         }
     }
 
-    /**
-     * Discover projects from configuration
-     */
-    private function discoverProjects(array $filters): array
-    {
-        $projects = [];
-        $collections = $this->config['collections'] ?? [];
+    // ──────────────────────────────────────────────────────────────────
+    // Process project
+    // ──────────────────────────────────────────────────────────────────
 
-        $this->logger->debug("Discovering projects from " . count($collections) . " collection(s)");
-
-        foreach ($collections as $collection) {
-            if (!($collection['enabled'] ?? true)) {
-                $this->logger->debug("  Skipping disabled collection: {$collection['name']}");
-                continue;
-            }
-
-            if (isset($filters['collection']) && $collection['name'] !== $filters['collection']) {
-                continue;
-            }
-
-            $this->logger->debug("  Scanning collection: {$collection['name']}");
-
-            foreach ($collection['projects'] ?? [] as $projectConfig) {
-                if (!($projectConfig['enabled'] ?? true)) {
-                    $this->logger->debug("    Skipping disabled project: {$projectConfig['name']}");
-                    continue;
-                }
-
-                if (isset($filters['project']) && $projectConfig['name'] !== $filters['project']) {
-                    continue;
-                }
-
-                // Load project.json
-                $projectPath = $collection['base_path'] . '/' . $projectConfig['name'];
-                $projectJsonPath = $projectPath . '/project.json';
-
-                if (!file_exists($projectJsonPath)) {
-                    $this->logger->warning("    Project config not found: {$projectJsonPath}");
-                    continue;
-                }
-
-                $projectData = json_decode(file_get_contents($projectJsonPath), true);
-                if (json_last_error() !== JSON_ERROR_NONE) {
-                    $this->logger->warning("    Invalid JSON in: {$projectJsonPath}");
-                    continue;
-                }
-
-                $projectData['_collection'] = $collection['name'];
-                $projectData['_projectPath'] = $projectPath;
-                $projects[] = $projectData;
-
-                $this->logger->debug("    ✓ Loaded: {$projectConfig['name']}");
-            }
-        }
-
-        return $projects;
-    }
-
-    /**
-     * Process single project
-     */
     private function processProject(array $project): void
     {
-        $projectName = $project['project_common_name'] ?? 'Unknown';
+        $name      = $project['project_common_name'] ?? basename($project['_projectPath']);
+        $mountPath = $project['data_access']['mount_path'] ?? $project['_projectPath'];
+        $ddDir     = "{$mountPath}/documentation/data_dictionary";
+        $dataDir   = "{$mountPath}/deidentified-raw/clinical";
 
-        $this->logger->info("\n========================================");
-        $this->logger->info("Project: {$projectName}");
-        $this->logger->info("========================================");
+        $this->logDir = "{$mountPath}/logs/clinical";
+        $this->openRunLog();
 
-        // Get clinical data directory
-        $clinicalDir = $project['data_access']['mount_path'] . '/deidentified-raw/clinical';
+        $this->log("========================================");
+        $this->log("Project: {$name}");
+        $this->log("Run: {$this->runTimestamp}");
+        $this->log("DD dir: {$ddDir}");
+        $this->log("Data dir: {$dataDir}");
+        $this->log("========================================");
 
-        $this->logger->debug("Clinical data directory: {$clinicalDir}");
+        // Reset per-project tracking
+        $this->installResults = [];
+        $this->dataResults    = [];
 
-        if (!is_dir($clinicalDir)) {
-            $this->logger->warning("  ✗ Clinical directory not found: {$clinicalDir}");
-            $this->logger->info("    Expected path: {$clinicalDir}");
-            $this->logger->info("    Ensure deidentified data has been placed in the correct location");
-            return;
-        }
-
-        // Get instruments from project.json
-        $instruments = $project['clinical_instruments'] ?? [];
-
-        if (empty($instruments)) {
-            $this->logger->warning("  ✗ No clinical_instruments defined in project.json");
-            $this->logger->info("    Add instruments to project.json under 'clinical_instruments' array");
-            return;
-        }
-
-        $this->logger->info("Instruments defined in project.json: " . count($instruments));
-        $this->logger->info("  → " . implode(', ', $instruments));
-
-        // Setup project-specific logging
-        if (isset($project['logging']['log_path'])) {
-            $projectLogFile = $project['logging']['log_path'] . '/clinical.log';
-            $this->logger->debug("Project log: {$projectLogFile}");
-            $this->logger->pushHandler(new RotatingFileHandler($projectLogFile, 30));
-        }
-
-        // Process each instrument
-        $projectStats = [
-            'total'   => 0,
-            'success' => 0,
-            'failed'  => 0,
-            'skipped' => 0,
-            'instruments' => [
-                'success' => [],
-                'failed'  => [],
-                'skipped' => []
-            ],
-            'reasons' => [
-                'failed'  => [],
-                'skipped' => []
-            ]
-        ];
-
-        $this->logger->info("\nProcessing instruments:");
-        $this->logger->info("----------------------------------------");
-
-        foreach ($instruments as $instrument) {
-            $result = $this->processInstrument($project, $instrument, $clinicalDir);
-
-            // Result can be 'success', 'failed', 'skipped' or array with reason
-            if (is_array($result)) {
-                $status = $result['status'];
-                $reason = $result['reason'] ?? '';
-                $projectStats[$status]++;
-                $projectStats['instruments'][$status][] = $instrument;
-                if ($reason && isset($projectStats['reasons'][$status])) {
-                    $projectStats['reasons'][$status][$instrument] = $reason;
-                }
-            } else {
-                $projectStats[$result]++;
-                $projectStats['instruments'][$result][] = $instrument;
-            }
-            $projectStats['total']++;
-        }
-
-        // Project summary
-        $this->logger->info("\n----------------------------------------");
-        $this->logger->info("Project '{$projectName}' completed:");
-        $this->logger->info("  Total: {$projectStats['total']}, Success: {$projectStats['success']}, Failed: {$projectStats['failed']}, Skipped: {$projectStats['skipped']}");
-
-        // Send notification
-        $this->sendProjectNotification($project, $projectStats);
+        $this->installFromDirectory($ddDir);
+        $this->uploadFromDirectory($project, $dataDir);
+        $this->writeProjectSummary($name);
+        $this->sendNotification($project);
     }
 
-    /**
-     * Process single instrument CSV file
-     */
-    private function processInstrument(array $project, string $instrument, string $clinicalDir): string|array
+    // ══════════════════════════════════════════════════════════════════
+    //  STEP 1: Install instruments
+    // ══════════════════════════════════════════════════════════════════
+
+    private function installFromDirectory(string $ddDir): void
     {
-        $csvFile = "{$clinicalDir}/{$instrument}.csv";
+        $this->log("");
+        $this->log("──── STEP 1: INSTALL INSTRUMENTS ────");
 
-        // ─────────────────────────────────────────────────────────────
-        // CHECK 1: Does the CSV data file exist?
-        // ─────────────────────────────────────────────────────────────
-        if (!file_exists($csvFile)) {
-            // Check if instrument definition exists in data_dictionary
-            $ddPath = $project['data_access']['mount_path'] . '/documentation/data_dictionary';
-            $linstFile = "{$ddPath}/{$instrument}.linst";
-            $ddCsvFile = "{$ddPath}/{$instrument}.csv";
+        if (!is_dir($ddDir)) {
+            $this->log("  Directory not found: {$ddDir}");
+            return;
+        }
 
-            $linstExists = file_exists($linstFile);
-            $ddCsvExists = file_exists($ddCsvFile);
-
-            if ($linstExists || $ddCsvExists) {
-                // DD exists but no data to ingest - this is OK, just skip
-                $ddType = $linstExists ? '.linst' : '.csv';
-                $this->logger->info("\n  ⚠ {$instrument}:");
-                $this->logger->info("      Status: SKIPPED - No data to ingest");
-                $this->logger->info("      DD definition: ✓ Found ({$ddType})");
-                $this->logger->info("      Data CSV: ✗ Not found in deidentified folder");
-                $this->logger->debug("      Expected: {$csvFile}");
-
-                $this->stats['skipped']++;
-                return ['status' => 'skipped', 'reason' => 'no data'];
-            } else {
-                // Neither DD nor data exists - this is a FAILURE
-                $this->logger->info("\n  ✗ {$instrument}:");
-                $this->logger->info("      Status: FAILED - No DD found");
-                $this->logger->info("      DD definition: ✗ Not found");
-                $this->logger->info("      Data CSV: ✗ Not found");
-                $this->logger->info("      Note: Defined in project.json but no files exist");
-                $this->logger->debug("      DD path checked: {$ddPath}");
-                $this->logger->debug("      Data path checked: {$csvFile}");
-
-                $this->stats['failed']++;
-                $this->stats['errors'][] = [
-                    'instrument' => $instrument,
-                    'file' => '',
-                    'errors' => ["No data dictionary (.linst or .csv) found in {$ddPath}/"]
-                ];
-                return ['status' => 'failed', 'reason' => 'no DD found'];
+        $files = [];
+        foreach (self::DD_EXTENSIONS as $ext => $type) {
+            foreach (glob("{$ddDir}/*.{$ext}") as $path) {
+                $files[] = ['path' => $path, 'name' => basename($path), 'type' => $type];
             }
         }
 
-        // ─────────────────────────────────────────────────────────────
-        // CHECK 2: Has this file already been processed?
-        // ─────────────────────────────────────────────────────────────
-        $filename = "{$instrument}.csv";
-        if ($this->isAlreadyProcessed($project, $filename, 'clinical')) {
-            $this->logger->info("\n  ⚠ {$instrument}:");
-            $this->logger->info("      Status: SKIPPED - Already processed");
-            $this->logger->info("      File found in processed/ archive folder");
-            $this->logger->debug("      Source: {$csvFile}");
+        $this->stats['dd_files_found'] += count($files);
 
-            $this->stats['skipped']++;
-            return ['status' => 'skipped', 'reason' => 'already processed'];
+        if (empty($files)) {
+            $this->log("  No DD files found (.csv, .linst, .json)");
+            return;
         }
 
-        // ─────────────────────────────────────────────────────────────
-        // FILE FOUND - Process it
-        // ─────────────────────────────────────────────────────────────
-        $this->logger->info("\n  → {$instrument}:");
-        $this->stats['total']++;
+        $this->log("  Found " . count($files) . " DD file(s)");
+        $this->log("");
 
-        // Log file info
-        $fileSize = filesize($csvFile);
-        $fileSizeMB = round($fileSize / 1024 / 1024, 2);
-        $fileSizeKB = round($fileSize / 1024, 2);
-        $rowCount = $this->countCSVRows($csvFile);
-
-        $sizeStr = $fileSizeMB >= 1 ? "{$fileSizeMB} MB" : "{$fileSizeKB} KB";
-        $this->logger->info("      File: {$instrument}.csv ({$sizeStr}, {$rowCount} rows)");
-
-        // ─────────────────────────────────────────────────────────────
-        // CHECK 3: Validate CSV structure
-        // ─────────────────────────────────────────────────────────────
-        if (!$this->validateCSV($csvFile)) {
-            $this->logger->error("      Status: FAILED - Invalid CSV format");
-            $this->stats['failed']++;
-            $this->stats['errors'][] = [
-                'instrument' => $instrument,
-                'file' => $csvFile,
-                'errors' => ['Invalid CSV format - missing required columns (Visit_label)']
-            ];
-            return ['status' => 'failed', 'reason' => 'invalid CSV'];
+        foreach ($files as $f) {
+            $this->installOneDDFile($f);
         }
+    }
 
-        $this->logger->debug("      CSV validation: ✓ Passed");
+    private function installOneDDFile(array $f): void
+    {
+        $filePath = $f['path'];
+        $filename = $f['name'];
+        $type     = $f['type'];
 
-        // ─────────────────────────────────────────────────────────────
-        // CHECK 4: Ensure instrument exists in LORIS (auto-install if needed)
-        // ─────────────────────────────────────────────────────────────
-        if (!$this->ensureInstrumentExists($project, $instrument)) {
-            $this->logger->error("      Status: FAILED - Instrument not installed in LORIS");
-            $this->stats['failed']++;
-            return ['status' => 'failed', 'reason' => 'not in LORIS'];
-        }
+        $this->log("  [{$type}] {$filename}");
 
-        // ─────────────────────────────────────────────────────────────
-        // DRY RUN - Don't actually upload
-        // ─────────────────────────────────────────────────────────────
         if ($this->dryRun) {
-            $this->logger->info("      Status: DRY RUN - Would upload {$rowCount} row(s)");
-            $this->stats['success']++;
+            $this->log("    DRY RUN — would install");
+            $this->installResults[$filename] = ['status' => 'dry_run', 'type' => $type];
+            return;
+        }
+
+        try {
+            $t0      = microtime(true);
+            $result  = $this->client->installInstrument($filePath);
+            $elapsed = round(microtime(true) - $t0, 2);
+            $msg     = $result['message'] ?? '';
+
+            if ($result['success'] ?? false) {
+                if (stripos($msg, 'already') !== false || stripos($msg, 'Already') !== false) {
+                    $this->log("    Already installed ({$elapsed}s)");
+                    $this->installResults[$filename] = ['status' => 'exists', 'type' => $type, 'time' => $elapsed];
+                    $this->stats['dd_already_existed']++;
+                } else {
+                    $this->log("    Installed successfully ({$elapsed}s)");
+                    $this->installResults[$filename] = ['status' => 'installed', 'type' => $type, 'time' => $elapsed];
+                    $this->stats['dd_installed']++;
+                    $this->client->clearInstrumentCache();
+                }
+                return;
+            }
+
+            if (stripos($msg, '409') !== false || stripos($msg, 'already') !== false) {
+                $this->log("    Already installed ({$elapsed}s)");
+                $this->installResults[$filename] = ['status' => 'exists', 'type' => $type, 'time' => $elapsed];
+                $this->stats['dd_already_existed']++;
+                return;
+            }
+
+            $this->log("    FAILED: {$msg}");
+            $this->writeError($filename, "Install failed: {$msg}");
+            $this->installResults[$filename] = ['status' => 'failed', 'type' => $type, 'error' => $msg];
+            $this->stats['dd_failed']++;
+
+        } catch (\Exception $e) {
+            $emsg = $e->getMessage();
+            if (stripos($emsg, '409') !== false) {
+                $this->log("    Already installed");
+                $this->installResults[$filename] = ['status' => 'exists', 'type' => $type];
+                $this->stats['dd_already_existed']++;
+                return;
+            }
+            $this->log("    EXCEPTION: {$emsg}");
+            $this->writeError($filename, "Install exception: {$emsg}");
+            $this->installResults[$filename] = ['status' => 'failed', 'type' => $type, 'error' => $emsg];
+            $this->stats['dd_failed']++;
+        }
+    }
+
+    // ══════════════════════════════════════════════════════════════════
+    //  STEP 2: Upload data — file by file
+    // ══════════════════════════════════════════════════════════════════
+
+    private function uploadFromDirectory(array $project, string $dataDir): void
+    {
+        $this->log("");
+        $this->log("──── STEP 2: UPLOAD CLINICAL DATA ────");
+
+        if (!is_dir($dataDir)) {
+            $this->log("  Directory not found: {$dataDir}");
+            return;
+        }
+
+        $files = [];
+        foreach (self::DATA_EXTENSIONS as $ext => $format) {
+            foreach (glob("{$dataDir}/*.{$ext}") as $path) {
+                $files[] = ['path' => $path, 'name' => basename($path), 'format' => $format];
+            }
+        }
+
+        $this->stats['data_files_found'] += count($files);
+        $excludeFiles = $project['exclude_data_files'] ?? [];
+
+        if (empty($files)) {
+            $this->log("  No data files found (.csv, .tsv)");
+            return;
+        }
+
+        $this->log("  Found " . count($files) . " data file(s)");
+        $this->log("");
+
+        foreach ($files as $f) {
+            $filename = $f['name'];
+
+            if (in_array($filename, $excludeFiles, true)) {
+                $this->log("  [{$filename}] SKIPPED — excluded in project.json");
+                $this->dataResults[$filename] = ['status' => 'skipped', 'reason' => 'excluded'];
+                $this->stats['data_skipped']++;
+                continue;
+            }
+
+            if ($this->isAlreadyProcessed($project, $filename)) {
+                $this->log("  [{$filename}] SKIPPED — already processed");
+                $this->dataResults[$filename] = ['status' => 'skipped', 'reason' => 'already processed'];
+                $this->stats['data_skipped']++;
+                continue;
+            }
+
+            $this->processOneDataFile($project, $f);
+        }
+    }
+
+    private function processOneDataFile(array $project, array $fileInfo): void
+    {
+        $filePath = $fileInfo['path'];
+        $filename = $fileInfo['name'];
+        $format   = $fileInfo['format'];
+        $baseName = pathinfo($filename, PATHINFO_FILENAME);
+
+        $rows = $this->countRows($filePath);
+
+        $this->log("  [{$filename}] {$rows} rows, format: {$format}");
+
+        if ($rows === 0) {
+            $this->log("    SKIPPED — empty file");
+            $this->dataResults[$filename] = ['status' => 'skipped', 'reason' => 'empty', 'rows' => 0];
+            $this->stats['data_skipped']++;
+            return;
+        }
+
+        // Case A: filename matches instrument
+        if ($this->client->instrumentExists($baseName)) {
+            $this->log("    Instrument: {$baseName} (matched by filename)");
+            $result = $this->doSingleUpload($baseName, $filePath, $format, $rows);
+            $this->dataResults[$filename] = array_merge($result, [
+                'instruments' => [$baseName], 'rows' => $rows,
+            ]);
+            if ($result['status'] === 'success') {
+                $this->archiveFile($project, $filePath);
+            }
+            return;
+        }
+
+        // Case B: detect from headers
+        $instruments = $this->detectInstrumentsFromHeaders($filePath, $format);
+
+        if (empty($instruments)) {
+            $this->log("    FAILED — no matching instruments found in headers");
+            $this->writeError($filename, "No matching instruments found");
+            $this->dataResults[$filename] = [
+                'status' => 'failed', 'reason' => 'no matching instruments',
+                'instruments' => [], 'rows' => $rows,
+            ];
+            $this->stats['data_failed']++;
+            return;
+        }
+
+        $this->log("    Instruments (" . count($instruments) . "): " . implode(', ', $instruments));
+
+        if (count($instruments) === 1) {
+            $result = $this->doSingleUpload($instruments[0], $filePath, $format, $rows);
+        } else {
+            $result = $this->doMultiUpload($instruments, $filePath, $format, $rows);
+        }
+
+        $this->dataResults[$filename] = array_merge($result, [
+            'instruments' => $instruments, 'rows' => $rows,
+        ]);
+
+        if ($result['status'] === 'success') {
+            $this->archiveFile($project, $filePath);
+        }
+    }
+
+    private function detectInstrumentsFromHeaders(string $filePath, string $format): array
+    {
+        $delimiter = ($format === 'BIDS_TSV') ? "\t" : ',';
+        $fh = fopen($filePath, 'r');
+        $headerLine = fgets($fh);
+        fclose($fh);
+
+        if ($headerLine === false) {
+            return [];
+        }
+
+        $columns = array_map('trim', str_getcsv(trim($headerLine), $delimiter));
+        $instruments = [];
+
+        foreach ($columns as $col) {
+            if (preg_match('/^(.+)_complete$/', $col, $m)) {
+                $inst = $m[1];
+                if (!in_array($inst, self::DEFAULT_EXCLUDE_FORMS, true)
+                    && $this->client->instrumentExists($inst)
+                ) {
+                    $instruments[] = $inst;
+                }
+            }
+        }
+
+        return array_unique($instruments);
+    }
+
+    // ══════════════════════════════════════════════════════════════════
+    //  Upload execution
+    // ══════════════════════════════════════════════════════════════════
+
+    private function doSingleUpload(string $instrument, string $filePath, string $format, int $rows): array
+    {
+        if ($this->dryRun) {
+            $this->log("    DRY RUN — would upload {$rows} rows to {$instrument}");
             return ['status' => 'success', 'reason' => 'dry run'];
         }
 
-        // ─────────────────────────────────────────────────────────────
-        // UPLOAD via ClinicalClient
-        // ─────────────────────────────────────────────────────────────
         try {
-            $this->logger->info("      Uploading to LORIS (CREATE_SESSIONS mode)...");
-            $startTime = microtime(true);
-
-            $result = $this->client->uploadInstrumentCSV(
-                $instrument,
-                $csvFile,
-                'CREATE_SESSIONS'
-            );
-
-            $duration = round(microtime(true) - $startTime, 2);
+            $t0      = microtime(true);
+            $result  = $this->client->uploadInstrumentData($instrument, $filePath, 'CREATE_SESSIONS');
+            $elapsed = round(microtime(true) - $t0, 2);
 
             if ($result['success'] ?? false) {
-                $this->logger->info("      Status: SUCCESS ({$duration}s)");
-                $this->stats['success']++;
-
-                // Parse message for statistics
-                $this->parseUploadResult($result, $instrument);
-
-                // Archive the processed file
-                $this->archiveFile($project, $csvFile, 'clinical');
-                return ['status' => 'success', 'reason' => 'uploaded'];
-
-            } else {
-                $this->logger->error("      Status: FAILED ({$duration}s)");
-                $this->stats['failed']++;
-                $this->logUploadErrors($instrument, $csvFile, $result);
-                return ['status' => 'failed', 'reason' => 'upload error'];
+                $ui = $this->extractUploadInfo($result);
+                $this->logUploadSuccess($elapsed, $ui);
+                $this->tallyUploadSuccess($ui);
+                return array_merge(['status' => 'success', 'reason' => 'uploaded', 'elapsed' => $elapsed], $ui);
             }
 
+            $msg = $this->firstErrorMsg($result);
+            $this->log("    FAILED ({$elapsed}s): {$msg}");
+            $this->writeError($instrument, "Upload failed: {$msg}");
+            $this->writeUploadErrorDetails($instrument, $filePath, $result);
+            $this->stats['data_failed']++;
+            return ['status' => 'failed', 'reason' => $msg, 'elapsed' => $elapsed];
+
         } catch (\Exception $e) {
-            $this->logger->error("      Status: FAILED - Exception");
-            $this->logger->error("      Error: " . $e->getMessage());
-            $this->stats['failed']++;
-            $this->stats['errors'][] = [
-                'instrument' => $instrument,
-                'file' => $csvFile,
-                'errors' => [$e->getMessage()]
-            ];
-            return ['status' => 'failed', 'reason' => 'exception'];
+            $this->log("    EXCEPTION: " . $e->getMessage());
+            $this->writeError($instrument, "Upload exception: " . $e->getMessage());
+            $this->stats['data_failed']++;
+            return ['status' => 'failed', 'reason' => $e->getMessage()];
         }
     }
 
-    /**
-     * Ensure instrument exists in LORIS, try to install if not
-     */
-    private function ensureInstrumentExists(array $project, string $instrument): bool
+    private function doMultiUpload(array $instruments, string $filePath, string $format, int $rows): array
     {
-        // Check if instrument exists
-        if ($this->client->instrumentExists($instrument)) {
-            $this->logger->debug("      LORIS instrument: ✓ Exists");
-            return true;
-        }
+        $count = count($instruments);
 
-        $this->logger->warning("      LORIS instrument: ✗ Not found - attempting auto-install");
-
-        // Try to find definition in data dictionary
-        $ddPath = $project['data_access']['mount_path'] . '/documentation/data_dictionary';
-
-        $linstFile = "{$ddPath}/{$instrument}.linst";
-        $csvFile = "{$ddPath}/{$instrument}.csv";
-
-        $installFile = null;
-        $fileType = null;
-
-        if (file_exists($linstFile)) {
-            $installFile = $linstFile;
-            $fileType = 'LINST';
-            $this->logger->info("      DD found: {$instrument}.linst (LORIS format)");
-        } elseif (file_exists($csvFile)) {
-            $installFile = $csvFile;
-            $fileType = 'REDCap CSV';
-            $this->logger->info("      DD found: {$instrument}.csv (REDCap format)");
-        }
-
-        if ($installFile === null) {
-            $this->logger->error("      ✗ Cannot auto-install: No instrument definition found");
-            $this->logger->error("        Checked locations:");
-            $this->logger->error("          - {$ddPath}/{$instrument}.linst");
-            $this->logger->error("          - {$ddPath}/{$instrument}.csv");
-            $this->logger->info("        Action required: Install '{$instrument}' manually in LORIS");
-            $this->logger->info("        Or add definition file to data_dictionary folder");
-
-            $this->stats['errors'][] = [
-                'instrument' => $instrument,
-                'file' => '',
-                'errors' => [
-                    "Instrument '{$instrument}' not installed in LORIS",
-                    "No definition found in {$ddPath}/",
-                    "Add {$instrument}.linst or {$instrument}.csv to data_dictionary, or install manually"
-                ]
-            ];
-            return false;
-        }
-
-        // Dry run - don't actually install
         if ($this->dryRun) {
-            $this->logger->info("      DRY RUN - Would install instrument from {$fileType}");
-            return true;
+            $this->log("    DRY RUN — would upload {$rows} rows for {$count} instruments");
+            return ['status' => 'success', 'reason' => 'dry run'];
         }
-
-        // Try to install
-        $this->logger->info("      Installing instrument from {$fileType}...");
 
         try {
-            $success = $this->client->installInstrument($installFile);
+            $t0      = microtime(true);
+            $result  = $this->client->uploadMultiInstrumentData($instruments, $filePath, 'CREATE_SESSIONS', $format);
+            $elapsed = round(microtime(true) - $t0, 2);
 
-            if ($success) {
-                $this->logger->info("      ✓ Instrument '{$instrument}' installed successfully");
-                $this->stats['instruments_installed']++;
-                return true;
-            } else {
-                $this->logger->error("      ✗ Failed to install instrument");
-                $this->stats['errors'][] = [
-                    'instrument' => $instrument,
-                    'file' => $installFile,
-                    'errors' => ["Failed to install instrument from {$fileType}"]
-                ];
-                return false;
+            if ($result['success'] ?? false) {
+                $ui = $this->extractUploadInfo($result);
+                $this->logUploadSuccess($elapsed, $ui, $count);
+                $this->tallyUploadSuccess($ui);
+                return array_merge(['status' => 'success', 'reason' => 'uploaded', 'elapsed' => $elapsed], $ui);
             }
+
+            $msg = $this->firstErrorMsg($result);
+            $this->log("    FAILED ({$elapsed}s): {$msg}");
+            $this->writeError('multi-instrument', "Upload failed: {$msg}");
+            $this->writeUploadErrorDetails('multi-instrument', $filePath, $result);
+            $this->stats['data_failed']++;
+            return ['status' => 'failed', 'reason' => $msg, 'elapsed' => $elapsed];
 
         } catch (\Exception $e) {
-            $this->logger->error("      ✗ Install exception: " . $e->getMessage());
-            $this->stats['errors'][] = [
-                'instrument' => $instrument,
-                'file' => $installFile,
-                'errors' => ["Install failed: " . $e->getMessage()]
-            ];
-            return false;
+            $this->log("    EXCEPTION: " . $e->getMessage());
+            $this->writeError('multi-instrument', "Exception: " . $e->getMessage());
+            $this->stats['data_failed']++;
+            return ['status' => 'failed', 'reason' => $e->getMessage()];
         }
     }
 
-    /**
-     * Parse upload result and update stats
-     */
-    private function parseUploadResult(array $result, string $instrument): void
+    private function extractUploadInfo(array $result): array
     {
-        $saved = 0;
-        $total = 0;
+        $info = ['rows_saved' => null, 'rows_total' => null, 'rows_skipped' => 0, 'candidates' => 0];
 
-        if (isset($result['message']) && is_string($result['message'])) {
-            if (preg_match('/Saved (\d+) out of (\d+)/', $result['message'], $matches)) {
-                $saved = (int)$matches[1];
-                $total = (int)$matches[2];
-                $skipped = $total - $saved;
+        $msg = $result['message'] ?? null;
+        if (is_string($msg) && preg_match('/Saved (\d+) out of (\d+)/', $msg, $m)) {
+            $info['rows_saved']   = (int)$m[1];
+            $info['rows_total']   = (int)$m[2];
+            $info['rows_skipped'] = $info['rows_total'] - $info['rows_saved'];
+        }
 
-                $this->stats['rows_uploaded'] += $saved;
-                $this->stats['rows_skipped'] += $skipped;
+        $idMap = $result['idMapping'] ?? [];
+        if (!empty($idMap) && is_array($idMap)) {
+            $info['candidates'] = count($idMap);
+        }
 
-                $this->logger->info("      Rows: {$saved}/{$total} saved" . ($skipped > 0 ? " ({$skipped} already exist)" : ""));
-            } else {
-                $this->logger->info("      Result: " . $result['message']);
+        return $info;
+    }
+
+    private function logUploadSuccess(float $elapsed, array $ui, ?int $instCount = null): void
+    {
+        $parts = ["SUCCESS ({$elapsed}s)"];
+        if ($instCount !== null) {
+            $parts[] = "{$instCount} instruments";
+        }
+        if ($ui['rows_saved'] !== null) {
+            $parts[] = "{$ui['rows_saved']}/{$ui['rows_total']} rows saved";
+        }
+        if ($ui['candidates'] > 0) {
+            $parts[] = "{$ui['candidates']} new candidates";
+        }
+        $this->log("    " . implode(' — ', $parts));
+    }
+
+    private function tallyUploadSuccess(array $ui): void
+    {
+        $this->stats['data_uploaded']++;
+        $this->stats['rows_uploaded']      += $ui['rows_saved'] ?? 0;
+        $this->stats['rows_skipped']       += $ui['rows_skipped'] ?? 0;
+        $this->stats['candidates_created'] += $ui['candidates'];
+    }
+
+    // ══════════════════════════════════════════════════════════════════
+    //  RUN LOG — per pipeline run, all detail
+    // ══════════════════════════════════════════════════════════════════
+
+    private function openRunLog(): void
+    {
+        if ($this->runLogFh !== null) {
+            return;
+        }
+        if ($this->logDir === null) {
+            return;
+        }
+        if (!is_dir($this->logDir)) {
+            mkdir($this->logDir, 0755, true);
+        }
+
+        $this->runLogPath = "{$this->logDir}/clinical_run_{$this->runTimestamp}.log";
+        $this->runLogFh   = fopen($this->runLogPath, 'a');
+
+        if ($this->runLogFh) {
+            $sep = str_repeat('=', 72);
+            fwrite($this->runLogFh,
+                "{$sep}\n"
+                . " ARCHIMEDES Clinical Pipeline — Run Log\n"
+                . " Started: " . date('Y-m-d H:i:s T') . "\n"
+                . ($this->dryRun ? " Mode: DRY RUN\n" : "")
+                . "{$sep}\n\n"
+            );
+        }
+    }
+
+    /** Write to both console (logger) and run log file */
+    private function log(string $msg): void
+    {
+        $this->logger->info($msg);
+
+        if ($this->runLogFh) {
+            $ts = date('H:i:s');
+            fwrite($this->runLogFh, "[{$ts}] {$msg}\n");
+        }
+    }
+
+    // ══════════════════════════════════════════════════════════════════
+    //  ERROR LOG — only created when errors occur
+    // ══════════════════════════════════════════════════════════════════
+
+    private function writeError(string $context, string $msg): void
+    {
+        $this->logger->error("[{$context}] {$msg}");
+
+        // Lazy-open error log on first error
+        if ($this->errorFh === null && $this->logDir !== null) {
+            if (!is_dir($this->logDir)) {
+                mkdir($this->logDir, 0755, true);
+            }
+            $this->errorLogPath = "{$this->logDir}/clinical_errors_{$this->runTimestamp}.log";
+            $this->errorFh = fopen($this->errorLogPath, 'a');
+            if ($this->errorFh) {
+                $sep = str_repeat('=', 72);
+                fwrite($this->errorFh,
+                    "{$sep}\n"
+                    . " ARCHIMEDES Clinical Pipeline — Error Log\n"
+                    . " Run: {$this->runTimestamp}\n"
+                    . "{$sep}\n\n"
+                );
             }
         }
 
-        // Log new candidates created
-        if (isset($result['idMapping']) && !empty($result['idMapping']) && $saved > 0) {
-            $newCandidates = count($result['idMapping']);
-            $this->stats['candidates_created'] += $newCandidates;
-            $this->logger->info("      New records created: {$newCandidates}");
+        if ($this->errorFh) {
+            $ts = date('H:i:s');
+            fwrite($this->errorFh, "[{$ts}] [{$context}] {$msg}\n");
+        }
 
-            if ($this->verbose) {
-                foreach ($result['idMapping'] as $mapping) {
-                    $extId = $mapping['ExtStudyID'] ?? 'N/A';
-                    $candId = $mapping['CandID'] ?? 'N/A';
-                    $this->logger->debug("        StudyID {$extId} → CandID {$candId}");
+        // Also write to run log as ERROR
+        if ($this->runLogFh) {
+            $ts = date('H:i:s');
+            fwrite($this->runLogFh, "[{$ts}] ERROR [{$context}] {$msg}\n");
+        }
+    }
+
+    private function writeErrorDetail(string $text): void
+    {
+        if ($this->errorFh) {
+            fwrite($this->errorFh, "  {$text}\n");
+        }
+        if ($this->runLogFh) {
+            fwrite($this->runLogFh, "  ERROR-DETAIL: {$text}\n");
+        }
+    }
+
+    private function writeUploadErrorDetails(string $context, string $file, array $result): void
+    {
+        $errors = isset($result['message'])
+            ? (is_array($result['message']) ? $result['message'] : [$result['message']])
+            : [];
+
+        $this->writeErrorDetail("File: {$file}");
+        foreach (array_slice($errors, 0, 20) as $i => $err) {
+            $msg = is_array($err) ? ($err['message'] ?? json_encode($err)) : (string)$err;
+            $this->writeErrorDetail(($i + 1) . ". {$msg}");
+        }
+        if (count($errors) > 20) {
+            $this->writeErrorDetail("... and " . (count($errors) - 20) . " more errors");
+        }
+    }
+
+    private function closeAllLogs(): void
+    {
+        // Close error log
+        if ($this->errorFh) {
+            $sep = str_repeat('=', 72);
+            fwrite($this->errorFh, "\n{$sep}\n Closed: " . date('Y-m-d H:i:s T') . "\n{$sep}\n");
+            fclose($this->errorFh);
+            $this->errorFh = null;
+        }
+
+        // Close run log
+        if ($this->runLogFh) {
+            $sep = str_repeat('=', 72);
+            fwrite($this->runLogFh, "\n{$sep}\n Completed: " . date('Y-m-d H:i:s T') . "\n{$sep}\n");
+            fclose($this->runLogFh);
+            $this->runLogFh = null;
+        }
+    }
+
+    // ══════════════════════════════════════════════════════════════════
+    //  PROJECT SUMMARY — written to run log after each project
+    // ══════════════════════════════════════════════════════════════════
+
+    private function writeProjectSummary(string $projectName): void
+    {
+        $this->log("");
+        $this->log("──── PROJECT SUMMARY: {$projectName} ────");
+
+        // ── Install summary ──────────────────────────────────────────
+        $this->log("");
+        $this->log("  INSTRUMENT INSTALLATION:");
+
+        if (empty($this->installResults)) {
+            $this->log("    (no DD files)");
+        } else {
+            $installed = $exists = $failed = [];
+            foreach ($this->installResults as $file => $r) {
+                switch ($r['status']) {
+                    case 'installed': $installed[] = $file; break;
+                    case 'exists':    $exists[]    = $file; break;
+                    case 'failed':    $failed[]    = $file; break;
+                    case 'dry_run':   $installed[] = "{$file} (dry run)"; break;
+                }
+            }
+            if (!empty($installed)) {
+                $this->log("    Newly installed (" . count($installed) . "):");
+                foreach ($installed as $f) {
+                    $time = $this->installResults[str_replace(' (dry run)', '', $f)]['time'] ?? '';
+                    $this->log("      + {$f}" . ($time ? " ({$time}s)" : ""));
+                }
+            }
+            if (!empty($exists)) {
+                $this->log("    Already installed (" . count($exists) . "):");
+                foreach ($exists as $f) {
+                    $this->log("      = {$f}");
+                }
+            }
+            if (!empty($failed)) {
+                $this->log("    Failed (" . count($failed) . "):");
+                foreach ($failed as $f) {
+                    $err = $this->installResults[$f]['error'] ?? '?';
+                    $this->log("      ! {$f} — {$err}");
                 }
             }
         }
-    }
 
-    /**
-     * Log upload errors
-     */
-    private function logUploadErrors(string $instrument, string $csvFile, array $result): void
-    {
-        $errorEntry = [
-            'instrument' => $instrument,
-            'file' => $csvFile,
-            'errors' => []
-        ];
+        // ── Data upload summary ──────────────────────────────────────
+        $this->log("");
+        $this->log("  DATA INGESTION:");
 
-        if (isset($result['message'])) {
-            if (is_array($result['message'])) {
-                $errorCount = count($result['message']);
-                $this->logger->error("      Errors: {$errorCount} issue(s)");
+        if (empty($this->dataResults)) {
+            $this->log("    (no data files)");
+        } else {
+            $success = $failed = $skipped = [];
+            foreach ($this->dataResults as $file => $r) {
+                switch ($r['status']) {
+                    case 'success': $success[] = $file; break;
+                    case 'failed':  $failed[]  = $file; break;
+                    case 'skipped': $skipped[] = $file; break;
+                }
+            }
 
-                $errorEntry['errors'] = $result['message'];
-
-                $maxErrors = 5;
-                foreach (array_slice($result['message'], 0, $maxErrors) as $i => $error) {
-                    if (is_array($error)) {
-                        $msg = $error['message'] ?? json_encode($error);
-                        $this->logger->error("        " . ($i + 1) . ". " . $msg);
-                    } else {
-                        $this->logger->error("        " . ($i + 1) . ". " . $error);
+            if (!empty($success)) {
+                $this->log("    Uploaded (" . count($success) . "):");
+                foreach ($success as $f) {
+                    $r    = $this->dataResults[$f];
+                    $inst = implode(', ', $r['instruments'] ?? []);
+                    $info = "rows={$r['rows']}";
+                    if (isset($r['rows_saved'])) {
+                        $info .= " saved={$r['rows_saved']}";
                     }
+                    if (($r['rows_skipped'] ?? 0) > 0) {
+                        $info .= " existing={$r['rows_skipped']}";
+                    }
+                    if (($r['candidates'] ?? 0) > 0) {
+                        $info .= " new_candidates={$r['candidates']}";
+                    }
+                    if (isset($r['elapsed'])) {
+                        $info .= " time={$r['elapsed']}s";
+                    }
+                    $this->log("      + {$f} [{$inst}] ({$info})");
                 }
-
-                if ($errorCount > $maxErrors) {
-                    $remaining = $errorCount - $maxErrors;
-                    $this->logger->error("        ... and {$remaining} more error(s)");
+            }
+            if (!empty($failed)) {
+                $this->log("    Failed (" . count($failed) . "):");
+                foreach ($failed as $f) {
+                    $reason = $this->dataResults[$f]['reason'] ?? '?';
+                    $this->log("      ! {$f} — {$reason}");
                 }
-            } else {
-                $errorEntry['errors'][] = $result['message'];
-                $this->logger->error("      Error: " . $result['message']);
+            }
+            if (!empty($skipped)) {
+                $this->log("    Skipped (" . count($skipped) . "):");
+                foreach ($skipped as $f) {
+                    $reason = $this->dataResults[$f]['reason'] ?? '?';
+                    $this->log("      - {$f} — {$reason}");
+                }
             }
         }
 
-        $this->stats['errors'][] = $errorEntry;
+        $this->log("");
+        $this->log("────────────────────────────────────────");
     }
 
-    /**
-     * Count rows in CSV file (excluding header)
-     */
-    private function countCSVRows(string $csvFile): int
+    // ══════════════════════════════════════════════════════════════════
+    //  FINAL SUMMARY — end of entire pipeline run
+    // ══════════════════════════════════════════════════════════════════
+
+    private function writeFinalSummary(): void
     {
-        $count = 0;
-        $handle = fopen($csvFile, 'r');
-        if ($handle) {
-            fgetcsv($handle); // Skip header
-            while (fgetcsv($handle) !== false) {
-                $count++;
-            }
-            fclose($handle);
+        $s = $this->stats;
+
+        $this->log("");
+        $this->log("========================================");
+        $this->log("PIPELINE RUN SUMMARY");
+        $this->log("========================================");
+        $this->log("  Run: {$this->runTimestamp}");
+        $this->log("");
+        $this->log("  Instruments:");
+        $this->log("    DD files found:     {$s['dd_files_found']}");
+        $this->log("    Newly installed:    {$s['dd_installed']}");
+        $this->log("    Already existed:    {$s['dd_already_existed']}");
+        $this->log("    Install failures:   {$s['dd_failed']}");
+        $this->log("");
+        $this->log("  Data:");
+        $this->log("    Data files found:   {$s['data_files_found']}");
+        $this->log("    Uploaded:           {$s['data_uploaded']}");
+        $this->log("    Failed:             {$s['data_failed']}");
+        $this->log("    Skipped:            {$s['data_skipped']}");
+        $this->log("    Rows uploaded:      {$s['rows_uploaded']}");
+        $this->log("    Rows skipped:       {$s['rows_skipped']}");
+        $this->log("    Candidates created: {$s['candidates_created']}");
+        $this->log("");
+
+        if ($this->runLogPath) {
+            $this->log("  Run log:   {$this->runLogPath}");
         }
-        return $count;
+        if ($this->errorLogPath) {
+            $this->log("  Error log: {$this->errorLogPath}");
+        }
+
+        $hasErrors = ($s['data_failed'] > 0 || $s['dd_failed'] > 0);
+        $outcome   = $hasErrors ? 'COMPLETED WITH ERRORS' : 'COMPLETED SUCCESSFULLY';
+        $this->log("");
+        $this->log("  Result: {$outcome}");
+        $this->log("========================================");
     }
 
-    /**
-     * Validate CSV file
-     */
-    private function validateCSV(string $csvFile): bool
+    // ══════════════════════════════════════════════════════════════════
+    //  EMAIL NOTIFICATION
+    // ══════════════════════════════════════════════════════════════════
+
+    private function sendNotification(array $project): void
     {
-        if (!is_readable($csvFile)) {
-            $this->logger->error("      CSV not readable: {$csvFile}");
-            return false;
-        }
+        $name = $project['project_common_name'] ?? 'Unknown';
+        $s    = $this->stats;
 
-        $handle = fopen($csvFile, 'r');
-        $headers = fgetcsv($handle);
-        fclose($handle);
+        $hasFailures = ($s['data_failed'] > 0 || $s['dd_failed'] > 0);
 
-        if (empty($headers)) {
-            $this->logger->error("      CSV has no headers");
-            return false;
-        }
-
-        $required = ['Visit_label'];
-        $missing = [];
-
-        foreach ($required as $col) {
-            if (!in_array($col, $headers)) {
-                $missing[] = $col;
-            }
-        }
-
-        if (!empty($missing)) {
-            $this->logger->error("      Missing required column(s): " . implode(', ', $missing));
-            $this->logger->debug("      Found columns: " . implode(', ', $headers));
-            return false;
-        }
-
-        return true;
-    }
-
-    /**
-     * Archive processed file
-     */
-    private function archiveFile(array $project, string $sourceFile, string $modality): bool
-    {
-        $archiveDir = rtrim($project['data_access']['mount_path'], '/')
-            . "/processed/{$modality}/"
-            . date('Y-m-d');
-
-        if (!is_dir($archiveDir)) {
-            if (!mkdir($archiveDir, 0755, true)) {
-                $this->logger->error("      ✗ Failed to create archive directory: {$archiveDir}");
-                return false;
-            }
-            $this->logger->debug("      Created archive directory: {$archiveDir}");
-        }
-
-        $filename = basename($sourceFile);
-        $destFile = "{$archiveDir}/{$filename}";
-
-        if (file_exists($destFile)) {
-            $uniqueName = time() . "_" . $filename;
-            $destFile   = "{$archiveDir}/{$uniqueName}";
-            $this->logger->warning("      Archive file exists, using: {$uniqueName}");
-        }
-
-        if (copy($sourceFile, $destFile)) {
-            $this->logger->info("      Archived: {$filename} → processed/{$modality}/" . date('Y-m-d') . "/");
-            return true;
-        }
-
-        $this->logger->error("      ✗ Failed to archive file");
-        return false;
-    }
-
-    /**
-     * Send project notification for clinical modality
-     */
-    private function sendProjectNotification(array $project, array $projectStats): void
-    {
-        $modality = 'clinical';
-        $projectName = $project['project_common_name'];
-
-        $hasFailures = ($projectStats['failed'] ?? 0) > 0;
-
-        $successEmails = $project['notification_emails'][$modality]['on_success'] ?? [];
-        $errorEmails   = $project['notification_emails'][$modality]['on_error'] ?? [];
+        $successEmails = $project['notification_emails']['clinical']['on_success'] ?? [];
+        $errorEmails   = $project['notification_emails']['clinical']['on_error'] ?? [];
 
         $emailsToSend = $hasFailures ? $errorEmails : $successEmails;
 
         if (empty($emailsToSend)) {
-            $this->logger->debug("  No notification emails configured for {$modality}");
+            $this->log("  No notification emails configured for clinical");
             return;
         }
 
-        $subject = $hasFailures
-            ? "FAILED: $projectName Clinical Ingestion"
-            : "SUCCESS: $projectName Clinical Ingestion";
+        $status = $hasFailures ? 'FAILED' : 'SUCCESS';
+        $subject = "{$status}: {$name} Clinical Ingestion";
 
-        $body  = "Project: $projectName\n";
-        $body .= "Modality: $modality\n";
-        $body .= "Timestamp: " . date('Y-m-d H:i:s') . "\n\n";
+        // ── Build email body ─────────────────────────────────────────
 
-        $body .= "Instruments Processed: {$projectStats['total']}\n";
+        $body  = "Project: {$name}\n";
+        $body .= "Modality: clinical\n";
+        $body .= "Timestamp: " . date('Y-m-d H:i:s') . "\n";
+        $body .= "Run: {$this->runTimestamp}\n\n";
 
-        // Uploaded
-        $body .= "  ✔ Uploaded: {$projectStats['success']}";
-        if (!empty($projectStats['instruments']['success'])) {
-            $body .= " (" . implode(', ', $projectStats['instruments']['success']) . ")";
+        // ── Instrument Installation ──────────────────────────────────
+
+        $body .= "Instrument Installation:\n";
+
+        // Group install results by status
+        $installByStatus = ['installed' => [], 'exists' => [], 'failed' => [], 'dry_run' => []];
+        foreach ($this->installResults as $file => $r) {
+            $installByStatus[$r['status']][] = $file;
         }
+
+        $installCount = count($this->installResults);
+        if ($installCount === 0) {
+            $body .= "  (no DD files found)\n";
+        } else {
+            // Newly installed
+            if (!empty($installByStatus['installed'])) {
+                $count = count($installByStatus['installed']);
+                $body .= "  ✔ Installed: {$count} (" . implode(', ', $installByStatus['installed']) . ")\n";
+            }
+            // Already existed
+            if (!empty($installByStatus['exists'])) {
+                $count = count($installByStatus['exists']);
+                $body .= "  ● Already existed: {$count} (" . implode(', ', $installByStatus['exists']) . ")\n";
+            }
+            // Failed — group by error reason
+            if (!empty($installByStatus['failed'])) {
+                $failedByReason = [];
+                foreach ($installByStatus['failed'] as $file) {
+                    $reason = $this->installResults[$file]['error'] ?? 'unknown';
+                    $failedByReason[$reason][] = $file;
+                }
+                $count = count($installByStatus['failed']);
+                $failedParts = [];
+                foreach ($failedByReason as $reason => $files) {
+                    $failedParts[] = implode(', ', $files) . " [{$reason}]";
+                }
+                $body .= "  ✗ Failed: {$count} (" . implode('; ', $failedParts) . ")\n";
+            }
+        }
+
         $body .= "\n";
 
-        // Failed - group by reason
-        $body .= "  ✗ Failed: {$projectStats['failed']}";
-        if (!empty($projectStats['instruments']['failed'])) {
-            $failedByReason = [];
-            foreach ($projectStats['instruments']['failed'] as $inst) {
-                $reason = $projectStats['reasons']['failed'][$inst] ?? 'error';
-                $failedByReason[$reason][] = $inst;
-            }
-            $failedParts = [];
-            foreach ($failedByReason as $reason => $insts) {
-                $failedParts[] = implode(', ', $insts) . " [{$reason}]";
-            }
-            $body .= " (" . implode('; ', $failedParts) . ")";
+        // ── Data Ingestion ───────────────────────────────────────────
+
+        $body .= "Data Ingestion:\n";
+
+        // Group data results by status
+        $dataByStatus = ['success' => [], 'failed' => [], 'skipped' => []];
+        foreach ($this->dataResults as $file => $r) {
+            $dataByStatus[$r['status']][] = $file;
         }
+
+        $dataCount = count($this->dataResults);
+        if ($dataCount === 0) {
+            $body .= "  (no data files found)\n";
+        } else {
+            // Uploaded — show each with detail
+            if (!empty($dataByStatus['success'])) {
+                $count = count($dataByStatus['success']);
+                $body .= "  ✔ Uploaded: {$count}\n";
+                foreach ($dataByStatus['success'] as $file) {
+                    $r = $this->dataResults[$file];
+                    $inst = implode(', ', $r['instruments'] ?? []);
+                    $info = [];
+                    if (isset($r['rows_saved']) && isset($r['rows'])) {
+                        $info[] = "{$r['rows_saved']}/{$r['rows']} rows";
+                    } elseif (isset($r['rows'])) {
+                        $info[] = "{$r['rows']} rows";
+                    }
+                    if (($r['candidates'] ?? 0) > 0) {
+                        $info[] = "{$r['candidates']} new candidates";
+                    }
+                    $infoStr = !empty($info) ? ' (' . implode(', ', $info) . ')' : '';
+                    $instStr = $inst ? " [{$inst}]" : '';
+                    $body .= "     {$file}{$instStr}{$infoStr}\n";
+                }
+            }
+
+            // Failed — group by reason
+            if (!empty($dataByStatus['failed'])) {
+                $failedByReason = [];
+                foreach ($dataByStatus['failed'] as $file) {
+                    $reason = $this->dataResults[$file]['reason'] ?? 'error';
+                    $failedByReason[$reason][] = $file;
+                }
+                $count = count($dataByStatus['failed']);
+                $failedParts = [];
+                foreach ($failedByReason as $reason => $files) {
+                    $failedParts[] = implode(', ', $files) . " [{$reason}]";
+                }
+                $body .= "  ✗ Failed: {$count} (" . implode('; ', $failedParts) . ")\n";
+            }
+
+            // Skipped — group by reason
+            if (!empty($dataByStatus['skipped'])) {
+                $skippedByReason = [];
+                foreach ($dataByStatus['skipped'] as $file) {
+                    $reason = $this->dataResults[$file]['reason'] ?? 'unknown';
+                    $skippedByReason[$reason][] = $file;
+                }
+                $count = count($dataByStatus['skipped']);
+                $skippedParts = [];
+                foreach ($skippedByReason as $reason => $files) {
+                    $skippedParts[] = implode(', ', $files) . " [{$reason}]";
+                }
+                $body .= "  ⚠ Skipped: {$count} (" . implode('; ', $skippedParts) . ")\n";
+            }
+        }
+
         $body .= "\n";
 
-        // Skipped - group by reason
-        $body .= "  ⚠ Skipped: {$projectStats['skipped']}";
-        if (!empty($projectStats['instruments']['skipped'])) {
-            $skippedByReason = [];
-            foreach ($projectStats['instruments']['skipped'] as $inst) {
-                $reason = $projectStats['reasons']['skipped'][$inst] ?? 'unknown';
-                $skippedByReason[$reason][] = $inst;
-            }
-            $skippedParts = [];
-            foreach ($skippedByReason as $reason => $insts) {
-                $skippedParts[] = implode(', ', $insts) . " [{$reason}]";
-            }
-            $body .= " (" . implode('; ', $skippedParts) . ")";
-        }
-        $body .= "\n\n";
+        // ── Totals ───────────────────────────────────────────────────
 
-        // Outlook / Status message
+        $body .= str_repeat('-', 50) . "\n";
+        $body .= "Totals:\n";
+        $body .= "  DD files: {$s['dd_files_found']} found, {$s['dd_installed']} installed, {$s['dd_already_existed']} existed, {$s['dd_failed']} failed\n";
+        $body .= "  Data files: {$s['data_files_found']} found, {$s['data_uploaded']} uploaded, {$s['data_failed']} failed, {$s['data_skipped']} skipped\n";
+
+        if ($s['rows_uploaded'] > 0 || $s['rows_skipped'] > 0) {
+            $totalRows = $s['rows_uploaded'] + $s['rows_skipped'];
+            $body .= "  Rows: {$s['rows_uploaded']}/{$totalRows} saved";
+            if ($s['rows_skipped'] > 0) {
+                $body .= " ({$s['rows_skipped']} already exist)";
+            }
+            $body .= "\n";
+        }
+        if ($s['candidates_created'] > 0) {
+            $body .= "  Candidates created: {$s['candidates_created']}\n";
+        }
+
+        $body .= "\n";
+
+        // ── Status message ───────────────────────────────────────────
+
         if ($hasFailures) {
-            $body .= "⚠ Some instruments failed to ingest.\n";
+            $body .= "⚠ Some instruments failed to install or ingest.\n";
             $body .= "Check logs for details.\n";
-        } elseif ($projectStats['success'] > 0) {
+        } elseif ($s['data_uploaded'] > 0) {
             $body .= "✔ Ingestion completed successfully.\n";
-        } elseif ($projectStats['skipped'] > 0 && $projectStats['success'] === 0) {
-            $body .= "✔ Ingestion completed. All instruments were skipped\n";
+        } elseif ($s['data_skipped'] > 0 && $s['data_uploaded'] === 0) {
+            $body .= "✔ Ingestion completed. All data files were skipped\n";
             $body .= "   (already processed or no new data available).\n";
         } else {
-            $body .= "✔ Ingestion completed. No instruments to process.\n";
+            $body .= "✔ Ingestion completed. No data files to process.\n";
         }
 
-        $this->logger->debug("  Sending notification to: " . implode(', ', $emailsToSend));
+        // ── Log paths ────────────────────────────────────────────────
 
-        foreach ($emailsToSend as $emailTo) {
-            $this->notification->send($emailTo, $subject, $body);
+        $body .= "\n";
+        if ($this->runLogPath) {
+            $body .= "Run log: {$this->runLogPath}\n";
+        }
+        if ($this->errorLogPath) {
+            $body .= "Error log: {$this->errorLogPath}\n";
+        }
+
+        // ── Send ─────────────────────────────────────────────────────
+
+        $this->log("  Sending notification to: " . implode(', ', $emailsToSend));
+
+        foreach ($emailsToSend as $to) {
+            $this->notification->send($to, $subject, $body);
         }
     }
 
-    /**
-     * Print summary
-     */
-    private function printSummary(): void
+    // ══════════════════════════════════════════════════════════════════
+    //  Helpers
+    // ══════════════════════════════════════════════════════════════════
+
+    private function firstErrorMsg(array $result): string
     {
-        $this->logger->info("\n========================================");
-        $this->logger->info("PIPELINE SUMMARY");
-        $this->logger->info("========================================");
-
-        $this->logger->info("\nFiles:");
-        $this->logger->info("  Total processed: {$this->stats['total']}");
-        $this->logger->info("  Successfully uploaded: {$this->stats['success']}");
-        $this->logger->info("  Failed: {$this->stats['failed']}");
-        $this->logger->info("  Skipped: {$this->stats['skipped']}");
-
-        if ($this->stats['instruments_installed'] > 0) {
-            $this->logger->info("\nInstruments:");
-            $this->logger->info("  Auto-installed: {$this->stats['instruments_installed']}");
+        $m = $result['message'] ?? null;
+        if (is_string($m)) {
+            return $m;
         }
-
-        if ($this->stats['rows_uploaded'] > 0 || $this->stats['rows_skipped'] > 0) {
-            $this->logger->info("\nData Rows:");
-            $this->logger->info("  Uploaded: {$this->stats['rows_uploaded']}");
-            if ($this->stats['rows_skipped'] > 0) {
-                $this->logger->info("  Skipped (already exist): {$this->stats['rows_skipped']}");
-            }
-            $totalRows = $this->stats['rows_uploaded'] + $this->stats['rows_skipped'];
-            $this->logger->info("  Total processed: {$totalRows}");
+        if (is_array($m)) {
+            $first = reset($m);
+            return is_array($first) ? ($first['message'] ?? json_encode($first)) : (string)$first;
         }
-
-        if ($this->stats['candidates_created'] > 0) {
-            $this->logger->info("\nNew Records:");
-            $this->logger->info("  Created: {$this->stats['candidates_created']}");
-        }
-
-        if ($this->stats['total'] > 0) {
-            $successRate = round(($this->stats['success'] / $this->stats['total']) * 100, 1);
-            $this->logger->info("\nSuccess Rate: {$successRate}%");
-        }
-
-        if (!empty($this->stats['errors'])) {
-            $this->logger->info("\n----------------------------------------");
-            $this->logger->error("ERRORS ENCOUNTERED:");
-            foreach ($this->stats['errors'] as $errorEntry) {
-                $this->logger->error("\n  Instrument: {$errorEntry['instrument']}");
-                if (!empty($errorEntry['file'])) {
-                    $this->logger->error("  File: " . basename($errorEntry['file']));
-                }
-                if (is_array($errorEntry['errors'])) {
-                    foreach (array_slice($errorEntry['errors'], 0, 3) as $error) {
-                        if (is_array($error)) {
-                            $msg = $error['message'] ?? json_encode($error);
-                            $this->logger->error("    • {$msg}");
-                        } else {
-                            $this->logger->error("    • {$error}");
-                        }
-                    }
-                    if (count($errorEntry['errors']) > 3) {
-                        $remaining = count($errorEntry['errors']) - 3;
-                        $this->logger->error("    ... and {$remaining} more");
-                    }
-                }
-            }
-        }
-
-        $this->logger->info("\n========================================");
+        return 'Unknown error';
     }
 
-    /**
-     * Check if file already exists in ANY processed/<modality>/<date> folder
-     */
-    private function isAlreadyProcessed(array $project, string $filename, string $modality): bool
+    private function countRows(string $file): int
     {
-        $base = rtrim($project['data_access']['mount_path'], '/') . "/processed/{$modality}";
+        $c  = 0;
+        $fh = fopen($file, 'r');
+        fgetcsv($fh); // skip header
+        while (fgetcsv($fh) !== false) {
+            $c++;
+        }
+        fclose($fh);
+        return $c;
+    }
 
+    private function isAlreadyProcessed(array $project, string $filename): bool
+    {
+        $base = rtrim($project['data_access']['mount_path'] ?? '', '/') . '/processed/clinical';
         if (!is_dir($base)) {
             return false;
         }
-
-        $folders = glob($base . "/*", GLOB_ONLYDIR);
-
-        foreach ($folders as $folder) {
-            if (file_exists($folder . '/' . $filename)) {
-                $this->logger->debug("      Found in archive: {$folder}/{$filename}");
+        foreach (glob("{$base}/*", GLOB_ONLYDIR) as $d) {
+            if (file_exists("{$d}/{$filename}")) {
                 return true;
             }
         }
-
         return false;
+    }
+
+    private function archiveFile(array $project, string $src): void
+    {
+        $dest = rtrim($project['data_access']['mount_path'] ?? '', '/')
+            . '/processed/clinical/' . date('Y-m-d');
+        if (!is_dir($dest)) {
+            mkdir($dest, 0755, true);
+        }
+        $target = "{$dest}/" . basename($src);
+        if (file_exists($target)) {
+            $target = "{$dest}/" . time() . '_' . basename($src);
+        }
+        if (copy($src, $target)) {
+            $this->log("    Archived to processed/clinical/" . date('Y-m-d') . "/");
+        }
+    }
+
+    private function discoverProjects(array $filters): array
+    {
+        $projects = [];
+
+        foreach ($this->config['collections'] ?? [] as $coll) {
+            if (!($coll['enabled'] ?? true)) {
+                continue;
+            }
+            if (isset($filters['collection']) && $coll['name'] !== $filters['collection']) {
+                continue;
+            }
+
+            foreach ($coll['projects'] ?? [] as $pc) {
+                if (!($pc['enabled'] ?? true)) {
+                    continue;
+                }
+                if (isset($filters['project']) && $pc['name'] !== $filters['project']) {
+                    continue;
+                }
+
+                $path = $coll['base_path'] . '/' . $pc['name'];
+                $json = "{$path}/project.json";
+
+                if (!file_exists($json)) {
+                    $this->logger->warning("project.json not found: {$json}");
+                    continue;
+                }
+
+                $data = json_decode(file_get_contents($json), true);
+                if ($data === null) {
+                    $this->logger->warning("Invalid JSON: {$json}");
+                    continue;
+                }
+
+                $data['_collection']  = $coll['name'];
+                $data['_projectPath'] = $path;
+                $projects[] = $data;
+            }
+        }
+
+        return $projects;
     }
 }

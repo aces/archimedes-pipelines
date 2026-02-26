@@ -406,7 +406,7 @@ PHPCODE;
     // ──────────────────────────────────────────────────────────────────
 
     /**
-     * Upload instrument data CSV.
+     * Upload instrument data CSV (single instrument).
      *
      * @param string $instrument     Instrument name
      * @param string $csvFilePath    Path to CSV file
@@ -476,7 +476,102 @@ PHPCODE;
     }
 
     /**
-     * HTTP fallback for instrument data upload.
+     * Upload a single CSV with data for multiple instruments (multi-instrument mode).
+     *
+     * instrument_manager/instrument_data supports multi-instrument upload:
+     *   POST with multi-instrument=JSON + data_file
+     *   where JSON = [{"value":"form1"},{"value":"form2"},...]
+     *
+     * The CSV columns are matched to instruments by LORIS's
+     * InstrumentDataParser::parseMultiple(). LORIS routes each column
+     * to the correct instrument — no client-side data splitting needed.
+     *
+     * This is the preferred method for monolithic REDCap data exports
+     * where all instruments/forms are in a single CSV file.
+     *
+     * @param string[] $instrumentNames  List of instrument names present in the CSV
+     * @param string   $csvFilePath      Path to the CSV file containing all instrument data
+     * @param string   $action           CREATE_SESSIONS or VALIDATE_SESSIONS
+     * @param string   $format           LORIS_CSV (default) or BIDS_TSV
+     *
+     * @return array{success: bool, message: string|array, idMapping?: array, method: string}
+     */
+    public function uploadMultiInstrumentData(
+        array  $instrumentNames,
+        string $csvFilePath,
+        string $action = 'CREATE_SESSIONS',
+        string $format = 'LORIS_CSV'
+    ): array {
+        $count = count($instrumentNames);
+        $this->logger->info("  Uploading multi-instrument data ({$count} instruments)");
+
+        // Build the multi-instrument JSON in the format LORIS expects:
+        // [{"value":"form1"},{"value":"form2"},...]
+        // See: instrumentManagerIndex.js → uploadMultiInstrumentData()
+        //      instrument_data.class.inc → line 243-249
+        $multiJson = json_encode(
+            array_map(
+                fn(string $name) => ['value' => $name],
+                $instrumentNames
+            )
+        );
+
+        // --- Priority 1: API client ---
+        if ($this->hasApiClient && $this->moduleConfig !== null) {
+            try {
+                $this->logger->debug("    Trying API client (multi-instrument)...");
+
+                $api = new \LORISClient\Api\InstrumentManagerApi(
+                    $this->httpClient,
+                    $this->moduleConfig
+                );
+
+                $fileObj = new SplFileObject($csvFilePath, 'r');
+
+                $startTime = microtime(true);
+
+                // Signature: uploadInstrumentData($action, $format, $data_file, $instrument?, $multi_instrument?)
+                $result = $api->uploadInstrumentData(
+                    $action,
+                    $format,
+                    $fileObj,
+                    null,          // instrument: null for multi
+                    $multiJson     // multi-instrument: JSON string
+                );
+
+                $elapsed = round(microtime(true) - $startTime, 2);
+
+                $parsed = $this->parseApiUploadResult($result);
+                $parsed['method'] = 'API';
+
+                if ($parsed['success']) {
+                    $this->logger->info("    ✓ Multi-instrument upload successful via API ({$elapsed}s)");
+                    $this->logIdMapping($parsed);
+                    return $parsed;
+                }
+
+                $this->logger->warning("    API multi-instrument upload returned failure");
+            } catch (\Error $e) {
+                $this->logger->warning("    API multi-instrument error: " . $e->getMessage());
+                $this->logger->info("    Falling back to HTTP...");
+            } catch (\Exception $e) {
+                $this->logger->warning("    API multi-instrument failed: " . $e->getMessage());
+                $this->logger->info("    Falling back to HTTP...");
+            }
+        }
+
+        // --- Priority 2: Direct HTTP fallback ---
+        return $this->uploadMultiInstrumentDataHttp(
+            $instrumentNames,
+            $csvFilePath,
+            $action,
+            $format,
+            $multiJson
+        );
+    }
+
+    /**
+     * HTTP fallback for instrument data upload (single instrument).
      */
     private function uploadInstrumentDataHttp(
         string $instrument,
@@ -548,6 +643,114 @@ PHPCODE;
     }
 
     /**
+     * HTTP fallback for multi-instrument data upload.
+     *
+     * Sends:
+     *   action           = CREATE_SESSIONS | VALIDATE_SESSIONS
+     *   format           = LORIS_CSV | BIDS_TSV
+     *   multi-instrument = JSON [{"value":"form1"},{"value":"form2"},...]
+     *   data_file        = CSV file
+     *
+     * Note: The form field name is literally "multi-instrument" with a hyphen
+     * (not camelCase). This matches instrumentManagerIndex.js line 268 and
+     * instrument_data.class.inc line 241.
+     *
+     * @param string[] $instrumentNames  Instrument names
+     * @param string   $csvFilePath      Path to CSV
+     * @param string   $action           CREATE_SESSIONS or VALIDATE_SESSIONS
+     * @param string   $format           LORIS_CSV or BIDS_TSV
+     * @param string   $multiJson        Pre-built JSON string (optional, built from instrumentNames if null)
+     *
+     * @return array{success: bool, message: string|array, idMapping?: array, method: string}
+     */
+    private function uploadMultiInstrumentDataHttp(
+        array  $instrumentNames,
+        string $csvFilePath,
+        string $action,
+        string $format,
+        ?string $multiJson = null
+    ): array {
+        $url = "{$this->baseUrl}/instrument_manager/instrument_data";
+
+        if ($multiJson === null) {
+            $multiJson = json_encode(
+                array_map(
+                    fn(string $name) => ['value' => $name],
+                    $instrumentNames
+                )
+            );
+        }
+
+        try {
+            $this->refreshTokenIfNeeded();
+
+            $this->logger->debug("    HTTP POST {$url} (multi-instrument)");
+            $this->logger->debug("    Instruments: " . implode(', ', $instrumentNames));
+
+            $startTime = microtime(true);
+
+            $response = $this->httpClient->request('POST', $url, [
+                'headers' => [
+                    'Authorization' => "Bearer {$this->token}",
+                ],
+                'multipart' => [
+                    ['name' => 'action',           'contents' => $action],
+                    ['name' => 'format',           'contents' => $format],
+                    ['name' => 'multi-instrument', 'contents' => $multiJson],
+                    [
+                        'name'     => 'data_file',
+                        'contents' => fopen($csvFilePath, 'r'),
+                        'filename' => basename($csvFilePath),
+                    ],
+                ],
+                'http_errors' => false,
+            ]);
+
+            $elapsed    = round(microtime(true) - $startTime, 2);
+            $statusCode = $response->getStatusCode();
+            $rawBody    = (string) $response->getBody();
+
+            $this->logger->debug("    Response: HTTP {$statusCode} ({$elapsed}s)");
+
+            $data = json_decode($rawBody, true) ?? [];
+
+            if ($statusCode >= 200 && $statusCode < 300) {
+                $result = [
+                    'success'   => $data['success'] ?? true,
+                    'message'   => $data['message'] ?? 'OK',
+                    'idMapping' => $data['idMapping'] ?? [],
+                    'method'    => 'HTTP',
+                ];
+
+                if ($result['success']) {
+                    $this->logger->info("    ✓ Multi-instrument upload successful via HTTP ({$elapsed}s)");
+                    $this->logIdMapping($result);
+                }
+
+                return $result;
+            }
+
+            $errMsg = $data['error'] ?? $data['message'] ?? "HTTP {$statusCode}";
+            $this->logger->error("    ✗ Multi-instrument upload failed: HTTP {$statusCode}");
+            return [
+                'success'   => false,
+                'message'   => $errMsg,
+                'idMapping' => [],
+                'method'    => 'HTTP',
+            ];
+
+        } catch (\Exception $e) {
+            $this->logger->error("    ✗ Multi-instrument HTTP upload failed: " . $e->getMessage());
+            return [
+                'success'   => false,
+                'message'   => $e->getMessage(),
+                'idMapping' => [],
+                'method'    => 'HTTP',
+            ];
+        }
+    }
+
+    /**
      * Install an instrument from a .linst file or REDCap data dictionary CSV.
      *
      * @param string $filePath  Path to .linst or REDCap .csv
@@ -609,6 +812,51 @@ PHPCODE;
 
         // --- Priority 2: Direct HTTP fallback ---
         return $this->installInstrumentHttp($filePath);
+    }
+
+    /**
+     * Install instruments from a monolithic REDCap data dictionary CSV.
+     *
+     * The full DD (all forms) is uploaded as-is. LORIS instrument_manager's
+     * RedcapCSVParser splits by Form Name → creates one .linst per form.
+     *
+     * IMPORTANT: instrument_manager checks if ALL instrument names already
+     * exist BEFORE installing any. If any form is already installed, it
+     * returns 409 Conflict and aborts the entire upload (line 179-189 in
+     * instrument_manager.class.inc). This method catches that case.
+     *
+     * This is a convenience wrapper around installInstrument() that validates
+     * the CSV has the required REDCap DD headers before uploading.
+     *
+     * @param string $csvFilePath  Path to full REDCap data_dict.csv
+     * @return array{success: bool, message: string, method: string}
+     * @throws \RuntimeException If file not found or invalid headers
+     */
+    public function installFromRedcap(string $csvFilePath): array
+    {
+        if (!file_exists($csvFilePath)) {
+            throw new \RuntimeException("REDCap DD not found: {$csvFilePath}");
+        }
+
+        // Validate it's a REDCap data dictionary
+        $handle  = fopen($csvFilePath, 'r');
+        $headers = fgetcsv($handle);
+        fclose($handle);
+
+        $required = ['Variable / Field Name', 'Form Name', 'Field Type'];
+        $missing  = array_diff($required, array_map('trim', $headers ?: []));
+
+        if (!empty($missing)) {
+            throw new \RuntimeException(
+                "Invalid REDCap DD — missing columns: " . implode(', ', $missing)
+            );
+        }
+
+        $this->logger->info("  Installing instruments from monolithic REDCap DD");
+
+        // installInstrument() detects .csv extension → instrument_type='redcap'
+        // LORIS RedcapCSVParser splits by Form Name internally
+        return $this->installInstrument($csvFilePath);
     }
 
     /**
