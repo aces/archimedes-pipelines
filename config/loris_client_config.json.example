@@ -5,6 +5,7 @@
     "password": "secure_password_here",
     "token_expiry_minutes": 55
   },
+  "timeout": 1800,
 
   "database": {
     "host": "localhost",

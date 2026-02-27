@@ -17,6 +17,7 @@ The pipelines are expected to be installed on the predefined data mount for the 
 - **Comprehensive Logging** - Detailed execution logs with rotation
 - **Dry Run Mode** - Test without making actual changes
 - **Imaging Data Ingestion** - BIDS dataset ingestion
+- **DICOM Import** - Archive and insert DICOM studies into LORIS tarchive tables
 - **Multi-Project Support** - Handle multiple projects and collections
 
 ---
@@ -292,7 +293,7 @@ php scripts/run_imaging_pipeline.php --all
 
 ---
 
-## Command-Line Options
+## Command-Line Options (BIDS)
 
 ### Participant Sync (Step 1)
 
@@ -332,6 +333,173 @@ php scripts/run_imaging_pipeline.php --all
 
 ---
 
+## DICOM Ingestion Workflow (Convert to tarchive)
+
+The DICOM import pipeline scans each project's `deidentified-raw/imaging/dicoms/` directory for study folders, archives them into LORIS tarchive format, and inserts or updates the records in the LORIS database via the `cbigr_api` script endpoint.
+
+```
+1. Load Collections from Config
+   └── Read collections array from loris_client_config.json
+       ├── Collection A
+       │   ├── Project 1 (enabled)
+       │   └── Project 2 (disabled)
+       └── Collection B
+           └── Project 1 (enabled)
+
+2. For each enabled Collection:
+   └── For each enabled Project:
+       ├── Authenticate with LORIS API
+       └── Continue to DICOM processing
+
+3. STEP 1: Scan DICOM Directories
+   ├── Scan deidentified-raw/imaging/dicoms/
+   ├── Discover study directories (one per DICOM study)
+   ├── Load tracking file (.dicom_import_processed.json)
+   └── Skip already-processed studies (unless --force)
+
+4. STEP 2: Import Studies
+   ├── For each study directory:
+   │   ├── POST /cbigr_api/script/importdicomstudy
+   │   │   ├── args: { source: "/path/to/study", profile: "database_config.py" }
+   │   │   └── flags: ["insert", "verbose"]
+   │   ├── Script archives DICOMs into .tar.gz
+   │   ├── Calculates MD5 checksums
+   │   ├── Inserts/updates tarchive record in database
+   │   └── Associates with LORIS session (if --session flag)
+   │
+   ├── Classify results:
+   │   ├── SUCCESS → mark as processed
+   │   ├── ALREADY_EXISTS → mark as already_exists (not an error)
+   │   └── FAILED → log error details
+   │
+   └── Update tracking file after each study
+
+5. Post-Processing:
+   ├── Write project summary to run log
+   ├── Write errors to error log (if any)
+   ├── Send email notification (from project.json config)
+   └── Return exit code (0 = success, 1 = any failures)
+```
+
+### DICOM Study Directory Structure
+
+Each study should be a subdirectory under `deidentified-raw/imaging/dicoms/` containing the DICOM files:
+
+```
+{collection_base_path}/{ProjectName}/
+└── deidentified-raw/
+    └── imaging/
+        └── dicoms/
+            ├── TST02_ROM_00000001_02_SE01_MR/
+            │   ├── 1.3.12.2.1107.5.2.38.51068.xxx.dcm
+            │   ├── 1.3.12.2.1107.5.2.38.51068.yyy.dcm
+            │   └── ...
+            ├── TST02_ROM_00000002_02_SE01_MR/
+            │   └── ...
+            └── .dicom_import_processed.json   # Tracking file (auto-generated)
+```
+
+### Tracking File
+
+The pipeline maintains a `.dicom_import_processed.json` file in the dicoms directory to track which studies have been processed. This prevents re-importing studies on subsequent runs. Use `--force` to override and reprocess all studies.
+
+```json
+{
+  "TST02_ROM_00000001_02_SE01_MR": {
+    "status": "success",
+    "detail": "",
+    "timestamp": "2026-02-27T15:53:19+00:00"
+  }
+}
+```
+
+### Logging
+
+Logs are stored in each project's `logs/dicom/` directory:
+
+```
+{ProjectName}/logs/dicom/
+├── dicom_run_2026-02-27_18-36-05.log        # Full run log (always created)
+└── dicom_errors_2026-02-27_18-36-05.log     # Error log (only if errors occur)
+```
+
+---
+
+## Running the DICOM Import Pipeline
+
+### Dry Run Mode (Recommended First)
+
+```bash
+# All enabled projects
+php scripts/run_dicom_import.php --all --verbose
+
+# All projects in a collection
+php scripts/run_dicom_import.php --collection=archimedes --verbose
+
+# Single project
+php scripts/run_dicom_import.php --collection=archimedes --project=FDG-PET --verbose
+```
+
+### Execute (Live Run)
+
+```bash
+# All projects
+php scripts/run_dicom_import.php --all --confirm --verbose
+
+# Single collection
+php scripts/run_dicom_import.php --collection=archimedes --confirm --verbose
+
+# Single project
+php scripts/run_dicom_import.php --collection=archimedes --project=FDG-PET --confirm --verbose
+```
+
+### Force Reprocess
+
+```bash
+# Reprocess all studies (ignore tracking file)
+php scripts/run_dicom_import.php --collection=archimedes --project=FDG-PET --confirm --force --verbose
+
+# Force reprocess across all projects
+php scripts/run_dicom_import.php --all --confirm --force --verbose
+```
+
+### Update Mode
+
+```bash
+# Update existing studies instead of insert
+php scripts/run_dicom_import.php --collection=archimedes --project=FDG-PET --confirm --update --verbose
+
+# Update with session association and overwrite
+php scripts/run_dicom_import.php --collection=archimedes --project=FDG-PET --confirm --update --session --overwrite --verbose
+```
+
+### Custom Profile
+
+```bash
+# Use a different Python configuration file
+php scripts/run_dicom_import.php --collection=archimedes --project=FDG-PET --confirm --profile=custom_config.py --verbose
+```
+
+---
+
+## Command-Line Options (DICOM Import)
+
+| Option | Description |
+|--------|-------------|
+| `--all` | Process all enabled collections & projects |
+| `--collection=NAME` | Process all enabled projects in a collection |
+| `--project=NAME` | Process a specific project (requires `--collection`) |
+| `--confirm` | Execute (default is dry run) |
+| `--force` | Reprocess already-processed studies |
+| `--update` | Use `--update` flag instead of `--insert` |
+| `--session` | Associate study with LORIS session |
+| `--overwrite` | Overwrite existing archive files |
+| `--profile=NAME` | Python config file (default: `database_config.py`) |
+| `--config=FILE` | Config file path (default: `config/loris_client_config.json`) |
+| `--verbose` | Detailed output |
+| `--help` | Show help |
+
+---
 
 ## Directory Structure
 
@@ -342,13 +510,13 @@ php scripts/run_imaging_pipeline.php --all
 ├── deidentified-raw/                     # De-identified participant data
 │   ├── clinical/                         # Raw Patient records & clinical assessment in csv/tsv
 │   ├── imaging/
-│   │   └── dicoms/                       # Raw medical imaging data (non-BIDS)
+│   │   └── dicoms/                       # Raw DICOM studies (one folder per study)
 │   ├── bids/                             # Deidentified MRI and EEG Data (ExternalIDs)
 │   └── genomics/
 │
 ├── deidentified-lorisid/                 # LORIS-relabelled data
 │   ├── imaging/
-    │   └── dicoms/                       # Raw medical imaging data with LORIS IDs
+│   │   └── dicoms/                       # DICOM data with LORIS IDs
 │   ├── bids/                             # Reidentified MRI and EEG Data with LORIS IDs
 │   └── genomics/
 │
@@ -360,6 +528,8 @@ php scripts/run_imaging_pipeline.php --all
 │   └── freesurfer-output/                # Converted & cleaned data (NIfTI, MINC)
 │
 ├── logs/                                 # Execution logs
+│   ├── clinical/                         # Clinical pipeline logs
+│   └── dicom/                            # DICOM import pipeline logs
 │
 └── documentation/
     ├── data_dictionary/                  # Instrument Data Dictionary (.linst, REDCap CSV)
@@ -373,16 +543,21 @@ php scripts/run_imaging_pipeline.php --all
 Logs are stored in each project's `logs/` directory.
 
 ```bash
-# View today's clinical log
-tail -f PROJECT/logs/clinical_$(date +%Y-%m-%d).log
+# View today's clinical run log
+tail -f PROJECT/logs/clinical/clinical_run_*.log
+
+# View today's DICOM run log
+tail -f PROJECT/logs/dicom/dicom_run_*.log
+
+# View DICOM error log (only exists if errors occurred)
+cat PROJECT/logs/dicom/dicom_errors_*.log
 
 # View today's imaging log
 tail -f PROJECT/logs/imaging_$(date +%Y-%m-%d).log
 
-# Search for errors
-grep "ERROR" PROJECT/logs/*.log
+# Search for errors across all logs
+grep "ERROR" PROJECT/logs/**/*.log
 ```
-
 
 ---
 
@@ -398,6 +573,11 @@ Per-project in `project.json`:
             "on_success": ["team@example.com"],
             "on_error": ["admin@example.com"]
         },
+        "dicom": {
+            "enabled": true,
+            "on_success": ["team@example.com"],
+            "on_error": ["admin@example.com"]
+        },
         "imaging": {
             "enabled": true,
             "on_success": ["imaging@example.com"],
@@ -406,5 +586,6 @@ Per-project in `project.json`:
     }
 }
 ```
+
 
 ---

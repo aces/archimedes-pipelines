@@ -40,6 +40,11 @@
       "on_success": ["clinical_team@example.org"],
       "on_error": ["clinical_team@example.org"]
     },
+     "dicom": {
+          "enabled": true,
+          "on_success": ["team@example.com"],
+          "on_error": ["admin@example.com"]
+        }
     "imaging": {
      "enabled": true,
       "on_success": ["imaging_team@example.org"],
