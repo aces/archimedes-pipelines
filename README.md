@@ -359,9 +359,7 @@ The DICOM import pipeline scans each project's `deidentified-raw/imaging/dicoms/
 
 4. STEP 2: Import Studies
    ├── For each study directory:
-   │   ├── POST /cbigr_api/script/importdicomstudy
-   │   │   ├── args: { source: "/path/to/study", profile: "database_config.py" }
-   │   │   └── flags: ["insert", "verbose"]
+   │   ├── Call importdicom study script Endpoint from LORIS/CBIG
    │   ├── Script archives DICOMs into .tar.gz
    │   ├── Calculates MD5 checksums
    │   ├── Inserts/updates tarchive record in database
@@ -385,43 +383,13 @@ The DICOM import pipeline scans each project's `deidentified-raw/imaging/dicoms/
 
 Each study should be a subdirectory under `deidentified-raw/imaging/dicoms/` containing the DICOM files:
 
-```
-{collection_base_path}/{ProjectName}/
-└── deidentified-raw/
-    └── imaging/
-        └── dicoms/
-            ├── TST02_ROM_00000001_02_SE01_MR/
-            │   ├── 1.3.12.2.1107.5.2.38.51068.xxx.dcm
-            │   ├── 1.3.12.2.1107.5.2.38.51068.yyy.dcm
-            │   └── ...
-            ├── TST02_ROM_00000002_02_SE01_MR/
-            │   └── ...
-            └── .dicom_import_processed.json   # Tracking file (auto-generated)
-```
-
 ### Tracking File
 
 The pipeline maintains a `.dicom_import_processed.json` file in the dicoms directory to track which studies have been processed. This prevents re-importing studies on subsequent runs. Use `--force` to override and reprocess all studies.
 
-```json
-{
-  "TST02_ROM_00000001_02_SE01_MR": {
-    "status": "success",
-    "detail": "",
-    "timestamp": "2026-02-27T15:53:19+00:00"
-  }
-}
-```
-
 ### Logging
 
 Logs are stored in each project's `logs/dicom/` directory:
-
-```
-{ProjectName}/logs/dicom/
-├── dicom_run_2026-02-27_18-36-05.log        # Full run log (always created)
-└── dicom_errors_2026-02-27_18-36-05.log     # Error log (only if errors occur)
-```
 
 ---
 
@@ -471,13 +439,6 @@ php scripts/run_dicom_import.php --collection=archimedes --project=FDG-PET --con
 
 # Update with session association and overwrite
 php scripts/run_dicom_import.php --collection=archimedes --project=FDG-PET --confirm --update --session --overwrite --verbose
-```
-
-### Custom Profile
-
-```bash
-# Use a different Python configuration file
-php scripts/run_dicom_import.php --collection=archimedes --project=FDG-PET --confirm --profile=custom_config.py --verbose
 ```
 
 ---
@@ -586,6 +547,5 @@ Per-project in `project.json`:
     }
 }
 ```
-
 
 ---
