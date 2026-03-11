@@ -7,11 +7,15 @@ declare(strict_types=1);
  * Scans <projectDir>/deidentified-raw/imaging/dicoms/ for study directories
  * and imports each via POST /cbigr_api/script/importdicomstudy endpoint.
  *
- * Logging:
- *   1. Console        → stdout (always)
- *   2. Run log        → logs/dicom/dicom_run_{timestamp}.log  (per run, all detail)
- *   3. Error log      → logs/dicom/dicom_errors_{timestamp}.log (per run, only if errors)
- *   4. Email          → success or failure notification with full summary
+ * Execution model:
+ *   - Imports fired as async=true → SPM forks script → returns job_id immediately
+ *   - Pipeline polls GET /cbigr_api/script/job/{id} every 30s
+ *   - On ERROR the full Python/Perl stdout+stderr is returned (not a cURL timeout)
+ *
+ * Flag selection:
+ *   - Normal run          → --insert (script errors if already in DB → auto-retry with --update --overwrite)
+ *   - --force / --retry   → --update --overwrite (known to be in DB from prior run)
+ *   - --force-study=NAME  → --update --overwrite (explicit safe reinsertion)
  *
  * @package LORIS\Pipelines
  */
@@ -33,14 +37,13 @@ class DicomImportPipeline
     private bool $verbose;
     private string $token = '';
 
-    /** Timestamp for this pipeline run — shared across log files */
     private string $runTimestamp;
 
-    /** @var resource|null Error log — opened lazily on first error */
+    /** @var resource|null */
     private $errorFh = null;
     private ?string $errorLogPath = null;
 
-    /** @var resource|null Run log — opened per project */
+    /** @var resource|null */
     private $runLogFh = null;
     private ?string $runLogPath = null;
 
@@ -48,12 +51,20 @@ class DicomImportPipeline
 
     private const TRACK_FILE = '.dicom_import_processed.json';
 
-    // ── Tracking ─────────────────────────────────────────────────────
+    /** Seconds between SPM job status poll requests */
+    private const POLL_INTERVAL_SECONDS = 30;
 
-    /** Import results per study: studyName → {status, error, elapsed} */
+    /** Maximum seconds to wait for a single study before declaring timeout */
+    private const POLL_TIMEOUT_SECONDS = 14400; // 4 hours
+
+    /**
+     * Python script error message indicating the study is already in the DB.
+     * Matched against computeExitText() output from ScriptServerProcess.
+     */
+    private const ALREADY_INSERTED_PATTERN = '/already inserted in LORIS/i';
+
     private array $importResults = [];
 
-    /** Global stats across all projects in this run */
     private array $stats = [
         'studies_found'         => 0,
         'studies_processed'     => 0,
@@ -71,11 +82,11 @@ class DicomImportPipeline
         $this->config       = $config;
         $this->dryRun       = $dryRun;
         $this->verbose      = $verbose;
-        $this->runTimestamp  = date('Y-m-d_H-i-s');
+        $this->runTimestamp = date('Y-m-d_H-i-s');
 
         $logLevel = $verbose ? Logger::DEBUG : Logger::INFO;
         $this->logger = new Logger('dicom_import');
-        $formatter = new CleanLogFormatter();
+        $formatter    = new CleanLogFormatter();
 
         $console = new StreamHandler('php://stdout', $logLevel);
         $console->setFormatter($formatter);
@@ -83,7 +94,7 @@ class DicomImportPipeline
 
         $this->http = new HttpClient([
             'base_uri'    => rtrim($config['api']['base_url'] ?? '', '/') . '/',
-            'timeout'     => $config['timeout'] ?? 1800,
+            'timeout'     => 30,        // handshake only — scripts run async via SPM
             'verify'      => $config['verify_ssl'] ?? true,
             'http_errors' => false,
         ]);
@@ -92,16 +103,26 @@ class DicomImportPipeline
     }
 
     // ──────────────────────────────────────────────────────────────────
-    // Main entry — processes a single project
+    // Main entry
     // ──────────────────────────────────────────────────────────────────
 
+    /**
+     * @param string   $projectDir    Full path to project directory
+     * @param bool     $force         Reprocess ALL studies (use --update --overwrite)
+     * @param bool     $retryFailed   Auto-retry previously failed studies (default true)
+     * @param array    $flags         Base script flags (insert/update/overwrite/session/verbose)
+     * @param string   $profile       Python config profile name
+     * @param string[] $forceStudies  Specific study names to force-reinsert with
+     *                                --update --overwrite regardless of tracking status
+     */
     public function run(
         string $projectDir,
-        bool   $force   = false,
-        array  $flags   = ['insert', 'verbose'],
-        string $profile = 'database_config.py'
+        bool   $force        = false,
+        bool   $retryFailed  = true,
+        array  $flags        = ['insert', 'verbose'],
+        string $profile      = 'database_config.py',
+        array  $forceStudies = []
     ): array {
-        // Reset per-project tracking
         $this->importResults = [];
         $this->stats = [
             'studies_found'         => 0,
@@ -122,6 +143,16 @@ class DicomImportPipeline
         }
         $this->log("Flags: " . implode(', ', $flags));
         $this->log("Profile: {$profile}");
+        if ($force) {
+            $this->log("Mode: FORCE — all studies reprocessed with --update --overwrite");
+        } elseif ($retryFailed) {
+            $this->log("Mode: RETRY FAILED — auto-retrying previously failed studies");
+        } else {
+            $this->log("Mode: SKIP FAILED — skipping previously failed studies");
+        }
+        if (!empty($forceStudies)) {
+            $this->log("Force-study targets: " . implode(', ', $forceStudies));
+        }
         $this->log("========================================");
 
         try {
@@ -134,7 +165,9 @@ class DicomImportPipeline
                 }
             }
 
-            $this->processProject($projectDir, $force, $flags, $profile);
+            $this->processProject(
+                $projectDir, $force, $retryFailed, $flags, $profile, $forceStudies
+            );
             $this->writeProjectSummary(basename($projectDir));
             $this->sendNotification($projectDir);
             $this->closeAllLogs();
@@ -157,8 +190,10 @@ class DicomImportPipeline
     private function processProject(
         string $projectDir,
         bool   $force,
+        bool   $retryFailed,
         array  $flags,
-        string $profile
+        string $profile,
+        array  $forceStudies
     ): void {
         $this->log("");
         $this->log("──── STEP 1: SCAN DICOM DIRECTORIES ────");
@@ -182,33 +217,127 @@ class DicomImportPipeline
         $this->log("");
 
         foreach ($studies as $studyPath) {
-            $name = basename($studyPath);
+            $name       = basename($studyPath);
+            $isForced   = in_array($name, $forceStudies, true);
+            $prev       = $processed[$name] ?? null;
+            $prevStatus = $prev['status'] ?? null;
 
-            // Skip already processed
-            if (!$force && isset($processed[$name])) {
-                $prev = $processed[$name];
-                $this->log("  [{$name}] SKIPPED — {$prev['status']} ({$prev['timestamp']})");
-                $this->importResults[$name] = [
-                    'status' => 'skipped',
-                    'reason' => "already {$prev['status']}",
-                ];
-                $this->stats['studies_skipped']++;
-                continue;
+            // ── Skip / retry logic ─────────────────────────────────────────────
+            if (!$force && !$isForced && $prev !== null) {
+                if ($prevStatus === 'failed' && $retryFailed) {
+                    $this->log("  [{$name}] RETRYING — previously failed"
+                        . " ({$prev['timestamp']}): "
+                        . $this->_truncateForLog($prev['detail'] ?? 'unknown'));
+                    // fall through to import
+                } else {
+                    $this->log("  [{$name}] SKIPPED — {$prevStatus} ({$prev['timestamp']})");
+                    $this->importResults[$name] = [
+                        'status' => 'skipped',
+                        'reason' => "already {$prevStatus}",
+                    ];
+                    if ($prevStatus === 'already_exists') {
+                        $this->stats['studies_already_exist']++;
+                    } else {
+                        $this->stats['studies_skipped']++;
+                    }
+                    continue;
+                }
             }
 
             $this->log("  [{$name}]");
 
             if ($this->dryRun) {
-                $this->log("    DRY RUN — would POST importdicomstudy");
+                $effectiveFlags = $this->_resolveFlags($flags, $force, $isForced, $prevStatus);
+                $this->log("    DRY RUN — would POST importdicomstudy (async via SPM)");
                 $this->log("    source={$studyPath}");
+                $this->log("    flags: " . implode(', ', $effectiveFlags));
                 $this->importResults[$name] = ['status' => 'dry_run'];
                 $this->stats['studies_processed']++;
                 continue;
             }
 
-            $this->importOneStudy($name, $studyPath, $dicomRoot, $processed, $flags, $profile);
+            // ── Resolve flags ───────────────────────────────────────────────────
+            // --force / --force-study on a study with a prior tracking entry means
+            // we know it reached the DB (or partially did). Use --update --overwrite
+            // to safely overwrite without creating a duplicate tarchive row.
+            // Normal first-run studies use --insert; if the script replies "already
+            // inserted", _importOneStudy() automatically retries with --update --overwrite.
+            $effectiveFlags = $this->_resolveFlags($flags, $force, $isForced, $prevStatus);
+
+            $this->importOneStudy(
+                $name, $studyPath, $dicomRoot, $processed, $effectiveFlags, $profile
+            );
         }
     }
+
+    // ──────────────────────────────────────────────────────────────────
+    // Flag resolution
+    // ──────────────────────────────────────────────────────────────────
+
+    /**
+     * Resolve the effective flags for a single study.
+     *
+     * Rule:
+     *   - force=true OR isForced=true AND prevStatus !== null
+     *     → --update --overwrite  (known to be in DB, safe overwrite)
+     *   - everything else
+     *     → caller-supplied flags (normally --insert)
+     *     If the script returns ALREADY_EXISTS, _importOneStudy() will
+     *     automatically retry with --update --overwrite (two-pass fallback).
+     *
+     * @param array   $baseFlags   Flags from CLI / run() caller
+     * @param bool    $force       Global --force flag
+     * @param bool    $isForced    Study is in --force-study list
+     * @param ?string $prevStatus  Previous tracking status or null
+     *
+     * @return array Resolved flags
+     */
+    private function _resolveFlags(
+        array   $baseFlags,
+        bool    $force,
+        bool    $isForced,
+        ?string $prevStatus
+    ): array {
+        $useOverwrite = $force || ($isForced && $prevStatus !== null);
+
+        if ($useOverwrite) {
+            // Strip insert, ensure update + overwrite
+            $flags = array_filter($baseFlags, fn($f) => $f !== 'insert');
+            if (!in_array('update', $flags, true)) {
+                $flags[] = 'update';
+            }
+            if (!in_array('overwrite', $flags, true)) {
+                $flags[] = 'overwrite';
+            }
+            return array_values($flags);
+        }
+
+        return $baseFlags;
+    }
+
+    /**
+     * Build flags for automatic retry after ALREADY_EXISTS error.
+     * Switches insert → update + overwrite.
+     *
+     * @param array $flags Current flags
+     *
+     * @return array
+     */
+    private function _buildRetryFlags(array $flags): array
+    {
+        $flags = array_filter($flags, fn($f) => $f !== 'insert');
+        if (!in_array('update', $flags, true)) {
+            $flags[] = 'update';
+        }
+        if (!in_array('overwrite', $flags, true)) {
+            $flags[] = 'overwrite';
+        }
+        return array_values($flags);
+    }
+
+    // ──────────────────────────────────────────────────────────────────
+    // Import one study — fire async, poll, auto-retry on ALREADY_EXISTS
+    // ──────────────────────────────────────────────────────────────────
 
     private function importOneStudy(
         string  $name,
@@ -216,61 +345,202 @@ class DicomImportPipeline
         string  $dicomRoot,
         array  &$processed,
         array   $flags,
-        string  $profile
+        string  $profile,
+        bool    $isRetry = false  // true when auto-retrying after ALREADY_EXISTS
     ): void {
         try {
-            $t0      = microtime(true);
-            $result  = $this->callImportDicomStudy($studyPath, $flags, $profile);
-            $elapsed = round(microtime(true) - $t0, 2);
+            $t0     = microtime(true);
+            $launch = $this->_launchAsync($studyPath, $flags, $profile);
 
-            $status    = $result['status'] ?? 'unknown';
-            $http      = $result['http_status'] ?? 0;
-            $errorType = $result['error_type'] ?? '';
-
-            // Already inserted → mark and skip
-            if ($errorType === 'ALREADY_EXISTS') {
-                $this->log("    Already inserted — marking done ({$elapsed}s)");
-                $this->markProcessed($dicomRoot, $processed, $name, 'already_exists');
-                $this->importResults[$name] = [
-                    'status'  => 'already_exists',
-                    'elapsed' => $elapsed,
-                ];
-                $this->stats['studies_already_exist']++;
+            if (($launch['http_status'] ?? 0) !== 202) {
+                $elapsed = round(microtime(true) - $t0, 2);
+                $errMsg  = $this->extractErrorMessage($launch);
+                $this->log("    FAILED to launch ({$elapsed}s): {$errMsg}");
+                $this->writeError($name, "Launch failed: {$errMsg}");
+                $this->writeErrorDetail("HTTP status: " . ($launch['http_status'] ?? 0));
+                $this->markProcessed($dicomRoot, $processed, $name, 'failed', $errMsg);
+                $this->importResults[$name] = ['status' => 'failed', 'reason' => $errMsg, 'elapsed' => $elapsed];
+                $this->stats['studies_failed']++;
                 return;
             }
 
-            if ($status === 'success' || ($http >= 200 && $http < 300 && $status !== 'error')) {
-                $this->log("    SUCCESS ({$elapsed}s)");
-                $this->markProcessed($dicomRoot, $processed, $name, 'success');
-                $this->importResults[$name] = [
-                    'status'  => 'success',
-                    'elapsed' => $elapsed,
-                ];
-                $this->stats['studies_processed']++;
+            $jobId = $launch['job_id'] ?? null;
+            $pid   = $launch['pid']    ?? null;
+            if (!$jobId) {
+                $elapsed = round(microtime(true) - $t0, 2);
+                $errMsg  = "No job_id returned from async launch";
+                $this->log("    FAILED ({$elapsed}s): {$errMsg}");
+                $this->writeError($name, $errMsg);
+                $this->markProcessed($dicomRoot, $processed, $name, 'failed', $errMsg);
+                $this->importResults[$name] = ['status' => 'failed', 'reason' => $errMsg, 'elapsed' => $elapsed];
+                $this->stats['studies_failed']++;
                 return;
             }
 
-            $errMsg = $this->extractErrorMessage($result);
-            $this->log("    FAILED ({$elapsed}s): {$errMsg}");
-            $this->writeError($name, "Import failed: {$errMsg}");
-            $this->writeErrorDetail("Command: " . ($result['command'] ?? 'N/A'));
-            $this->writeErrorDetail("HTTP status: {$http}");
-            $this->writeErrorDetail("Error type: {$errorType}");
-            $this->markProcessed($dicomRoot, $processed, $name, 'failed', $errMsg);
-            $this->importResults[$name] = [
-                'status'  => 'failed',
-                'reason'  => $errMsg,
-                'elapsed' => $elapsed,
-            ];
-            $this->stats['studies_failed']++;
+            $retryLabel = $isRetry ? ' [retry with --update --overwrite]' : '';
+            $this->log("    Launched — job_id={$jobId} pid={$pid}{$retryLabel}, polling every "
+                . self::POLL_INTERVAL_SECONDS . "s ...");
+
+            // ── Poll ───────────────────────────────────────────────────────────
+            $pollStart        = microtime(true);
+            $pollFailures     = 0;
+            $wasRunning       = false;
+
+            while (true) {
+                sleep(self::POLL_INTERVAL_SECONDS);
+
+                $elapsed = round(microtime(true) - $t0, 2);
+
+                if ((microtime(true) - $pollStart) > self::POLL_TIMEOUT_SECONDS) {
+                    $errMsg = "Job {$jobId} timed out after "
+                        . self::POLL_TIMEOUT_SECONDS . "s — "
+                        . "check server_processes id={$jobId}";
+                    $this->log("    TIMEOUT ({$elapsed}s)");
+                    $this->writeError($name, $errMsg);
+                    $this->markProcessed($dicomRoot, $processed, $name, 'failed', $errMsg);
+                    $this->importResults[$name] = [
+                        'status'  => 'failed',
+                        'reason'  => $errMsg,
+                        'elapsed' => $elapsed,
+                        'job_id'  => $jobId,
+                    ];
+                    $this->stats['studies_failed']++;
+                    return;
+                }
+
+                $status = $this->_pollJob($jobId);
+
+                if ($status === null) {
+                    $pollFailures++;
+                    $this->log("    WARNING: poll failed for job {$jobId} at {$elapsed}s"
+                        . " — attempt {$pollFailures}/3");
+                    if ($pollFailures >= 3) {
+                        $errMsg = "Job {$jobId} poll failed 3 consecutive times"
+                            . " — check GET cbigr_api/script/job/{$jobId}";
+                        $this->log("    FAILED ({$elapsed}s): {$errMsg}");
+                        $this->writeError($name, $errMsg);
+                        $this->markProcessed($dicomRoot, $processed, $name, 'failed', $errMsg);
+                        $this->importResults[$name] = [
+                            'status'  => 'failed',
+                            'reason'  => $errMsg,
+                            'elapsed' => $elapsed,
+                            'job_id'  => $jobId,
+                        ];
+                        $this->stats['studies_failed']++;
+                        return;
+                    }
+                    continue;
+                }
+
+                $pollFailures = 0;
+                $state        = $status['state'] ?? 'UNKNOWN';
+                $this->log("    [{$elapsed}s] job {$jobId} → {$state}");
+
+                if ($state === 'RUNNING') {
+                    $wasRunning = true;
+                    continue;
+                }
+
+                // UNKNOWN means SPM couldn't read the exit code file — either it was
+                // deleted before the monitor synced (exit 0, deleteProcessFiles ran)
+                // or the process died unexpectedly.
+                // If we saw RUNNING previously, the process completed and the file was
+                // cleaned up after a successful exit — treat as SUCCESS.
+                if ($state === 'UNKNOWN') {
+                    if ($wasRunning) {
+                        $this->log("    SUCCESS (exit code file cleaned up after successful run)"
+                            . " ({$elapsed}s)");
+                        $this->markProcessed($dicomRoot, $processed, $name, 'success');
+                        $this->importResults[$name] = [
+                            'status'  => 'success',
+                            'elapsed' => $elapsed,
+                            'job_id'  => $jobId,
+                        ];
+                        $this->stats['studies_processed']++;
+                        return;
+                    }
+                    // Never saw RUNNING — process likely died immediately
+                    $errMsg = "Job {$jobId} ended in UNKNOWN state without running"
+                        . " — check server_processes id={$jobId}";
+                    $this->log("    FAILED ({$elapsed}s): {$errMsg}");
+                    $this->writeError($name, $errMsg);
+                    $this->markProcessed($dicomRoot, $processed, $name, 'failed', $errMsg);
+                    $this->importResults[$name] = [
+                        'status'  => 'failed',
+                        'reason'  => $errMsg,
+                        'elapsed' => $elapsed,
+                        'job_id'  => $jobId,
+                    ];
+                    $this->stats['studies_failed']++;
+                    return;
+                }
+
+                // ── Job finished ───────────────────────────────────────────────
+                $elapsed = round(microtime(true) - $t0, 2);
+
+                if ($state === 'SUCCESS') {
+                    $this->log("    SUCCESS ({$elapsed}s)");
+                    $this->markProcessed($dicomRoot, $processed, $name, 'success');
+                    $this->importResults[$name] = [
+                        'status'  => 'success',
+                        'elapsed' => $elapsed,
+                        'job_id'  => $jobId,
+                    ];
+                    $this->stats['studies_processed']++;
+                    return;
+                }
+
+                // ── ERROR — read actual script output from SPM ─────────────────
+                $errorDetail = $status['error_detail'] ?? $status['progress'] ?? 'Unknown error';
+                $exitCode    = $status['exit_code'] ?? '?';
+
+                // ALREADY_EXISTS: study is in DB but we tried --insert.
+                // Auto-retry once with --update --overwrite.
+                if (!$isRetry && preg_match(self::ALREADY_INSERTED_PATTERN, $errorDetail)) {
+                    $this->log("    Already inserted — retrying with --update --overwrite ({$elapsed}s)");
+                    $retryFlags = $this->_buildRetryFlags($flags);
+                    $this->importOneStudy(
+                        $name, $studyPath, $dicomRoot, $processed, $retryFlags, $profile, true
+                    );
+                    return;
+                }
+
+                // On retry ALREADY_EXISTS means a genuine conflict — mark as already_exists
+                if ($isRetry && preg_match(self::ALREADY_INSERTED_PATTERN, $errorDetail)) {
+                    $this->log("    Already inserted (confirmed) — marking done ({$elapsed}s)");
+                    $this->markProcessed($dicomRoot, $processed, $name, 'already_exists');
+                    $this->importResults[$name] = [
+                        'status'  => 'already_exists',
+                        'elapsed' => $elapsed,
+                        'job_id'  => $jobId,
+                    ];
+                    $this->stats['studies_already_exist']++;
+                    return;
+                }
+
+                // Real failure — the full Python/Perl error is in errorDetail
+                $this->log("    FAILED ({$elapsed}s) exit_code={$exitCode}: "
+                    . $this->_truncateForLog($errorDetail));
+                $this->writeError($name, "Script failed (exit {$exitCode}): "
+                    . $this->_truncateForLog($errorDetail, 300));
+                $this->writeErrorDetail("job_id: {$jobId}");
+                $this->writeErrorDetail("Full error:\n{$errorDetail}");
+                $this->markProcessed($dicomRoot, $processed, $name, 'failed', $errorDetail);
+                $this->importResults[$name] = [
+                    'status'    => 'failed',
+                    'reason'    => $errorDetail,
+                    'elapsed'   => $elapsed,
+                    'job_id'    => $jobId,
+                    'exit_code' => $exitCode,
+                ];
+                $this->stats['studies_failed']++;
+                return;
+            }
 
         } catch (\Exception $e) {
             $this->log("    EXCEPTION: " . $e->getMessage());
             $this->writeError($name, "Import exception: " . $e->getMessage());
-            $this->importResults[$name] = [
-                'status' => 'failed',
-                'reason' => $e->getMessage(),
-            ];
+            $this->importResults[$name] = ['status' => 'failed', 'reason' => $e->getMessage()];
             $this->stats['studies_failed']++;
         }
     }
@@ -299,7 +569,7 @@ class DicomImportPipeline
                 return false;
             }
 
-            $body = json_decode($resp->getBody()->getContents(), true);
+            $body        = json_decode($resp->getBody()->getContents(), true);
             $this->token = $body['token'] ?? '';
 
             if (empty($this->token)) {
@@ -316,30 +586,33 @@ class DicomImportPipeline
     }
 
     // ──────────────────────────────────────────────────────────────────
-    // Endpoint call
+    // HTTP helpers
     // ──────────────────────────────────────────────────────────────────
 
-    private function callImportDicomStudy(
+    /**
+     * POST importdicomstudy with async=true.
+     * Returns immediately with { job_id, poll_url }.
+     */
+    private function _launchAsync(
         string $sourceDir,
-        array  $flags   = ['insert', 'verbose'],
-        string $profile = 'database_config.py',
-        bool   $async   = false
+        array  $flags   = ['insert'],
+        string $profile = 'database_config.py'
     ): array {
         $endpoint = 'cbigr_api/script/importdicomstudy';
 
         $payload = [
             'args'  => ['source' => $sourceDir, 'profile' => $profile],
             'flags' => $flags,
-            'async' => $async,
+            'async' => true,
         ];
 
-        $this->logger->debug("  POST {$endpoint}");
-        $this->logger->debug("  source={$sourceDir} flags=" . implode(',', $flags));
+        $this->logger->debug("  POST {$endpoint} async=true flags=" . implode(',', $flags));
 
         try {
             $resp = $this->http->post($endpoint, [
                 'json'    => $payload,
                 'headers' => ['Authorization' => 'Bearer ' . $this->token],
+                'timeout' => 30,
             ]);
             $body = json_decode($resp->getBody()->getContents(), true) ?? [];
             $body['http_status'] = $resp->getStatusCode();
@@ -350,6 +623,25 @@ class DicomImportPipeline
                 'http_status' => 0,
                 'errors'      => [['type' => 'exception', 'message' => $e->getMessage()]],
             ];
+        }
+    }
+
+    /**
+     * GET /cbigr_api/script/job/{id}.
+     * Returns null on transient failure — caller retries next poll cycle.
+     */
+    private function _pollJob(int $jobId): ?array
+    {
+        try {
+            $resp = $this->http->get("cbigr_api/script/job/{$jobId}", [
+                'headers' => ['Authorization' => 'Bearer ' . $this->token],
+                'timeout' => 15,
+            ]);
+            $body = json_decode($resp->getBody()->getContents(), true);
+            return is_array($body) ? $body : null;
+        } catch (\Exception $e) {
+            $this->logger->debug("  poll exception job {$jobId}: " . $e->getMessage());
+            return null;
         }
     }
 
@@ -417,30 +709,52 @@ class DicomImportPipeline
         return $studies;
     }
 
+    // ──────────────────────────────────────────────────────────────────
+    // Helpers
+    // ──────────────────────────────────────────────────────────────────
+
+    private function _truncateForLog(string $text, int $limit = 120): string
+    {
+        $text = preg_replace('/\s+/', ' ', trim($text));
+        if (strlen($text) <= $limit) {
+            return $text;
+        }
+        return substr($text, 0, $limit - 3) . '...';
+    }
+
+    private function extractErrorMessage(array $result): string
+    {
+        $errors = $result['errors'] ?? [];
+        if (!empty($errors)) {
+            $msgs = array_map(fn($e) => $e['message'] ?? $e['type'] ?? 'unknown', $errors);
+            return implode('; ', array_slice($msgs, 0, 3));
+        }
+        if (!empty($result['output'])) {
+            $lines = array_filter(explode("\n", trim($result['output'])));
+            return end($lines) ?: 'Unknown error';
+        }
+        return $result['error_type']
+            ?? 'Unknown error (HTTP ' . ($result['http_status'] ?? '?') . ')';
+    }
+
     // ══════════════════════════════════════════════════════════════════
-    //  RUN LOG — per pipeline run, all detail
+    //  RUN LOG
     // ══════════════════════════════════════════════════════════════════
 
     private function openRunLog(): void
     {
-        if ($this->runLogFh !== null) {
-            return;
-        }
-        if ($this->logDir === null) {
+        if ($this->runLogFh !== null || $this->logDir === null) {
             return;
         }
         if (!is_dir($this->logDir)) {
             @mkdir($this->logDir, 0755, true);
         }
-
         $this->runLogPath = "{$this->logDir}/dicom_run_{$this->runTimestamp}.log";
         $this->runLogFh   = @fopen($this->runLogPath, 'a');
-
         if ($this->runLogFh) {
             $sep = str_repeat('=', 72);
             fwrite($this->runLogFh,
-                "{$sep}\n"
-                . " ARCHIMEDES DICOM Import Pipeline — Run Log\n"
+                "{$sep}\n ARCHIMEDES DICOM Import Pipeline — Run Log\n"
                 . " Started: " . date('Y-m-d H:i:s T') . "\n"
                 . ($this->dryRun ? " Mode: DRY RUN\n" : "")
                 . "{$sep}\n\n"
@@ -448,51 +762,42 @@ class DicomImportPipeline
         }
     }
 
-    /** Write to both console (logger) and run log file */
     private function log(string $msg): void
     {
         $this->logger->info($msg);
-
         if ($this->runLogFh) {
-            $ts = date('H:i:s');
-            fwrite($this->runLogFh, "[{$ts}] {$msg}\n");
+            fwrite($this->runLogFh, "[" . date('H:i:s') . "] {$msg}\n");
         }
     }
 
     // ══════════════════════════════════════════════════════════════════
-    //  ERROR LOG — only created when errors occur
+    //  ERROR LOG
     // ══════════════════════════════════════════════════════════════════
 
     private function writeError(string $context, string $msg): void
     {
         $this->logger->error("[{$context}] {$msg}");
 
-        // Lazy-open error log on first error
         if ($this->errorFh === null && $this->logDir !== null) {
             if (!is_dir($this->logDir)) {
                 @mkdir($this->logDir, 0755, true);
             }
             $this->errorLogPath = "{$this->logDir}/dicom_errors_{$this->runTimestamp}.log";
-            $this->errorFh = @fopen($this->errorLogPath, 'a');
+            $this->errorFh      = @fopen($this->errorLogPath, 'a');
             if ($this->errorFh) {
                 $sep = str_repeat('=', 72);
                 fwrite($this->errorFh,
-                    "{$sep}\n"
-                    . " ARCHIMEDES DICOM Import Pipeline — Error Log\n"
-                    . " Run: {$this->runTimestamp}\n"
-                    . "{$sep}\n\n"
+                    "{$sep}\n ARCHIMEDES DICOM Import Pipeline — Error Log\n"
+                    . " Run: {$this->runTimestamp}\n{$sep}\n\n"
                 );
             }
         }
 
+        $ts = date('H:i:s');
         if ($this->errorFh) {
-            $ts = date('H:i:s');
             fwrite($this->errorFh, "[{$ts}] [{$context}] {$msg}\n");
         }
-
-        // Also write to run log as ERROR
         if ($this->runLogFh) {
-            $ts = date('H:i:s');
             fwrite($this->runLogFh, "[{$ts}] ERROR [{$context}] {$msg}\n");
         }
     }
@@ -509,30 +814,28 @@ class DicomImportPipeline
 
     private function closeAllLogs(): void
     {
+        $sep = str_repeat('=', 72);
+        $ts  = date('Y-m-d H:i:s T');
         if ($this->errorFh) {
-            $sep = str_repeat('=', 72);
-            fwrite($this->errorFh, "\n{$sep}\n Closed: " . date('Y-m-d H:i:s T') . "\n{$sep}\n");
+            fwrite($this->errorFh, "\n{$sep}\n Closed: {$ts}\n{$sep}\n");
             fclose($this->errorFh);
             $this->errorFh = null;
         }
-
         if ($this->runLogFh) {
-            $sep = str_repeat('=', 72);
-            fwrite($this->runLogFh, "\n{$sep}\n Completed: " . date('Y-m-d H:i:s T') . "\n{$sep}\n");
+            fwrite($this->runLogFh, "\n{$sep}\n Completed: {$ts}\n{$sep}\n");
             fclose($this->runLogFh);
             $this->runLogFh = null;
         }
     }
 
     // ══════════════════════════════════════════════════════════════════
-    //  PROJECT SUMMARY — written to run log after each project
+    //  PROJECT SUMMARY
     // ══════════════════════════════════════════════════════════════════
 
     private function writeProjectSummary(string $projectName): void
     {
         $this->log("");
         $this->log("──── PROJECT SUMMARY: {$projectName} ────");
-        $this->log("");
         $this->log("  DICOM STUDY IMPORT:");
 
         if (empty($this->importResults)) {
@@ -552,8 +855,9 @@ class DicomImportPipeline
             if (!empty($success)) {
                 $this->log("    Imported (" . count($success) . "):");
                 foreach ($success as $s) {
-                    $elapsed = $this->importResults[$s]['elapsed'] ?? '';
-                    $this->log("      + {$s}" . ($elapsed ? " ({$elapsed}s)" : ""));
+                    $e = $this->importResults[$s]['elapsed'] ?? '';
+                    $j = $this->importResults[$s]['job_id'] ?? null;
+                    $this->log("      + {$s}" . ($e ? " ({$e}s)" : "") . ($j ? " [job {$j}]" : ""));
                 }
             }
             if (!empty($alreadyExist)) {
@@ -565,15 +869,16 @@ class DicomImportPipeline
             if (!empty($skipped)) {
                 $this->log("    Skipped (" . count($skipped) . "):");
                 foreach ($skipped as $s) {
-                    $reason = $this->importResults[$s]['reason'] ?? '?';
-                    $this->log("      - {$s} — {$reason}");
+                    $this->log("      - {$s} — " . ($this->importResults[$s]['reason'] ?? '?'));
                 }
             }
             if (!empty($failed)) {
                 $this->log("    Failed (" . count($failed) . "):");
                 foreach ($failed as $s) {
-                    $reason = $this->importResults[$s]['reason'] ?? '?';
-                    $this->log("      ! {$s} — {$reason}");
+                    $j = $this->importResults[$s]['job_id'] ?? null;
+                    $this->log("      ! {$s} — "
+                        . $this->_truncateForLog($this->importResults[$s]['reason'] ?? '?')
+                        . ($j ? " [job {$j}]" : ""));
                 }
             }
             if (!empty($dryRun)) {
@@ -590,25 +895,14 @@ class DicomImportPipeline
         $this->log("PIPELINE RUN SUMMARY");
         $this->log("========================================");
         $this->log("  Run: {$this->runTimestamp}");
-        $this->log("");
         $this->log("  Studies found:          {$s['studies_found']}");
         $this->log("  Successfully imported:  {$s['studies_processed']}");
         $this->log("  Already existed:        {$s['studies_already_exist']}");
         $this->log("  Skipped:                {$s['studies_skipped']}");
         $this->log("  Failed:                 {$s['studies_failed']}");
-        $this->log("");
-
-        if ($this->runLogPath) {
-            $this->log("  Run log:   {$this->runLogPath}");
-        }
-        if ($this->errorLogPath) {
-            $this->log("  Error log: {$this->errorLogPath}");
-        }
-
-        $hasErrors = $s['studies_failed'] > 0;
-        $outcome   = $hasErrors ? 'COMPLETED WITH ERRORS' : 'COMPLETED SUCCESSFULLY';
-        $this->log("");
-        $this->log("  Result: {$outcome}");
+        if ($this->runLogPath)   $this->log("  Run log:   {$this->runLogPath}");
+        if ($this->errorLogPath) $this->log("  Error log: {$this->errorLogPath}");
+        $this->log("  Result: " . ($s['studies_failed'] > 0 ? 'COMPLETED WITH ERRORS' : 'COMPLETED SUCCESSFULLY'));
         $this->log("========================================");
     }
 
@@ -624,18 +918,14 @@ class DicomImportPipeline
         }
 
         $projectName = basename($projectDir);
-        $s = $this->stats;
-
+        $s           = $this->stats;
         $hasFailures = $s['studies_failed'] > 0;
 
-        // Load per-project notification config from project.json
         $projectJson = rtrim($projectDir, '/') . '/project.json';
-        $projectData = [];
-        if (file_exists($projectJson)) {
-            $projectData = json_decode(file_get_contents($projectJson), true) ?? [];
-        }
+        $projectData = file_exists($projectJson)
+            ? (json_decode(file_get_contents($projectJson), true) ?? [])
+            : [];
 
-        // Read notification config from project.json → notification_emails.dicom
         $notifConfig = $projectData['notification_emails']['dicom']
             ?? $this->config['notification_emails']['dicom']
             ?? $this->config['notification_defaults']
@@ -663,136 +953,62 @@ class DicomImportPipeline
         $status  = $hasFailures ? 'FAILED' : 'SUCCESS';
         $subject = "{$status}: {$projectName} DICOM Import";
 
-        // ── Build email body ─────────────────────────────────────────
-
         $body  = "Project: {$projectName}\n";
         $body .= "Modality: dicom\n";
         $body .= "Timestamp: " . date('Y-m-d H:i:s') . "\n";
         $body .= "Run: {$this->runTimestamp}\n\n";
-
-        // ── Study Import Results ─────────────────────────────────────
-
         $body .= "DICOM Study Import:\n";
 
-        $importByStatus = [
-            'success' => [], 'failed' => [], 'skipped' => [],
-            'already_exists' => [], 'dry_run' => [],
-        ];
+        $byStatus = ['success' => [], 'failed' => [], 'skipped' => [], 'already_exists' => [], 'dry_run' => []];
         foreach ($this->importResults as $study => $r) {
-            $importByStatus[$r['status']][] = $study;
+            $byStatus[$r['status']][] = $study;
         }
 
         if (empty($this->importResults)) {
             $body .= "  (no studies found)\n";
         } else {
-            if (!empty($importByStatus['success'])) {
-                $count = count($importByStatus['success']);
-                $body .= "  ✔ Imported: {$count}\n";
-                foreach ($importByStatus['success'] as $study) {
-                    $elapsed = $this->importResults[$study]['elapsed'] ?? '';
-                    $body .= "     {$study}" . ($elapsed ? " ({$elapsed}s)" : "") . "\n";
+            if (!empty($byStatus['success'])) {
+                $body .= "  ✔ Imported: " . count($byStatus['success']) . "\n";
+                foreach ($byStatus['success'] as $study) {
+                    $e = $this->importResults[$study]['elapsed'] ?? '';
+                    $j = $this->importResults[$study]['job_id'] ?? null;
+                    $body .= "     {$study}" . ($e ? " ({$e}s)" : "") . ($j ? " [job {$j}]" : "") . "\n";
                 }
             }
-
-            if (!empty($importByStatus['already_exists'])) {
-                $count = count($importByStatus['already_exists']);
-                $body .= "  ● Already existed: {$count} ("
-                    . implode(', ', $importByStatus['already_exists']) . ")\n";
+            if (!empty($byStatus['already_exists'])) {
+                $body .= "  ● Already existed: " . count($byStatus['already_exists'])
+                    . " (" . implode(', ', $byStatus['already_exists']) . ")\n";
             }
-
-            if (!empty($importByStatus['failed'])) {
-                $failedByReason = [];
-                foreach ($importByStatus['failed'] as $study) {
-                    $reason = $this->importResults[$study]['reason'] ?? 'unknown';
-                    $failedByReason[$reason][] = $study;
+            if (!empty($byStatus['failed'])) {
+                $body .= "  ✗ Failed: " . count($byStatus['failed']) . "\n";
+                foreach ($byStatus['failed'] as $study) {
+                    $reason   = $this->importResults[$study]['reason'] ?? 'unknown';
+                    $j        = $this->importResults[$study]['job_id'] ?? null;
+                    $exitCode = $this->importResults[$study]['exit_code'] ?? null;
+                    $body    .= "     {$study}"
+                        . ($j        ? " [job {$j}]"    : "")
+                        . ($exitCode !== null ? " exit={$exitCode}" : "") . "\n"
+                        . "       Error: {$reason}\n";
                 }
-                $count = count($importByStatus['failed']);
-                $failedParts = [];
-                foreach ($failedByReason as $reason => $studies) {
-                    $failedParts[] = implode(', ', $studies) . " [{$reason}]";
-                }
-                $body .= "  ✗ Failed: {$count} (" . implode('; ', $failedParts) . ")\n";
             }
-
-            if (!empty($importByStatus['skipped'])) {
-                $skippedByReason = [];
-                foreach ($importByStatus['skipped'] as $study) {
-                    $reason = $this->importResults[$study]['reason'] ?? 'unknown';
-                    $skippedByReason[$reason][] = $study;
-                }
-                $count = count($importByStatus['skipped']);
-                $skippedParts = [];
-                foreach ($skippedByReason as $reason => $studies) {
-                    $skippedParts[] = implode(', ', $studies) . " [{$reason}]";
-                }
-                $body .= "  ⚠ Skipped: {$count} (" . implode('; ', $skippedParts) . ")\n";
+            if (!empty($byStatus['skipped'])) {
+                $body .= "  ⚠ Skipped: " . count($byStatus['skipped']) . "\n";
             }
         }
 
-        $body .= "\n";
+        $body .= "\n" . str_repeat('-', 50) . "\n";
+        $body .= "Studies found:          {$s['studies_found']}\n";
+        $body .= "Successfully imported:  {$s['studies_processed']}\n";
+        $body .= "Already existed:        {$s['studies_already_exist']}\n";
+        $body .= "Skipped:                {$s['studies_skipped']}\n";
+        $body .= "Failed:                 {$s['studies_failed']}\n";
 
-        // ── Totals ───────────────────────────────────────────────────
-
-        $body .= str_repeat('-', 50) . "\n";
-        $body .= "Totals:\n";
-        $body .= "  Studies found:          {$s['studies_found']}\n";
-        $body .= "  Successfully imported:  {$s['studies_processed']}\n";
-        $body .= "  Already existed:        {$s['studies_already_exist']}\n";
-        $body .= "  Skipped:                {$s['studies_skipped']}\n";
-        $body .= "  Failed:                 {$s['studies_failed']}\n";
-        $body .= "\n";
-
-        // ── Status message ───────────────────────────────────────────
-
-        if ($hasFailures) {
-            $body .= "⚠ Some studies failed to import.\n";
-            $body .= "Check logs for details.\n";
-        } elseif ($s['studies_processed'] > 0) {
-            $body .= "✔ Import completed successfully.\n";
-        } elseif ($s['studies_skipped'] > 0 || $s['studies_already_exist'] > 0) {
-            $body .= "✔ Import completed. All studies were already processed.\n";
-        } else {
-            $body .= "✔ Import completed. No studies to process.\n";
-        }
-
-        // ── Log paths ────────────────────────────────────────────────
-
-        $body .= "\n";
-        if ($this->runLogPath) {
-            $body .= "Run log: {$this->runLogPath}\n";
-        }
-        if ($this->errorLogPath) {
-            $body .= "Error log: {$this->errorLogPath}\n";
-        }
-
-        // ── Send ─────────────────────────────────────────────────────
+        if ($this->runLogPath)   $body .= "\nRun log: {$this->runLogPath}\n";
+        if ($this->errorLogPath) $body .= "Error log: {$this->errorLogPath}\n";
 
         $this->log("  Sending notification to: " . implode(', ', $emailsToSend));
-
         foreach ($emailsToSend as $to) {
             $this->notification->send($to, $subject, $body);
         }
-    }
-
-    // ══════════════════════════════════════════════════════════════════
-    //  Helpers
-    // ══════════════════════════════════════════════════════════════════
-
-    private function extractErrorMessage(array $result): string
-    {
-        $errors = $result['errors'] ?? [];
-        if (!empty($errors)) {
-            $msgs = array_map(
-                fn($e) => $e['message'] ?? $e['type'] ?? 'unknown',
-                $errors
-            );
-            return implode('; ', array_slice($msgs, 0, 3));
-        }
-        if (!empty($result['output'])) {
-            $lines = array_filter(explode("\n", trim($result['output'])));
-            return end($lines) ?: 'Unknown error';
-        }
-        return $result['error_type']
-            ?? 'Unknown error (HTTP ' . ($result['http_status'] ?? '?') . ')';
     }
 }
