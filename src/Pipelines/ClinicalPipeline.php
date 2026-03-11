@@ -471,7 +471,8 @@ class ClinicalPipeline
 
         try {
             $t0      = microtime(true);
-            $result  = $this->client->uploadMultiInstrumentData($instruments, $filePath, 'CREATE_SESSIONS', $format);
+            $result = $this->client->uploadMultiInstrumentData($instruments, $filePath, 'CREATE_SESSIONS');
+
             $elapsed = round(microtime(true) - $t0, 2);
 
             if ($result['success'] ?? false) {

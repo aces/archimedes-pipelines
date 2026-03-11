@@ -20,6 +20,21 @@ use SplFileObject;
  *
  * Ref: https://github.com/aces/loris-php-api-client
  *
+ * CHANGELOG (instrument_manager im3 — explicit parameters):
+ *   - Install: sends instrument_type field (bids/linst/redcap) — DD format selector
+ *       Client auto-detects from extension: .csv → redcap, .linst → linst, .json → bids
+ *   - Data upload: sends 'format' field (LORIS_CSV/REDCAP_CSV/BIDS_TSV)
+ *       Client auto-detects: .tsv → BIDS_TSV, CSV with redcap_event_name → REDCAP_CSV, else → LORIS_CSV
+ *   - Data upload: sends 'strict' field (bool string) — column validation mode
+ *       strict=true  → all template columns must be present
+ *       strict=false → non-essential columns may be missing (pipeline default)
+ *   - GET template: sends 'format' query param (LORIS_CSV/REDCAP_CSV/BIDS_TSV)
+ *   - Client-side helpers:
+ *       detectInstrumentType() — auto-detect DD type from extension
+ *       detectDataFormat()     — auto-detect data format from content/extension
+ *       isRedcapCSV()          — checks for redcap_event_name column
+ *       validateColumns()      — pre-flight column check with format-aware delimiters
+ *
  * @package LORIS\Endpoints
  */
 class ClinicalClient
@@ -35,30 +50,26 @@ class ClinicalClient
     private int    $tokenExpiryMinutes;
     private ?int   $tokenExpiry = null;
 
-    // API client objects (null when library not installed or init fails)
     private bool  $hasApiClient   = false;
-    private mixed $apiConfig      = null;   // LORISClient\Configuration (REST API host)
-    private mixed $moduleConfig   = null;   // LORISClient\Configuration (Module host)
+    private mixed $apiConfig      = null;
+    private mixed $moduleConfig   = null;
 
-    // Supported API versions (try in order)
     private array $apiVersions;
     private ?string $activeVersion = null;
 
-    // Cache of installed instruments per project
     private ?array $installedInstruments = null;
+
+    // im3: DD type map — extension → instrument_type value
+    private const DD_TYPE_MAP = [
+        'csv'  => 'redcap',
+        'linst' => 'linst',
+        'json' => 'bids',
+    ];
 
     // ──────────────────────────────────────────────────────────────────
     // CONSTRUCTOR
     // ──────────────────────────────────────────────────────────────────
 
-    /**
-     * @param string               $baseUrl              LORIS base URL
-     * @param string               $username              LORIS username
-     * @param string               $password              LORIS password
-     * @param int                  $tokenExpiryMinutes    Token refresh interval (minutes)
-     * @param LoggerInterface|null $logger                PSR-3 logger
-     * @param string               $apiVersion            API version (e.g. v0.0.4-dev)
-     */
     public function __construct(
         string $baseUrl,
         string $username,
@@ -73,15 +84,13 @@ class ClinicalClient
         $this->apiVersion         = $apiVersion;
         $this->logger             = $logger ?? new \Psr\Log\NullLogger();
         $this->tokenExpiryMinutes = $tokenExpiryMinutes;
-
-        $this->apiVersions = [$apiVersion];
+        $this->apiVersions        = [$apiVersion];
 
         $this->httpClient = new GuzzleClient([
             'timeout' => 30,
             'verify'  => true,
         ]);
 
-        // Detect and initialize the API client if available
         if (class_exists(\LORISClient\Configuration::class)
             && class_exists(\LORISClient\Api\AuthenticationApi::class)
         ) {
@@ -91,35 +100,20 @@ class ClinicalClient
         }
     }
 
-    /**
-     * Initialize loris-php-api-client Configuration objects.
-     *
-     * Two configs are needed because the schema defines two server types:
-     *  - REST API config: host = {baseUrl}/api/{version}
-     *  - Module config:   host = {baseUrl}
-     */
     private function initApiClient(): void
     {
         try {
-            // Register missing model classes that codegen doesn't create
-            // (inline 200/201 response schemas → auto-named classes that don't exist)
             $this->registerMissingModels();
 
-            // Use new Configuration() — NOT getDefaultConfiguration() singleton
-            // REST API endpoints (/login, /candidates, /projects, /sites)
             $this->apiConfig = new \LORISClient\Configuration();
             $this->apiConfig->setHost("{$this->baseUrl}/api/{$this->apiVersion}");
 
-            // Module endpoints (/instrument_manager/*)
             $this->moduleConfig = new \LORISClient\Configuration();
             $this->moduleConfig->setHost($this->baseUrl);
 
             $this->hasApiClient = true;
             $this->logger->info("loris-php-api-client initialized ✓");
-        } catch (\Error $e) {
-            $this->hasApiClient = false;
-            $this->logger->warning("API client init error: " . $e->getMessage());
-        } catch (\Exception $e) {
+        } catch (\Error|\Exception $e) {
             $this->hasApiClient = false;
             $this->logger->warning("API client init failed: " . $e->getMessage());
         }
@@ -129,15 +123,10 @@ class ClinicalClient
      * Register missing model classes for loris-php-api-client.
      *
      * The OpenAPI schema uses inline response objects for 200/201 responses,
-     * which causes the generator to reference auto-named classes like
-     * "UploadInstrumentData201Response" that it never actually creates.
-     *
-     * This registers stub classes so the API client can deserialize
-     * responses without crashing. Lives in pipeline code so it
-     * survives client regeneration via ./generate.sh.
-     *
-     * If the real classes are eventually generated, class_exists()
-     * returns true and these stubs are skipped automatically.
+     * which causes the generator to reference auto-named classes that it
+     * never actually creates. This registers stub classes so the API client
+     * can deserialize responses without crashing. Lives in pipeline code so
+     * it survives client regeneration via ./generate.sh.
      */
     private function registerMissingModels(): void
     {
@@ -156,89 +145,47 @@ namespace LORISClient\Model;
 
 class {$shortName} implements \ArrayAccess, \JsonSerializable {
     public const DISCRIMINATOR = null;
-
     protected static string \$openAPIModelName = '{$shortName}';
-
-    protected static array \$openAPITypes = [
-        'success'   => 'bool',
-        'message'   => 'string',
-        'ok'        => 'string',
-        'idMapping' => 'object',
-    ];
-
-    protected static array \$openAPIFormats = [
-        'success'   => null,
-        'message'   => null,
-        'ok'        => null,
-        'idMapping' => null,
-    ];
-
-    protected static array \$openAPINullables = [
-        'success'   => false,
-        'message'   => false,
-        'ok'        => false,
-        'idMapping' => false,
-    ];
-
-    protected static array \$attributeMap = [
-        'success'   => 'success',
-        'message'   => 'message',
-        'ok'        => 'ok',
-        'idMapping' => 'idMapping',
-    ];
-
-    protected static array \$setters = [
-        'success'   => 'setSuccess',
-        'message'   => 'setMessage',
-        'ok'        => 'setOk',
-        'idMapping' => 'setIdMapping',
-    ];
-
-    protected static array \$getters = [
-        'success'   => 'getSuccess',
-        'message'   => 'getMessage',
-        'ok'        => 'getOk',
-        'idMapping' => 'getIdMapping',
-    ];
-
+    protected static array \$openAPITypes = ['success'=>'bool','message'=>'string','ok'=>'string','idMapping'=>'object'];
+    protected static array \$openAPIFormats = ['success'=>null,'message'=>null,'ok'=>null,'idMapping'=>null];
+    protected static array \$openAPINullables = ['success'=>false,'message'=>false,'ok'=>false,'idMapping'=>false];
+    protected static array \$attributeMap = ['success'=>'success','message'=>'message','ok'=>'ok','idMapping'=>'idMapping'];
+    protected static array \$setters = ['success'=>'setSuccess','message'=>'setMessage','ok'=>'setOk','idMapping'=>'setIdMapping'];
+    protected static array \$getters = ['success'=>'getSuccess','message'=>'getMessage','ok'=>'getOk','idMapping'=>'getIdMapping'];
     protected array \$container = [];
     protected array \$openAPINullablesSetToNull = [];
 
     public function __construct(?array \$data = null) {
-        \$this->container['success']   = \$data['success'] ?? null;
-        \$this->container['message']   = \$data['message'] ?? null;
-        \$this->container['ok']        = \$data['ok'] ?? null;
-        \$this->container['idMapping'] = \$data['idMapping'] ?? null;
+        \$this->container['success']=\$data['success']??null;
+        \$this->container['message']=\$data['message']??null;
+        \$this->container['ok']=\$data['ok']??null;
+        \$this->container['idMapping']=\$data['idMapping']??null;
     }
 
     public static function openAPITypes(): array { return static::\$openAPITypes; }
     public static function openAPIFormats(): array { return static::\$openAPIFormats; }
     public static function openAPINullables(): array { return static::\$openAPINullables; }
+    public static function isNullable(string \$p): bool { return static::\$openAPINullables[\$p] ?? false; }
+    public function isNullableSetToNull(string \$p): bool { return in_array(\$p, \$this->openAPINullablesSetToNull, true); }
     public static function attributeMap(): array { return static::\$attributeMap; }
     public static function setters(): array { return static::\$setters; }
     public static function getters(): array { return static::\$getters; }
-    public static function isNullable(string \$property): bool { return static::\$openAPINullables[\$property] ?? false; }
-    public function isNullableSetToNull(string \$property): bool { return in_array(\$property, \$this->openAPINullablesSetToNull, true); }
     public function getModelName(): string { return static::\$openAPIModelName; }
     public function listInvalidProperties(): array { return []; }
     public function valid(): bool { return true; }
-
     public function getSuccess(): ?bool { return \$this->container['success']; }
-    public function setSuccess(?bool \$val): static { \$this->container['success'] = \$val; return \$this; }
+    public function setSuccess(?bool \$v): static { \$this->container['success']=\$v; return \$this; }
     public function getMessage(): ?string { return \$this->container['message']; }
-    public function setMessage(?string \$val): static { \$this->container['message'] = \$val; return \$this; }
+    public function setMessage(?string \$v): static { \$this->container['message']=\$v; return \$this; }
     public function getOk(): ?string { return \$this->container['ok']; }
-    public function setOk(?string \$val): static { \$this->container['ok'] = \$val; return \$this; }
+    public function setOk(?string \$v): static { \$this->container['ok']=\$v; return \$this; }
     public function getIdMapping(): mixed { return \$this->container['idMapping']; }
-    public function setIdMapping(mixed \$val): static { \$this->container['idMapping'] = \$val; return \$this; }
-
-    public function offsetExists(mixed \$offset): bool { return isset(\$this->container[\$offset]); }
-    public function offsetGet(mixed \$offset): mixed { return \$this->container[\$offset] ?? null; }
-    public function offsetSet(mixed \$offset, mixed \$value): void { if (\$offset !== null) { \$this->container[\$offset] = \$value; } }
-    public function offsetUnset(mixed \$offset): void { unset(\$this->container[\$offset]); }
-
+    public function setIdMapping(mixed \$v): static { \$this->container['idMapping']=\$v; return \$this; }
+    public function offsetExists(mixed \$o): bool { return isset(\$this->container[\$o]); }
+    public function offsetGet(mixed \$o): mixed { return \$this->container[\$o] ?? null; }
+    public function offsetSet(mixed \$o, mixed \$v): void { if(\$o!==null) \$this->container[\$o]=\$v; }
+    public function offsetUnset(mixed \$o): void { unset(\$this->container[\$o]); }
     public function jsonSerialize(): mixed { return \$this->container; }
-
     public function __toString(): string { return json_encode(\$this->container, JSON_PRETTY_PRINT) ?: ''; }
 }
 PHPCODE;
@@ -251,42 +198,22 @@ PHPCODE;
     // AUTHENTICATION  (API → HTTP)
     // ──────────────────────────────────────────────────────────────────
 
-    /**
-     * Authenticate with LORIS and obtain a JWT token.
-     * Uses stored username/password from constructor.
-     *
-     * @return string  The JWT token
-     * @throws \RuntimeException  If all auth methods fail
-     */
     public function authenticate(): string
     {
         $this->logger->info("Authenticating with LORIS at {$this->baseUrl}");
 
-        // --- Priority 1: API client ---
         if ($this->hasApiClient) {
             try {
-                $this->logger->debug("  Trying API client (AuthenticationApi)...");
-
                 foreach ($this->apiVersions as $version) {
-                    $apiHost = "{$this->baseUrl}/api/{$version}";
                     $this->logger->info("  Trying API version: {$version}");
-
                     try {
-                        // Use new Configuration() — NOT singleton (avoids shared state bug)
                         $this->apiConfig = new \LORISClient\Configuration();
-                        $this->apiConfig->setHost($apiHost);
+                        $this->apiConfig->setHost("{$this->baseUrl}/api/{$version}");
 
-                        $authApi = new \LORISClient\Api\AuthenticationApi(
-                            $this->httpClient,
-                            $this->apiConfig
-                        );
-
-                        $loginRequest = new \LORISClient\Model\LoginRequest([
-                            'username' => $this->username,
-                            'password' => $this->password,
-                        ]);
-
-                        $response    = $authApi->login($loginRequest);
+                        $authApi  = new \LORISClient\Api\AuthenticationApi($this->httpClient, $this->apiConfig);
+                        $response = $authApi->login(new \LORISClient\Model\LoginRequest([
+                            'username' => $this->username, 'password' => $this->password,
+                        ]));
                         $this->token = $response->getToken();
 
                         if (!empty($this->token)) {
@@ -297,101 +224,51 @@ PHPCODE;
                             $this->logger->info("  ✓ Authenticated via API client (version: {$version})");
                             return $this->token;
                         }
-
-                        $this->logger->warning("    ✗ Empty token for version {$version}");
                     } catch (\Exception $e) {
                         $this->logger->warning("    ✗ API auth failed ({$version}): " . $e->getMessage());
                     }
                 }
-
                 $this->logger->info("  API client auth exhausted — falling back to HTTP...");
-            } catch (\Error $e) {
+            } catch (\Error|\Exception $e) {
                 $this->logger->warning("  API auth error: " . $e->getMessage());
-            } catch (\Exception $e) {
-                $this->logger->warning("  API client error: " . $e->getMessage());
             }
         }
 
-        // --- Priority 2: Direct HTTP fallback (Guzzle) ---
         return $this->authenticateHttp();
     }
 
-    /**
-     * HTTP fallback for authentication — tries each API version.
-     *
-     * @return string  The JWT token
-     * @throws \RuntimeException  If all versions fail
-     */
     private function authenticateHttp(): string
     {
         $lastError = '';
-
         foreach ($this->apiVersions as $version) {
             $url = "{$this->baseUrl}/api/{$version}/login";
-
             try {
-                $this->logger->debug("  HTTP POST {$url}");
-
                 $response = $this->httpClient->request('POST', $url, [
-                    'json' => [
-                        'username' => $this->username,
-                        'password' => $this->password,
-                    ],
+                    'json' => ['username' => $this->username, 'password' => $this->password],
                     'http_errors' => false,
                 ]);
-
-                $statusCode = $response->getStatusCode();
-                $rawBody    = (string) $response->getBody();
-
-                $this->logger->debug("  Response status: {$statusCode}");
-
-                if ($statusCode !== 200) {
-                    $lastError = "HTTP {$statusCode}";
-                    $this->logger->warning("  HTTP login returned {$statusCode}");
+                if ($response->getStatusCode() !== 200) {
+                    $lastError = "HTTP {$response->getStatusCode()}";
                     continue;
                 }
-
-                $data = json_decode($rawBody, true);
-                if (json_last_error() !== JSON_ERROR_NONE) {
-                    $lastError = json_last_error_msg();
-                    $this->logger->warning("  Invalid JSON: {$lastError}");
-                    continue;
-                }
-
+                $data = json_decode((string) $response->getBody(), true);
                 $this->token = $data['token'] ?? null;
-
                 if (!empty($this->token)) {
                     $this->activeVersion = $version;
                     $this->tokenExpiry   = time() + ($this->tokenExpiryMinutes * 60);
-
-                    // Also set on API configs if available
-                    if ($this->hasApiClient) {
-                        if ($this->apiConfig !== null) {
-                            $this->apiConfig->setAccessToken($this->token);
-                        }
-                        if ($this->moduleConfig !== null) {
-                            $this->moduleConfig->setAccessToken($this->token);
-                        }
-                    }
-
+                    $this->apiConfig?->setAccessToken($this->token);
+                    $this->moduleConfig?->setAccessToken($this->token);
                     $this->logger->info("  ✓ Authenticated via HTTP (version: {$version})");
                     return $this->token;
                 }
-
                 $lastError = "No token in response";
-                $this->logger->warning("  No token in HTTP response");
             } catch (\Exception $e) {
                 $lastError = $e->getMessage();
-                $this->logger->warning("  HTTP auth error ({$version}): {$lastError}");
             }
         }
-
         throw new \RuntimeException("All authentication methods failed. Last error: {$lastError}");
     }
 
-    /**
-     * Refresh token if close to expiry.
-     */
     public function refreshTokenIfNeeded(): void
     {
         if ($this->tokenExpiry !== null && time() >= ($this->tokenExpiry - 60)) {
@@ -401,28 +278,232 @@ PHPCODE;
     }
 
     // ──────────────────────────────────────────────────────────────────
-    // INSTRUMENT MANAGER  (API → HTTP)
-    // Uses MODULE config: host = {baseUrl}
+    // FORMAT DETECTION & COLUMN VALIDATION HELPERS
     // ──────────────────────────────────────────────────────────────────
 
     /**
-     * Upload instrument data CSV (single instrument).
+     * Detect instrument type from DD file extension.
      *
-     * @param string $instrument     Instrument name
-     * @param string $csvFilePath    Path to CSV file
-     * @param string $action         CREATE_SESSIONS or VALIDATE_SESSIONS
-     * @return array  [success => bool, message => string, idMapping => [...], method => string]
+     * im3: Client sends instrument_type field. This auto-detects the value.
+     *
+     * @param string $filePath  Path to DD file
+     * @return string  bids, linst, or redcap
+     * @throws \RuntimeException if extension not recognized
      */
-    public function uploadInstrumentData(
-        string $instrument,
+    public function detectInstrumentType(string $filePath): string
+    {
+        $ext = strtolower(pathinfo($filePath, PATHINFO_EXTENSION));
+
+        if (!isset(self::DD_TYPE_MAP[$ext])) {
+            throw new \RuntimeException(
+                "Unknown instrument type: " . basename($filePath)
+                . " (extension .{$ext} not in DD_TYPE_MAP)"
+            );
+        }
+
+        return self::DD_TYPE_MAP[$ext];
+    }
+
+    /**
+     * Detect data format from file content and extension.
+     *
+     * im3: Client sends format field. This auto-detects the value.
+     *   .tsv extension             → BIDS_TSV
+     *   CSV with redcap_event_name → REDCAP_CSV
+     *   otherwise                  → LORIS_CSV
+     *
+     * @param string $filePath  Path to data file
+     * @return string  BIDS_TSV, REDCAP_CSV, or LORIS_CSV
+     */
+    public function detectDataFormat(string $filePath): string
+    {
+        $ext = strtolower(pathinfo($filePath, PATHINFO_EXTENSION));
+
+        if ($ext === 'tsv') {
+            return 'BIDS_TSV';
+        }
+
+        if ($this->isRedcapCSV($filePath)) {
+            return 'REDCAP_CSV';
+        }
+
+        return 'LORIS_CSV';
+    }
+
+    /**
+     * Check if a CSV file is REDCap format (has redcap_event_name column).
+     *
+     * im3: Used by detectDataFormat() for auto-detection.
+     * Also available directly for pipeline informational logging.
+     */
+    public function isRedcapCSV(string $csvFilePath): bool
+    {
+        $fh = fopen($csvFilePath, 'r');
+        if ($fh === false) {
+            return false;
+        }
+        $headerLine = fgets($fh);
+        fclose($fh);
+
+        if ($headerLine !== false) {
+            $columns = array_map('trim', str_getcsv(trim($headerLine)));
+            return in_array('redcap_event_name', $columns, true);
+        }
+
+        return false;
+    }
+
+    /**
+     * Pre-flight column validation against LORIS expected template.
+     *
+     * im3: Detects format from file, requests matching template with format param,
+     * and uses correct delimiter (tab for TSV, comma for CSV).
+     *
+     * @return array{valid: bool, missing_essential: string[], missing_nonessential: string[], extra: string[], warnings: string[]}
+     */
+    public function validateColumns(
         string $csvFilePath,
+        string $instrument,
         string $action = 'CREATE_SESSIONS'
     ): array {
-        // Auto-detect format: .tsv = BIDS_TSV, all others = LORIS_CSV
-        $ext    = strtolower(pathinfo($csvFilePath, PATHINFO_EXTENSION));
-        $format = ($ext === 'tsv') ? 'BIDS_TSV' : 'LORIS_CSV';
+        $result = [
+            'valid' => true, 'missing_essential' => [], 'missing_nonessential' => [],
+            'extra' => [], 'warnings' => [],
+        ];
 
-        $this->logger->info("  Uploading {$instrument} data ({$action}, {$format})");
+        // im3: Detect format to request matching template
+        $format = $this->detectDataFormat($csvFilePath);
+
+        $expectedCsv = $this->getInstrumentDataHeaders($instrument, $action, $format);
+        if ($expectedCsv === null) {
+            $result['warnings'][] = "Could not fetch expected headers for {$instrument} — skipping column validation";
+            return $result;
+        }
+
+        // im3: Use correct delimiter based on format
+        $delimiter = ($format === 'BIDS_TSV') ? "\t" : ',';
+
+        $expectedHeaders = array_map('trim', str_getcsv(trim($expectedCsv), $delimiter));
+
+        $fh = fopen($csvFilePath, 'r');
+        if ($fh === false) {
+            $result['valid'] = false;
+            $result['warnings'][] = "Could not open {$csvFilePath}";
+            return $result;
+        }
+        $headerLine = fgets($fh);
+        fclose($fh);
+
+        if ($headerLine === false) {
+            $result['valid'] = false;
+            $result['warnings'][] = "Empty file: {$csvFilePath}";
+            return $result;
+        }
+
+        // im3: Parse with format-appropriate delimiter
+        $actualHeaders = array_map('trim', str_getcsv(trim($headerLine), $delimiter));
+
+        // Essential columns: only the structural/identifier columns that LORIS
+        // requires to locate or create the correct candidate/session/instrument.
+        // All instrument data fields are optional — LORIS accepts any subset.
+        $essentialColumns = [
+            // Candidate identifiers
+            'study_id', 'StudyID', 'PSCID', 'CandID', 'candid',
+            // Session identifiers
+            'visit_label', 'Visit_label',
+            // Demographics (needed for CREATE_SESSIONS)
+            'dob', 'DoB', 'sex', 'Sex',
+            // Site/project/cohort
+            'project', 'Project', 'site', 'Site', 'cohort', 'Cohort',
+            // REDCap structural
+            'redcap_event_name', 'redcap_repeat_instrument', 'redcap_repeat_instance',
+            // BIDS structural
+            'participant_id', 'session_id',
+        ];
+
+        $missingFromFile = array_diff($expectedHeaders, $actualHeaders);
+        $extraInFile     = array_diff($actualHeaders, $expectedHeaders);
+
+        foreach ($missingFromFile as $col) {
+            if (in_array($col, $essentialColumns, true)) {
+                $result['missing_essential'][] = $col;
+            } else {
+                $result['missing_nonessential'][] = $col;
+            }
+        }
+
+        // Known extra columns from REDCap exports — not flagged
+        $knownExtraColumns = [
+            'redcap_event_name', 'redcap_repeat_instrument',
+            'redcap_repeat_instance', 'redcap_data_access_group',
+        ];
+        foreach ($extraInFile as $col) {
+            if (in_array($col, $knownExtraColumns, true) || str_ends_with($col, '_complete')) {
+                continue;
+            }
+            $result['extra'][] = $col;
+        }
+
+        if (!empty($result['missing_essential'])) {
+            $result['valid'] = false;
+        }
+
+        return $result;
+    }
+
+    // ──────────────────────────────────────────────────────────────────
+    // INSTRUMENT DATA UPLOAD  (API → HTTP)
+    // ──────────────────────────────────────────────────────────────────
+
+    /**
+     * Upload instrument data (single instrument).
+     *
+     * im3: Sends action, format, strict, instrument, data_file.
+     * Format is auto-detected via detectDataFormat().
+     * Pipeline always sends strict=false.
+     *
+     * @param string $instrument  Instrument name
+     * @param string $csvFilePath Path to CSV/TSV file
+     * @param string $action      CREATE_SESSIONS or VALIDATE_SESSIONS
+     * @param bool   $strict      true=all columns required, false=non-essential may be missing
+     * @return array  [success, message, idMapping, method]
+     */
+    public function uploadInstrumentData(
+        string      $instrument,
+        string      $csvFilePath,
+        string      $action = 'CREATE_SESSIONS',
+        string|bool $strict = false
+    ): array {
+        // Normalize: accept bool or string ('true'/'false') for backward compat
+        if (is_string($strict)) {
+            $strict = ($strict === 'true');
+        }
+        $format   = $this->detectDataFormat($csvFilePath);
+        $isRedcap = ($format === 'REDCAP_CSV');
+
+        $this->logger->info("  Uploading {$instrument} data ({$action}, format={$format}, strict=" . ($strict ? 'true' : 'false') . ")");
+
+        // Pre-flight column validation
+        try {
+            $validation = $this->validateColumns($csvFilePath, $instrument, $action);
+            if (!$validation['valid']) {
+                $this->logger->error("    ✗ [{$instrument}] Missing REQUIRED columns: " . implode(', ', $validation['missing_essential']));
+                return [
+                    'success' => false,
+                    'message' => "Missing required columns for {$instrument}: "
+                        . implode(', ', $validation['missing_essential']),
+                    'idMapping' => [],
+                    'method'    => 'PREFLIGHT',
+                ];
+            }
+            if (!empty($validation['missing_nonessential'])) {
+                $this->logger->warning("    ⚠ [{$instrument}] Missing optional columns (" . count($validation['missing_nonessential']) . "): "
+                    . implode(', ', array_slice($validation['missing_nonessential'], 0, 10))
+                    . (count($validation['missing_nonessential']) > 10 ? ' …' : ''));
+            }
+        } catch (\Exception $e) {
+            $this->logger->debug("    Pre-flight validation skipped: " . $e->getMessage());
+        }
 
         $startTime = microtime(true);
 
@@ -431,27 +512,24 @@ PHPCODE;
             try {
                 $this->logger->debug("    Trying API client (InstrumentManagerApi)...");
 
-                $api = new \LORISClient\Api\InstrumentManagerApi(
-                    $this->httpClient,
-                    $this->moduleConfig
-                );
-
+                $api     = new \LORISClient\Api\InstrumentManagerApi($this->httpClient, $this->moduleConfig);
                 $fileObj = new SplFileObject($csvFilePath, 'r');
 
-                // Signature: uploadInstrumentData($action, $format, $data_file, $instrument?, $multi_instrument?)
+                // im3 Generated signature (from schema required-first order):
+                //   uploadInstrumentData($action, $format, $data_file, $strict?, $instrument?, $multi_instrument?)
                 $result = $api->uploadInstrumentData(
-                    $action,        // action: CREATE_SESSIONS or VALIDATE_SESSIONS
-                    $format,        // format: LORIS_CSV or BIDS_TSV (auto-detected)
-                    $fileObj,       // data_file
-                    $instrument,    // instrument name
-                    null            // multi_instrument
+                    $action,                        // action (required)
+                    $format,                        // format (required)
+                    $fileObj,                       // data_file (required)
+                    $strict ? 'true' : 'false',     // strict (optional)
+                    $instrument,                    // instrument (optional)
+                    null                            // multi_instrument (optional)
                 );
 
                 $elapsed = round(microtime(true) - $startTime, 2);
                 $this->logger->info("    Upload completed in {$elapsed}s");
 
-                // Parse result — handle both SuccessResponse and array
-                $parsed = $this->parseApiUploadResult($result);
+                $parsed           = $this->parseApiUploadResult($result);
                 $parsed['method'] = 'API';
 
                 if ($parsed['success']) {
@@ -472,85 +550,96 @@ PHPCODE;
         }
 
         // --- Priority 2: Direct HTTP fallback ---
-        return $this->uploadInstrumentDataHttp($instrument, $csvFilePath, $action, $format);
+        return $this->uploadInstrumentDataHttp($instrument, $csvFilePath, $action, $format, $strict);
     }
 
     /**
-     * Upload a single CSV with data for multiple instruments (multi-instrument mode).
+     * Upload multi-instrument data from a single CSV.
      *
-     * instrument_manager/instrument_data supports multi-instrument upload:
-     *   POST with multi-instrument=JSON + data_file
-     *   where JSON = [{"value":"form1"},{"value":"form2"},...]
-     *
-     * The CSV columns are matched to instruments by LORIS's
-     * InstrumentDataParser::parseMultiple(). LORIS routes each column
-     * to the correct instrument — no client-side data splitting needed.
-     *
-     * This is the preferred method for monolithic REDCap data exports
-     * where all instruments/forms are in a single CSV file.
-     *
-     * @param string[] $instrumentNames  List of instrument names present in the CSV
-     * @param string   $csvFilePath      Path to the CSV file containing all instrument data
-     * @param string   $action           CREATE_SESSIONS or VALIDATE_SESSIONS
-     * @param string   $format           LORIS_CSV (default) or BIDS_TSV
-     *
-     * @return array{success: bool, message: string|array, idMapping?: array, method: string}
+     * im3: Sends action, format, strict, multi-instrument (JSON), data_file.
      */
     public function uploadMultiInstrumentData(
-        array  $instrumentNames,
-        string $csvFilePath,
-        string $action = 'CREATE_SESSIONS',
-        string $format = 'LORIS_CSV'
+        array       $instrumentNames,
+        string      $csvFilePath,
+        string      $action = 'CREATE_SESSIONS',
+        string|bool $strict = false
     ): array {
-        $count = count($instrumentNames);
-        $this->logger->info("  Uploading multi-instrument data ({$count} instruments)");
+        // Normalize: accept bool or string ('true'/'false') for backward compat with pipeline callers
+        if (is_string($strict)) {
+            $strict = ($strict === 'true');
+        }
+        $count  = count($instrumentNames);
+        $format = $this->detectDataFormat($csvFilePath);
 
-        // Build the multi-instrument JSON in the format LORIS expects:
-        // [{"value":"form1"},{"value":"form2"},...]
-        // See: instrumentManagerIndex.js → uploadMultiInstrumentData()
-        //      instrument_data.class.inc → line 243-249
+        $this->logger->info("  Uploading multi-instrument data ({$count} instruments, format={$format}, strict=" . ($strict ? 'true' : 'false') . ")");
+
+        // Pre-flight column validation per instrument
+        foreach ($instrumentNames as $instName) {
+            try {
+                $validation = $this->validateColumns($csvFilePath, $instName, $action);
+                if (!$validation['valid']) {
+                    $this->logger->error("    ✗ [{$instName}] Missing REQUIRED columns: " . implode(', ', $validation['missing_essential']));
+                }
+                if (!empty($validation['missing_nonessential'])) {
+                    $this->logger->warning("    ⚠ [{$instName}] Missing optional columns (" . count($validation['missing_nonessential']) . "): "
+                        . implode(', ', array_slice($validation['missing_nonessential'], 0, 10))
+                        . (count($validation['missing_nonessential']) > 10 ? ' …' : ''));
+                }
+            } catch (\Exception $e) {
+                $this->logger->debug("    Pre-flight validation skipped for {$instName}: " . $e->getMessage());
+            }
+        }
+
         $multiJson = json_encode(
-            array_map(
-                fn(string $name) => ['value' => $name],
-                $instrumentNames
-            )
+            array_map(fn(string $name) => ['value' => $name], $instrumentNames)
         );
 
-        // --- Priority 1: API client ---
+        // --- Priority 1: API client config (direct HTTP with correct field name) ---
+        // The generated API client sends 'multi_instrument' (underscore) but LORIS
+        // expects 'multi-instrument' (hyphen). We use the API client's authenticated
+        // config but build the multipart request ourselves with the correct field name.
         if ($this->hasApiClient && $this->moduleConfig !== null) {
             try {
-                $this->logger->debug("    Trying API client (multi-instrument)...");
-
-                $api = new \LORISClient\Api\InstrumentManagerApi(
-                    $this->httpClient,
-                    $this->moduleConfig
-                );
-
-                $fileObj = new SplFileObject($csvFilePath, 'r');
+                $this->logger->debug("    Trying API path (multi-instrument)...");
 
                 $startTime = microtime(true);
+                $url = $this->moduleConfig->getHost() . '/instrument_manager/instrument_data';
 
-                // Signature: uploadInstrumentData($action, $format, $data_file, $instrument?, $multi_instrument?)
-                $result = $api->uploadInstrumentData(
-                    $action,
-                    $format,
-                    $fileObj,
-                    null,          // instrument: null for multi
-                    $multiJson     // multi-instrument: JSON string
-                );
+                $response = $this->httpClient->request('POST', $url, [
+                    'headers'   => ['Authorization' => 'Bearer ' . $this->moduleConfig->getAccessToken()],
+                    'multipart' => [
+                        ['name' => 'action',           'contents' => $action],
+                        ['name' => 'format',           'contents' => $format],
+                        ['name' => 'strict',           'contents' => $strict ? 'true' : 'false'],
+                        ['name' => 'multi-instrument', 'contents' => $multiJson],
+                        [
+                            'name'     => 'data_file',
+                            'contents' => fopen($csvFilePath, 'r'),
+                            'filename' => basename($csvFilePath),
+                        ],
+                    ],
+                    'http_errors' => false,
+                ]);
 
-                $elapsed = round(microtime(true) - $startTime, 2);
+                $elapsed    = round(microtime(true) - $startTime, 2);
+                $statusCode = $response->getStatusCode();
+                $data       = json_decode((string) $response->getBody(), true) ?? [];
 
-                $parsed = $this->parseApiUploadResult($result);
-                $parsed['method'] = 'API';
-
-                if ($parsed['success']) {
-                    $this->logger->info("    ✓ Multi-instrument upload successful via API ({$elapsed}s)");
-                    $this->logIdMapping($parsed);
+                if ($statusCode >= 200 && $statusCode < 300) {
+                    $parsed = [
+                        'success'   => $data['success'] ?? true,
+                        'message'   => $data['message'] ?? 'OK',
+                        'idMapping' => $data['idMapping'] ?? [],
+                        'method'    => 'API',
+                    ];
+                    if ($parsed['success']) {
+                        $this->logger->info("    ✓ Multi-instrument upload successful via API ({$elapsed}s)");
+                        $this->logIdMapping($parsed);
+                    }
                     return $parsed;
                 }
 
-                $this->logger->warning("    API multi-instrument upload returned failure");
+                $this->logger->warning("    API multi-instrument returned HTTP {$statusCode}");
             } catch (\Error $e) {
                 $this->logger->warning("    API multi-instrument error: " . $e->getMessage());
                 $this->logger->info("    Falling back to HTTP...");
@@ -562,37 +651,33 @@ PHPCODE;
 
         // --- Priority 2: Direct HTTP fallback ---
         return $this->uploadMultiInstrumentDataHttp(
-            $instrumentNames,
-            $csvFilePath,
-            $action,
-            $format,
-            $multiJson
+            $instrumentNames, $csvFilePath, $action, $multiJson, $format, $strict
         );
     }
 
     /**
-     * HTTP fallback for instrument data upload (single instrument).
+     * HTTP fallback for single-instrument data upload.
+     * im3: Sends action, format, strict, instrument, data_file.
      */
     private function uploadInstrumentDataHttp(
         string $instrument,
         string $csvFilePath,
         string $action,
-        string $format = 'LORIS_CSV'
+        string $format,
+        bool   $strict
     ): array {
         $url = "{$this->baseUrl}/instrument_manager/instrument_data";
 
         try {
             $this->logger->debug("    HTTP POST {$url}");
-
             $startTime = microtime(true);
 
             $response = $this->httpClient->request('POST', $url, [
-                'headers' => [
-                    'Authorization' => "Bearer {$this->token}",
-                ],
+                'headers'   => ['Authorization' => "Bearer {$this->token}"],
                 'multipart' => [
                     ['name' => 'action',     'contents' => $action],
                     ['name' => 'format',     'contents' => $format],
+                    ['name' => 'strict',     'contents' => $strict ? 'true' : 'false'],
                     ['name' => 'instrument', 'contents' => $instrument],
                     [
                         'name'     => 'data_file',
@@ -606,11 +691,9 @@ PHPCODE;
             $elapsed    = round(microtime(true) - $startTime, 2);
             $statusCode = $response->getStatusCode();
             $rawBody    = (string) $response->getBody();
+            $data       = json_decode($rawBody, true) ?? [];
 
-            $this->logger->debug("    Response status: {$statusCode}");
-            $this->logger->info("    Upload completed in {$elapsed}s");
-
-            $data = json_decode($rawBody, true) ?? [];
+            $this->logger->info("    Upload completed in {$elapsed}s (HTTP {$statusCode})");
 
             if ($statusCode >= 200 && $statusCode < 300) {
                 $result = [
@@ -626,76 +709,51 @@ PHPCODE;
             }
 
             return [
-                'success' => false,
-                'message' => $data['error'] ?? "HTTP {$statusCode}",
-                'idMapping' => [],
-                'method' => 'HTTP',
+                'success' => false, 'message' => $data['error'] ?? "HTTP {$statusCode}",
+                'idMapping' => [], 'method' => 'HTTP',
             ];
         } catch (\Exception $e) {
             $this->logger->error("    ✗ HTTP upload failed: " . $e->getMessage());
-            return [
-                'success' => false,
-                'message' => $e->getMessage(),
-                'idMapping' => [],
-                'method' => 'HTTP',
-            ];
+            return ['success' => false, 'message' => $e->getMessage(), 'idMapping' => [], 'method' => 'HTTP'];
         }
     }
 
     /**
      * HTTP fallback for multi-instrument data upload.
      *
-     * Sends:
-     *   action           = CREATE_SESSIONS | VALIDATE_SESSIONS
-     *   format           = LORIS_CSV | BIDS_TSV
-     *   multi-instrument = JSON [{"value":"form1"},{"value":"form2"},...]
-     *   data_file        = CSV file
-     *
-     * Note: The form field name is literally "multi-instrument" with a hyphen
-     * (not camelCase). This matches instrumentManagerIndex.js line 268 and
-     * instrument_data.class.inc line 241.
-     *
-     * @param string[] $instrumentNames  Instrument names
-     * @param string   $csvFilePath      Path to CSV
-     * @param string   $action           CREATE_SESSIONS or VALIDATE_SESSIONS
-     * @param string   $format           LORIS_CSV or BIDS_TSV
-     * @param string   $multiJson        Pre-built JSON string (optional, built from instrumentNames if null)
-     *
-     * @return array{success: bool, message: string|array, idMapping?: array, method: string}
+     * im3: Sends action, format, strict, multi-instrument (JSON), data_file.
+     * Form field name is "multi-instrument" (with hyphen) matching
+     * instrumentManagerIndex.js and instrument_data.class.inc.
      */
     private function uploadMultiInstrumentDataHttp(
-        array  $instrumentNames,
-        string $csvFilePath,
-        string $action,
-        string $format,
-        ?string $multiJson = null
+        array   $instrumentNames,
+        string  $csvFilePath,
+        string  $action,
+        ?string $multiJson = null,
+        string  $format = 'LORIS_CSV',
+        bool    $strict = false
     ): array {
         $url = "{$this->baseUrl}/instrument_manager/instrument_data";
 
         if ($multiJson === null) {
             $multiJson = json_encode(
-                array_map(
-                    fn(string $name) => ['value' => $name],
-                    $instrumentNames
-                )
+                array_map(fn(string $name) => ['value' => $name], $instrumentNames)
             );
         }
 
         try {
             $this->refreshTokenIfNeeded();
-
             $this->logger->debug("    HTTP POST {$url} (multi-instrument)");
             $this->logger->debug("    Instruments: " . implode(', ', $instrumentNames));
 
             $startTime = microtime(true);
 
             $response = $this->httpClient->request('POST', $url, [
-                'headers' => [
-                    'Authorization' => "Bearer {$this->token}",
-                ],
+                'headers'   => ['Authorization' => "Bearer {$this->token}"],
                 'multipart' => [
                     ['name' => 'action',           'contents' => $action],
                     ['name' => 'format',           'contents' => $format],
+                    ['name' => 'strict',           'contents' => $strict ? 'true' : 'false'],
                     ['name' => 'multi-instrument', 'contents' => $multiJson],
                     [
                         'name'     => 'data_file',
@@ -709,10 +767,9 @@ PHPCODE;
             $elapsed    = round(microtime(true) - $startTime, 2);
             $statusCode = $response->getStatusCode();
             $rawBody    = (string) $response->getBody();
+            $data       = json_decode($rawBody, true) ?? [];
 
             $this->logger->debug("    Response: HTTP {$statusCode} ({$elapsed}s)");
-
-            $data = json_decode($rawBody, true) ?? [];
 
             if ($statusCode >= 200 && $statusCode < 300) {
                 $result = [
@@ -721,90 +778,72 @@ PHPCODE;
                     'idMapping' => $data['idMapping'] ?? [],
                     'method'    => 'HTTP',
                 ];
-
                 if ($result['success']) {
                     $this->logger->info("    ✓ Multi-instrument upload successful via HTTP ({$elapsed}s)");
                     $this->logIdMapping($result);
                 }
-
                 return $result;
             }
 
             $errMsg = $data['error'] ?? $data['message'] ?? "HTTP {$statusCode}";
             $this->logger->error("    ✗ Multi-instrument upload failed: HTTP {$statusCode}");
-            return [
-                'success'   => false,
-                'message'   => $errMsg,
-                'idMapping' => [],
-                'method'    => 'HTTP',
-            ];
+            return ['success' => false, 'message' => $errMsg, 'idMapping' => [], 'method' => 'HTTP'];
 
         } catch (\Exception $e) {
             $this->logger->error("    ✗ Multi-instrument HTTP upload failed: " . $e->getMessage());
-            return [
-                'success'   => false,
-                'message'   => $e->getMessage(),
-                'idMapping' => [],
-                'method'    => 'HTTP',
-            ];
+            return ['success' => false, 'message' => $e->getMessage(), 'idMapping' => [], 'method' => 'HTTP'];
         }
     }
 
+    // ──────────────────────────────────────────────────────────────────
+    // INSTRUMENT INSTALL  (API → HTTP)
+    // ──────────────────────────────────────────────────────────────────
+
     /**
-     * Install an instrument from a .linst file or REDCap data dictionary CSV.
+     * Install an instrument definition file.
      *
-     * @param string $filePath  Path to .linst or REDCap .csv
-     * @return array [success => bool, message => string, method => string]
+     * im3: Sends install_file + instrument_type field.
+     * Client auto-detects from extension via DD_TYPE_MAP:
+     *   .csv  → redcap
+     *   .linst → linst
+     *   .json → bids
+     *
+     * @param string $filePath  Path to .linst, .csv (REDCap DD), or .json (BIDS)
+     * @return array [success, message, method]
      */
     public function installInstrument(string $filePath): array
     {
         $filename = basename($filePath);
-        $this->logger->info("  Installing instrument from: {$filename}");
+        $instrumentType = $this->detectInstrumentType($filePath);
 
-        // Detect instrument type from file extension
-        // Schema accepts: 'bids', 'linst', or 'redcap'
-        $ext = strtolower(pathinfo($filePath, PATHINFO_EXTENSION));
-        $instrumentType = ($ext === 'linst') ? 'linst' : 'redcap';
+        $this->logger->info("  Installing instrument from: {$filename} (type={$instrumentType})");
 
         // --- Priority 1: API client ---
         if ($this->hasApiClient && $this->moduleConfig !== null) {
             try {
                 $this->logger->debug("    Trying API client (installInstrument)...");
 
-                $api = new \LORISClient\Api\InstrumentManagerApi(
-                    $this->httpClient,
-                    $this->moduleConfig
-                );
+                $api = new \LORISClient\Api\InstrumentManagerApi($this->httpClient, $this->moduleConfig);
 
-                // Signature: installInstrument($install_file, $instrument_type)
+                // im3 Generated signature (from schema required-first order):
+                //   installInstrument($install_file, $instrument_type)
                 $result = $api->installInstrument(
-                    new SplFileObject($filePath, 'r'),  // install_file
-                    $instrumentType                      // instrument_type: 'linst' or 'redcap'
+                    new SplFileObject($filePath, 'r'),  // install_file (required)
+                    $instrumentType                     // instrument_type (required)
                 );
 
-                $this->logger->info("    ✓ Instrument installed via API client (type: {$instrumentType})");
+                $this->logger->info("    ✓ Instrument installed via API client");
                 $this->clearInstrumentCache();
-                return [
-                    'success' => true,
-                    'message' => 'Installed via API',
-                    'method'  => 'API',
-                ];
+                return ['success' => true, 'message' => 'Installed via API', 'method' => 'API'];
             } catch (\Error $e) {
                 $this->logger->warning("    API install error: " . $e->getMessage());
                 $this->logger->info("    Falling back to HTTP...");
             } catch (\Exception $e) {
                 $msg = $e->getMessage();
-
-                // 409 Conflict = already installed → treat as success
                 if (strpos($msg, '409') !== false || stripos($msg, 'already exists') !== false) {
                     $this->logger->info("    ✓ Instrument already installed in LORIS (409 Conflict)");
-                    return [
-                        'success' => true,
-                        'message' => 'Already installed',
-                        'method'  => 'API',
-                    ];
+                    return ['success' => true, 'message' => 'Already installed', 'method' => 'API'];
                 }
-
                 $this->logger->warning("    API install failed: {$msg}");
                 $this->logger->info("    Falling back to HTTP...");
             }
@@ -815,22 +854,8 @@ PHPCODE;
     }
 
     /**
-     * Install instruments from a monolithic REDCap data dictionary CSV.
-     *
-     * The full DD (all forms) is uploaded as-is. LORIS instrument_manager's
-     * RedcapCSVParser splits by Form Name → creates one .linst per form.
-     *
-     * IMPORTANT: instrument_manager checks if ALL instrument names already
-     * exist BEFORE installing any. If any form is already installed, it
-     * returns 409 Conflict and aborts the entire upload (line 179-189 in
-     * instrument_manager.class.inc). This method catches that case.
-     *
-     * This is a convenience wrapper around installInstrument() that validates
-     * the CSV has the required REDCap DD headers before uploading.
-     *
-     * @param string $csvFilePath  Path to full REDCap data_dict.csv
-     * @return array{success: bool, message: string, method: string}
-     * @throws \RuntimeException If file not found or invalid headers
+     * Install from a monolithic REDCap data dictionary CSV.
+     * Validates required REDCap DD headers before uploading.
      */
     public function installFromRedcap(string $csvFilePath): array
     {
@@ -838,7 +863,6 @@ PHPCODE;
             throw new \RuntimeException("REDCap DD not found: {$csvFilePath}");
         }
 
-        // Validate it's a REDCap data dictionary
         $handle  = fopen($csvFilePath, 'r');
         $headers = fgetcsv($handle);
         fclose($handle);
@@ -853,58 +877,46 @@ PHPCODE;
         }
 
         $this->logger->info("  Installing instruments from monolithic REDCap DD");
-
-        // installInstrument() detects .csv extension → instrument_type='redcap'
-        // LORIS RedcapCSVParser splits by Form Name internally
         return $this->installInstrument($csvFilePath);
     }
 
     /**
      * HTTP fallback for instrument installation.
+     * im3: Sends install_file + instrument_type field.
      */
     private function installInstrumentHttp(string $filePath): array
     {
         $url = "{$this->baseUrl}/instrument_manager";
+        $instrumentType = $this->detectInstrumentType($filePath);
 
         try {
             $this->logger->debug("    HTTP POST {$url}");
 
             $response = $this->httpClient->request('POST', $url, [
-                'headers' => [
-                    'Authorization' => "Bearer {$this->token}",
-                ],
+                'headers'   => ['Authorization' => "Bearer {$this->token}"],
                 'multipart' => [
                     [
-                        'name'     => 'instrument_file',
+                        'name'     => 'install_file',
                         'contents' => fopen($filePath, 'r'),
                         'filename' => basename($filePath),
                     ],
+                    ['name' => 'instrument_type', 'contents' => $instrumentType],
                 ],
                 'http_errors' => false,
             ]);
 
             $statusCode = $response->getStatusCode();
-            $rawBody    = (string) $response->getBody();
-            $data       = json_decode($rawBody, true) ?? [];
+            $data       = json_decode((string) $response->getBody(), true) ?? [];
 
             if ($statusCode >= 200 && $statusCode < 300) {
                 $this->logger->info("    ✓ Instrument installed via HTTP");
                 $this->clearInstrumentCache();
-                return [
-                    'success' => true,
-                    'message' => $data['message'] ?? 'Installed via HTTP',
-                    'method'  => 'HTTP',
-                ];
+                return ['success' => true, 'message' => $data['message'] ?? 'Installed via HTTP', 'method' => 'HTTP'];
             }
 
-            // 409 Conflict = already installed → success
             if ($statusCode === 409) {
                 $this->logger->info("    ✓ Instrument already installed (409 via HTTP)");
-                return [
-                    'success' => true,
-                    'message' => 'Already installed',
-                    'method'  => 'HTTP',
-                ];
+                return ['success' => true, 'message' => 'Already installed', 'method' => 'HTTP'];
             }
 
             $msg = $data['error'] ?? "HTTP {$statusCode}";
@@ -916,92 +928,92 @@ PHPCODE;
         }
     }
 
+    // ──────────────────────────────────────────────────────────────────
+    // INSTRUMENT DATA HEADERS (GET template)
+    // ──────────────────────────────────────────────────────────────────
+
     /**
-     * Get expected CSV headers for an instrument.
+     * Get expected CSV/TSV headers for an instrument.
      *
-     * @param string|null $instrument  Optional instrument name filter
-     * @return string|null  CSV headers string, or null if not found / error
+     * im3: Sends format query param to get headers in matching format.
+     *
+     * @param string|null $instrument  Instrument name
+     * @param string      $action      CREATE_SESSIONS or VALIDATE_SESSIONS
+     * @param string      $format      LORIS_CSV, REDCAP_CSV, or BIDS_TSV
+     * @return string|null  CSV/TSV header line, or null on error
      */
-    public function getInstrumentDataHeaders(?string $instrument = null): ?string
-    {
+    public function getInstrumentDataHeaders(
+        ?string $instrument = null,
+        string  $action = 'VALIDATE_SESSIONS',
+        string  $format = 'LORIS_CSV'
+    ): ?string {
         // --- Priority 1: API client ---
         if ($this->hasApiClient && $this->moduleConfig !== null) {
             try {
-                $this->logger->debug("    Trying API client (getInstrumentDataHeaders)...");
+                $api = new \LORISClient\Api\InstrumentManagerApi($this->httpClient, $this->moduleConfig);
 
-                $api = new \LORISClient\Api\InstrumentManagerApi(
-                    $this->httpClient,
-                    $this->moduleConfig
-                );
-
-                // Signature: getInstrumentDataHeaders($action, $format, $instrument?, $instruments?)
+                // im3 Generated signature (from schema required-first order):
+                //   getInstrumentDataHeaders($action, $format, $instrument?, $instruments?)
                 $result = $api->getInstrumentDataHeaders(
-                    'VALIDATE_SESSIONS',  // action
-                    'LORIS_CSV',          // format: LORIS_CSV or BIDS_TSV
-                    $instrument,          // instrument (optional)
-                    null                  // instruments (optional)
+                    $action,        // action (required)
+                    $format,        // format (required)
+                    $instrument,    // instrument (optional)
+                    null            // instruments (optional)
                 );
 
-                // Handle both string and object responses
                 if (is_string($result)) {
                     $this->logger->debug("    ✓ Got headers via API client");
                     return $result;
                 }
-
-                if (is_object($result)) {
-                    if (method_exists($result, 'getError')) {
-                        $this->logger->debug("    API returned ErrorResponse: " . $result->getError());
-                    } else {
-                        $stringResult = json_encode($result);
-                        if (!empty($stringResult) && $stringResult !== '{}' && $stringResult !== 'null') {
-                            return $stringResult;
-                        }
+                // Generated client returns SplFileObject for octet-stream responses
+                if ($result instanceof \SplFileObject) {
+                    $result->rewind();
+                    $content = '';
+                    while (!$result->eof()) {
+                        $content .= $result->fgets();
+                    }
+                    $content = trim($content);
+                    if (!empty($content)) {
+                        $this->logger->debug("    ✓ Got headers via API client (SplFileObject)");
+                        return $content;
                     }
                 }
-
-                $this->logger->debug("    API client returned unusable result, falling back to HTTP");
-            } catch (\Error $e) {
-                $this->logger->debug("    API headers error: " . $e->getMessage());
-                $this->logger->debug("    Falling back to HTTP...");
-            } catch (\Exception $e) {
-                $this->logger->debug("    API client headers failed: " . $e->getMessage());
-                $this->logger->debug("    Falling back to HTTP...");
+                if (is_object($result)) {
+                    $stringResult = json_encode($result);
+                    if (!empty($stringResult) && $stringResult !== '{}' && $stringResult !== 'null') {
+                        return $stringResult;
+                    }
+                }
+            } catch (\Error|\Exception $e) {
+                $this->logger->debug("    API headers failed: " . $e->getMessage());
             }
         }
 
-        // --- Priority 2: Direct HTTP fallback ---
-        return $this->getInstrumentDataHeadersHttp($instrument);
+        // --- Priority 2: HTTP fallback ---
+        return $this->getInstrumentDataHeadersHttp($instrument, $action, $format);
     }
 
-    /**
-     * HTTP fallback for getting instrument data headers.
-     */
-    private function getInstrumentDataHeadersHttp(?string $instrument = null): ?string
-    {
-        $url = "{$this->baseUrl}/instrument_manager/instrument_data";
+    private function getInstrumentDataHeadersHttp(
+        ?string $instrument,
+        string  $action,
+        string  $format = 'LORIS_CSV'
+    ): ?string {
+        // im3: Send format query param
+        $params = ['action' => $action, 'format' => $format];
         if ($instrument) {
-            $url .= '?' . http_build_query(['instrument' => $instrument]);
+            $params['instrument'] = $instrument;
         }
 
-        try {
-            $this->logger->debug("    HTTP GET {$url}");
+        $url = "{$this->baseUrl}/instrument_manager/instrument_data?" . http_build_query($params);
 
+        try {
             $response = $this->httpClient->request('GET', $url, [
-                'headers' => [
-                    'Authorization' => "Bearer {$this->token}",
-                ],
+                'headers'     => ['Authorization' => "Bearer {$this->token}"],
                 'http_errors' => false,
             ]);
-
-            $statusCode = $response->getStatusCode();
-
-            if ($statusCode === 200) {
-                $body = (string) $response->getBody();
-                $this->logger->debug("    ✓ Got headers via HTTP");
-                return $body;
+            if ($response->getStatusCode() === 200) {
+                return (string) $response->getBody();
             }
-
-            $this->logger->debug("    HTTP headers returned {$statusCode}");
             return null;
         } catch (\Exception $e) {
             $this->logger->debug("    HTTP headers failed: " . $e->getMessage());
@@ -1013,57 +1025,28 @@ PHPCODE;
     // INSTRUMENT EXISTS  (cached via Projects API)
     // ──────────────────────────────────────────────────────────────────
 
-    /**
-     * Check if an instrument exists in LORIS.
-     *
-     * Uses GET /projects/{project}/instruments to get the full list
-     * of installed instruments and checks against it.
-     * Results are cached so we only call the API once per run.
-     *
-     * @param string      $instrument   Instrument name to check
-     * @param string|null $project      Project name (optional, uses first project if null)
-     * @return bool
-     */
     public function instrumentExists(string $instrument, ?string $project = null): bool
     {
-        // Load and cache instrument list if not already done
         if ($this->installedInstruments === null) {
             $this->installedInstruments = $this->fetchInstalledInstruments($project);
         }
-
         $exists = in_array($instrument, $this->installedInstruments, true);
-
-        if ($exists) {
-            $this->logger->info("      ✓ '{$instrument}' found in LORIS");
-        } else {
-            $this->logger->info("      ✗ '{$instrument}' NOT found in LORIS — will attempt install");
-        }
-
+        $this->logger->info($exists
+            ? "      ✓ '{$instrument}' found in LORIS"
+            : "      ✗ '{$instrument}' NOT found in LORIS — will attempt install"
+        );
         return $exists;
     }
 
-    /**
-     * Clear the cached instrument list (e.g. after installing a new instrument).
-     */
     public function clearInstrumentCache(): void
     {
         $this->installedInstruments = null;
     }
 
-    /**
-     * Fetch list of all installed instrument names from LORIS.
-     *
-     * Priority 1: API client → ProjectsApi::getProjectInstruments
-     * Priority 2: HTTP → GET /projects/{project}/instruments
-     *
-     * @param string|null $project  Project name
-     * @return array  List of instrument test_name strings
-     */
     private function fetchInstalledInstruments(?string $project = null): array
     {
         $version = $this->activeVersion ?? $this->apiVersion;
 
-        // If no project specified, get the first project
         if ($project === null) {
             $project = $this->getFirstProject();
             if ($project === null) {
@@ -1072,52 +1055,30 @@ PHPCODE;
             }
         }
 
-        $this->logger->debug("    Fetching instruments for project '{$project}'...");
-
-        // --- Priority 1: API client ---
+        // Priority 1: API client
         if ($this->hasApiClient && $this->apiConfig !== null) {
             try {
-                $api = new \LORISClient\Api\ProjectsApi(
-                    $this->httpClient,
-                    $this->apiConfig
-                );
-
-                $response = $api->getProjectInstruments($project);
+                $api         = new \LORISClient\Api\ProjectsApi($this->httpClient, $this->apiConfig);
+                $response    = $api->getProjectInstruments($project);
                 $instruments = $this->parseInstrumentList($response);
-
                 if (!empty($instruments)) {
                     return $instruments;
                 }
-            } catch (\Error $e) {
-                $this->logger->debug("    API getProjectInstruments error: " . $e->getMessage());
-            } catch (\Exception $e) {
+            } catch (\Error|\Exception $e) {
                 $this->logger->debug("    API getProjectInstruments failed: " . $e->getMessage());
             }
         }
 
-        // --- Priority 2: HTTP fallback ---
+        // Priority 2: HTTP
         $url = "{$this->baseUrl}/api/{$version}/projects/" . urlencode($project) . "/instruments";
-
         try {
-            $this->logger->debug("    HTTP GET {$url}");
-
             $response = $this->httpClient->request('GET', $url, [
-                'headers' => [
-                    'Authorization' => "Bearer {$this->token}",
-                    'Accept'        => 'application/json',
-                ],
+                'headers' => ['Authorization' => "Bearer {$this->token}", 'Accept' => 'application/json'],
                 'http_errors' => false,
             ]);
-
-            $statusCode = $response->getStatusCode();
-
-            if ($statusCode === 200) {
-                $data = json_decode((string) $response->getBody(), true);
-                $instruments = $this->parseInstrumentList($data);
-                return $instruments;
+            if ($response->getStatusCode() === 200) {
+                return $this->parseInstrumentList(json_decode((string) $response->getBody(), true));
             }
-
-            $this->logger->debug("    HTTP instruments returned {$statusCode}");
         } catch (\Exception $e) {
             $this->logger->debug("    HTTP instruments failed: " . $e->getMessage());
         }
@@ -1125,66 +1086,37 @@ PHPCODE;
         return [];
     }
 
-    /**
-     * Parse instrument list from various response formats.
-     */
     private function parseInstrumentList($response): array
     {
-        // Convert objects to array
-        if (is_object($response)) {
-            $data = json_decode(json_encode($response), true);
-        } elseif (is_array($response)) {
-            $data = $response;
-        } else {
-            return [];
-        }
+        $data = is_object($response) ? json_decode(json_encode($response), true)
+            : (is_array($response) ? $response : []);
 
         $instruments = [];
-
-        if (isset($data['Instruments'])) {
-            $list = $data['Instruments'];
-            if (is_array($list)) {
-                foreach ($list as $key => $value) {
-                    if (is_string($key) && !is_numeric($key)) {
-                        $instruments[] = $key;
-                    } elseif (is_array($value)) {
-                        $name = $value['InstrumentName']
-                            ?? $value['Test_name']
-                            ?? $value['testName']
-                            ?? $value['instrument']
-                            ?? null;
-                        if ($name) {
-                            $instruments[] = $name;
-                        }
-                    } elseif (is_string($value)) {
-                        $instruments[] = $value;
-                    }
+        if (isset($data['Instruments']) && is_array($data['Instruments'])) {
+            foreach ($data['Instruments'] as $key => $value) {
+                if (is_string($key) && !is_numeric($key)) {
+                    $instruments[] = $key;
+                } elseif (is_array($value)) {
+                    $name = $value['InstrumentName'] ?? $value['Test_name'] ?? $value['testName'] ?? $value['instrument'] ?? null;
+                    if ($name) $instruments[] = $name;
+                } elseif (is_string($value)) {
+                    $instruments[] = $value;
                 }
             }
         }
-
         return $instruments;
     }
 
-    /**
-     * Get the first project name from LORIS.
-     */
     private function getFirstProject(): ?string
     {
         $version = $this->activeVersion ?? $this->apiVersion;
-        $url     = "{$this->baseUrl}/api/{$version}/projects";
-
         try {
-            $response = $this->httpClient->request('GET', $url, [
-                'headers' => [
-                    'Authorization' => "Bearer {$this->token}",
-                    'Accept'        => 'application/json',
-                ],
+            $response = $this->httpClient->request('GET', "{$this->baseUrl}/api/{$version}/projects", [
+                'headers' => ['Authorization' => "Bearer {$this->token}", 'Accept' => 'application/json'],
                 'http_errors' => false,
             ]);
-
             if ($response->getStatusCode() === 200) {
-                $data = json_decode((string) $response->getBody(), true);
+                $data     = json_decode((string) $response->getBody(), true);
                 $projects = $data['Projects'] ?? [];
                 if (!empty($projects)) {
                     $firstKey = array_key_first($projects);
@@ -1194,109 +1126,64 @@ PHPCODE;
         } catch (\Exception $e) {
             $this->logger->debug("    Failed to get projects: " . $e->getMessage());
         }
-
         return null;
     }
 
-    /**
-     * Alias for uploadInstrumentData — ClinicalPipeline calls this name.
-     */
-    public function uploadInstrumentCSV(
-        string $instrument,
-        string $csvFilePath,
-        string $action = 'CREATE_SESSIONS'
-    ): array {
-        return $this->uploadInstrumentData($instrument, $csvFilePath, $action);
+    /** Alias for uploadInstrumentData */
+    public function uploadInstrumentCSV(string $instrument, string $csvFilePath, string $action = 'CREATE_SESSIONS', string|bool $strict = false): array
+    {
+        return $this->uploadInstrumentData($instrument, $csvFilePath, $action, $strict);
     }
 
     // ──────────────────────────────────────────────────────────────────
     // CANDIDATES  (API → HTTP)
-    // Uses REST API config: host = {baseUrl}/api/{version}
     // ──────────────────────────────────────────────────────────────────
 
-    /**
-     * Get list of all candidates.
-     */
     public function getCandidates(): array
     {
         if ($this->hasApiClient && $this->apiConfig !== null) {
             try {
-                $api = new \LORISClient\Api\CandidatesApi(
-                    $this->httpClient,
-                    $this->apiConfig
-                );
-
+                $api = new \LORISClient\Api\CandidatesApi($this->httpClient, $this->apiConfig);
                 $response = $api->getCandidates();
-
                 if (method_exists($response, 'getCandidates')) {
                     return json_decode(json_encode($response->getCandidates()), true) ?? [];
                 }
-
                 return json_decode(json_encode($response), true) ?? [];
-            } catch (\Error $e) {
-                $this->logger->warning("    API getCandidates error: " . $e->getMessage());
-            } catch (\Exception $e) {
-                $this->logger->warning("API getCandidates failed: " . $e->getMessage());
+            } catch (\Error|\Exception $e) {
+                $this->logger->warning("    API getCandidates failed: " . $e->getMessage());
             }
         }
-
         return $this->apiGet('/candidates')['Candidates'] ?? [];
     }
 
-    /**
-     * Get a single candidate by CandID.
-     */
     public function getCandidate(int $candid): ?array
     {
         if ($this->hasApiClient && $this->apiConfig !== null) {
             try {
-                $api = new \LORISClient\Api\CandidatesApi(
-                    $this->httpClient,
-                    $this->apiConfig
-                );
-
-                $response = $api->getCandidate((string) $candid);
-                return json_decode(json_encode($response), true);
-            } catch (\Error $e) {
-                $this->logger->warning("    API getCandidate error: " . $e->getMessage());
-            } catch (\Exception $e) {
+                $api = new \LORISClient\Api\CandidatesApi($this->httpClient, $this->apiConfig);
+                return json_decode(json_encode($api->getCandidate((string) $candid)), true);
+            } catch (\Error|\Exception $e) {
                 $this->logger->debug("API getCandidate failed: " . $e->getMessage());
             }
         }
-
         return $this->apiGet("/candidates/{$candid}");
     }
 
-    /**
-     * Create a new candidate.
-     *
-     * @param array $candidateData  ['Project' => ..., 'DoB' => ..., 'Sex' => ..., 'Site' => ...]
-     */
     public function createCandidate(array $candidateData): ?array
     {
         if ($this->hasApiClient && $this->apiConfig !== null) {
             try {
-                $api = new \LORISClient\Api\CandidatesApi(
-                    $this->httpClient,
-                    $this->apiConfig
-                );
-
+                $api     = new \LORISClient\Api\CandidatesApi($this->httpClient, $this->apiConfig);
                 $request = new \LORISClient\Model\CandidateCreateRequest([
                     'candidate' => new \LORISClient\Model\CandidateCreateRequestCandidate($candidateData),
                 ]);
-
                 $response = $api->createCandidate($request);
-                $result   = json_decode(json_encode($response), true);
-
                 $this->logger->info("  ✓ Candidate created via API client");
-                return $result;
-            } catch (\Error $e) {
-                $this->logger->warning("    API createCandidate error: " . $e->getMessage());
-            } catch (\Exception $e) {
+                return json_decode(json_encode($response), true);
+            } catch (\Error|\Exception $e) {
                 $this->logger->warning("API createCandidate failed: " . $e->getMessage());
             }
         }
-
         return $this->apiPost('/candidates', ['candidate' => $candidateData]);
     }
 
@@ -1304,54 +1191,31 @@ PHPCODE;
     // VISITS  (API → HTTP)
     // ──────────────────────────────────────────────────────────────────
 
-    /**
-     * Get visit details.
-     */
     public function getVisit(int $candid, string $visitLabel): ?array
     {
         if ($this->hasApiClient && $this->apiConfig !== null) {
             try {
-                $api = new \LORISClient\Api\VisitsApi(
-                    $this->httpClient,
-                    $this->apiConfig
-                );
-
-                $response = $api->getVisit((string) $candid, $visitLabel);
-                return json_decode(json_encode($response), true);
-            } catch (\Error $e) {
-                $this->logger->warning("    API getVisit error: " . $e->getMessage());
-            } catch (\Exception $e) {
+                $api = new \LORISClient\Api\VisitsApi($this->httpClient, $this->apiConfig);
+                return json_decode(json_encode($api->getVisit((string) $candid, $visitLabel)), true);
+            } catch (\Error|\Exception $e) {
                 $this->logger->debug("API getVisit failed: " . $e->getMessage());
             }
         }
-
         return $this->apiGet("/candidates/{$candid}/{$visitLabel}");
     }
 
-    /**
-     * Create a new visit.
-     */
     public function createVisit(int $candid, string $visitLabel, array $visitData): ?array
     {
         if ($this->hasApiClient && $this->apiConfig !== null) {
             try {
-                $api = new \LORISClient\Api\VisitsApi(
-                    $this->httpClient,
-                    $this->apiConfig
-                );
-
-                $request = new \LORISClient\Model\VisitCreateRequest($visitData);
-                $response = $api->createVisit((string) $candid, $visitLabel, $request);
-
+                $api = new \LORISClient\Api\VisitsApi($this->httpClient, $this->apiConfig);
+                $api->createVisit((string) $candid, $visitLabel, new \LORISClient\Model\VisitCreateRequest($visitData));
                 $this->logger->info("  ✓ Visit {$visitLabel} created via API client");
-                return json_decode(json_encode($response), true);
-            } catch (\Error $e) {
-                $this->logger->warning("    API createVisit error: " . $e->getMessage());
-            } catch (\Exception $e) {
+                return $visitData;
+            } catch (\Error|\Exception $e) {
                 $this->logger->warning("API createVisit failed: " . $e->getMessage());
             }
         }
-
         return $this->apiPut("/candidates/{$candid}/{$visitLabel}", $visitData);
     }
 
@@ -1359,98 +1223,64 @@ PHPCODE;
     // INSTRUMENTS  (API → HTTP)
     // ──────────────────────────────────────────────────────────────────
 
-    /**
-     * Get instrument data for a candidate/visit.
-     */
     public function getInstrumentData(int $candid, string $visit, string $instrument): ?array
     {
         if ($this->hasApiClient && $this->apiConfig !== null) {
             try {
-                $api = new \LORISClient\Api\InstrumentsApi(
-                    $this->httpClient,
-                    $this->apiConfig
-                );
-
-                $response = $api->getInstrumentData((string) $candid, $visit, $instrument);
-                return json_decode(json_encode($response), true);
-            } catch (\Error $e) {
-                $this->logger->warning("    API getInstrumentData error: " . $e->getMessage());
-            } catch (\Exception $e) {
+                $api = new \LORISClient\Api\InstrumentsApi($this->httpClient, $this->apiConfig);
+                return json_decode(json_encode($api->getInstrumentData((string) $candid, $visit, $instrument)), true);
+            } catch (\Error|\Exception $e) {
                 $this->logger->debug("API getInstrumentData failed: " . $e->getMessage());
             }
         }
-
         return $this->apiGet("/candidates/{$candid}/{$visit}/instruments/{$instrument}");
     }
 
-    /**
-     * Update (PATCH) instrument data.
-     */
     public function patchInstrumentData(int $candid, string $visit, string $instrument, array $data): ?array
     {
         if ($this->hasApiClient && $this->apiConfig !== null) {
             try {
-                $api = new \LORISClient\Api\InstrumentsApi(
-                    $this->httpClient,
-                    $this->apiConfig
-                );
-
-                $request = new \LORISClient\Model\InstrumentDataRequest($data);
-                $response = $api->patchInstrumentData((string) $candid, $visit, $instrument, $request);
-                return json_decode(json_encode($response), true);
-            } catch (\Error $e) {
-                $this->logger->warning("    API patchInstrumentData error: " . $e->getMessage());
-            } catch (\Exception $e) {
+                $api = new \LORISClient\Api\InstrumentsApi($this->httpClient, $this->apiConfig);
+                return json_decode(json_encode($api->patchInstrumentData(
+                    (string) $candid, $visit, $instrument, new \LORISClient\Model\InstrumentDataRequest($data)
+                )), true);
+            } catch (\Error|\Exception $e) {
                 $this->logger->debug("API patchInstrumentData failed: " . $e->getMessage());
             }
         }
-
         return $this->apiPatch("/candidates/{$candid}/{$visit}/instruments/{$instrument}", $data);
     }
 
-    /**
-     * Replace (PUT) instrument data.
-     */
     public function putInstrumentData(int $candid, string $visit, string $instrument, array $data): ?array
     {
         if ($this->hasApiClient && $this->apiConfig !== null) {
             try {
-                $api = new \LORISClient\Api\InstrumentsApi(
-                    $this->httpClient,
-                    $this->apiConfig
-                );
-
-                $request = new \LORISClient\Model\InstrumentDataRequest($data);
-                $response = $api->putInstrumentData((string) $candid, $visit, $instrument, $request);
-                return json_decode(json_encode($response), true);
-            } catch (\Error $e) {
-                $this->logger->warning("    API putInstrumentData error: " . $e->getMessage());
-            } catch (\Exception $e) {
+                $api = new \LORISClient\Api\InstrumentsApi($this->httpClient, $this->apiConfig);
+                return json_decode(json_encode($api->putInstrumentData(
+                    (string) $candid, $visit, $instrument, new \LORISClient\Model\InstrumentDataRequest($data)
+                )), true);
+            } catch (\Error|\Exception $e) {
                 $this->logger->debug("API putInstrumentData failed: " . $e->getMessage());
             }
         }
-
         return $this->apiPut("/candidates/{$candid}/{$visit}/instruments/{$instrument}", $data);
     }
 
     // ──────────────────────────────────────────────────────────────────
-    // PROJECTS & SITES  (API → HTTP)
+    // PROJECTS & SITES
     // ──────────────────────────────────────────────────────────────────
 
     public function getProjects(): array
     {
         if ($this->hasApiClient && $this->apiConfig !== null) {
             try {
-                $api = new \LORISClient\Api\ProjectsApi($this->httpClient, $this->apiConfig);
-                $response = $api->getProjects();
-                return json_decode(json_encode($response), true) ?? [];
-            } catch (\Error $e) {
-                $this->logger->warning("    API getProjects error: " . $e->getMessage());
-            } catch (\Exception $e) {
+                return json_decode(json_encode(
+                    (new \LORISClient\Api\ProjectsApi($this->httpClient, $this->apiConfig))->getProjects()
+                ), true) ?? [];
+            } catch (\Error|\Exception $e) {
                 $this->logger->debug("API getProjects failed: " . $e->getMessage());
             }
         }
-
         return $this->apiGet('/projects') ?? [];
     }
 
@@ -1458,16 +1288,13 @@ PHPCODE;
     {
         if ($this->hasApiClient && $this->apiConfig !== null) {
             try {
-                $api = new \LORISClient\Api\SitesApi($this->httpClient, $this->apiConfig);
-                $response = $api->getSites();
-                return json_decode(json_encode($response), true) ?? [];
-            } catch (\Error $e) {
-                $this->logger->warning("    API getSites error: " . $e->getMessage());
-            } catch (\Exception $e) {
+                return json_decode(json_encode(
+                    (new \LORISClient\Api\SitesApi($this->httpClient, $this->apiConfig))->getSites()
+                ), true) ?? [];
+            } catch (\Error|\Exception $e) {
                 $this->logger->debug("API getSites failed: " . $e->getMessage());
             }
         }
-
         return $this->apiGet('/sites') ?? [];
     }
 
@@ -1477,24 +1304,13 @@ PHPCODE;
 
     private function apiGet(string $endpoint): ?array
     {
-        $version = $this->activeVersion ?? $this->apiVersion;
-        $url     = "{$this->baseUrl}/api/{$version}{$endpoint}";
-
+        $url = "{$this->baseUrl}/api/" . ($this->activeVersion ?? $this->apiVersion) . $endpoint;
         try {
-            $response = $this->httpClient->request('GET', $url, [
-                'headers' => [
-                    'Authorization' => "Bearer {$this->token}",
-                    'Accept'        => 'application/json',
-                ],
+            $r = $this->httpClient->request('GET', $url, [
+                'headers' => ['Authorization' => "Bearer {$this->token}", 'Accept' => 'application/json'],
                 'http_errors' => false,
             ]);
-
-            if ($response->getStatusCode() === 200) {
-                return json_decode((string) $response->getBody(), true);
-            }
-
-            $this->logger->debug("HTTP GET {$endpoint} returned {$response->getStatusCode()}");
-            return null;
+            return $r->getStatusCode() === 200 ? json_decode((string) $r->getBody(), true) : null;
         } catch (\Exception $e) {
             $this->logger->debug("HTTP GET {$endpoint} error: " . $e->getMessage());
             return null;
@@ -1503,25 +1319,13 @@ PHPCODE;
 
     private function apiPost(string $endpoint, array $data): ?array
     {
-        $version = $this->activeVersion ?? $this->apiVersion;
-        $url     = "{$this->baseUrl}/api/{$version}{$endpoint}";
-
+        $url = "{$this->baseUrl}/api/" . ($this->activeVersion ?? $this->apiVersion) . $endpoint;
         try {
-            $response = $this->httpClient->request('POST', $url, [
-                'headers' => [
-                    'Authorization' => "Bearer {$this->token}",
-                    'Content-Type'  => 'application/json',
-                ],
-                'json'        => $data,
-                'http_errors' => false,
+            $r = $this->httpClient->request('POST', $url, [
+                'headers' => ['Authorization' => "Bearer {$this->token}", 'Content-Type' => 'application/json'],
+                'json' => $data, 'http_errors' => false,
             ]);
-
-            if ($response->getStatusCode() >= 200 && $response->getStatusCode() < 300) {
-                return json_decode((string) $response->getBody(), true) ?? [];
-            }
-
-            $this->logger->debug("HTTP POST {$endpoint} returned {$response->getStatusCode()}");
-            return null;
+            return ($r->getStatusCode() >= 200 && $r->getStatusCode() < 300) ? (json_decode((string) $r->getBody(), true) ?? []) : null;
         } catch (\Exception $e) {
             $this->logger->debug("HTTP POST {$endpoint} error: " . $e->getMessage());
             return null;
@@ -1530,25 +1334,13 @@ PHPCODE;
 
     private function apiPut(string $endpoint, array $data): ?array
     {
-        $version = $this->activeVersion ?? $this->apiVersion;
-        $url     = "{$this->baseUrl}/api/{$version}{$endpoint}";
-
+        $url = "{$this->baseUrl}/api/" . ($this->activeVersion ?? $this->apiVersion) . $endpoint;
         try {
-            $response = $this->httpClient->request('PUT', $url, [
-                'headers' => [
-                    'Authorization' => "Bearer {$this->token}",
-                    'Content-Type'  => 'application/json',
-                ],
-                'json'        => $data,
-                'http_errors' => false,
+            $r = $this->httpClient->request('PUT', $url, [
+                'headers' => ['Authorization' => "Bearer {$this->token}", 'Content-Type' => 'application/json'],
+                'json' => $data, 'http_errors' => false,
             ]);
-
-            if ($response->getStatusCode() >= 200 && $response->getStatusCode() < 300) {
-                return json_decode((string) $response->getBody(), true) ?? [];
-            }
-
-            $this->logger->debug("HTTP PUT {$endpoint} returned {$response->getStatusCode()}");
-            return null;
+            return ($r->getStatusCode() >= 200 && $r->getStatusCode() < 300) ? (json_decode((string) $r->getBody(), true) ?? []) : null;
         } catch (\Exception $e) {
             $this->logger->debug("HTTP PUT {$endpoint} error: " . $e->getMessage());
             return null;
@@ -1557,25 +1349,13 @@ PHPCODE;
 
     private function apiPatch(string $endpoint, array $data): ?array
     {
-        $version = $this->activeVersion ?? $this->apiVersion;
-        $url     = "{$this->baseUrl}/api/{$version}{$endpoint}";
-
+        $url = "{$this->baseUrl}/api/" . ($this->activeVersion ?? $this->apiVersion) . $endpoint;
         try {
-            $response = $this->httpClient->request('PATCH', $url, [
-                'headers' => [
-                    'Authorization' => "Bearer {$this->token}",
-                    'Content-Type'  => 'application/json',
-                ],
-                'json'        => $data,
-                'http_errors' => false,
+            $r = $this->httpClient->request('PATCH', $url, [
+                'headers' => ['Authorization' => "Bearer {$this->token}", 'Content-Type' => 'application/json'],
+                'json' => $data, 'http_errors' => false,
             ]);
-
-            if ($response->getStatusCode() >= 200 && $response->getStatusCode() < 300) {
-                return json_decode((string) $response->getBody(), true) ?? [];
-            }
-
-            $this->logger->debug("HTTP PATCH {$endpoint} returned {$response->getStatusCode()}");
-            return null;
+            return ($r->getStatusCode() >= 200 && $r->getStatusCode() < 300) ? (json_decode((string) $r->getBody(), true) ?? []) : null;
         } catch (\Exception $e) {
             $this->logger->debug("HTTP PATCH {$endpoint} error: " . $e->getMessage());
             return null;
@@ -1586,78 +1366,42 @@ PHPCODE;
     // INTERNAL HELPERS
     // ──────────────────────────────────────────────────────────────────
 
-    /**
-     * Parse the API client upload result into a standard array.
-     */
     private function parseApiUploadResult($result): array
     {
         if ($result === null) {
             return ['success' => false, 'message' => 'Null response', 'idMapping' => []];
         }
-
         if (is_object($result)) {
-            $data = [];
-
-            if (method_exists($result, 'getSuccess')) {
-                $data['success'] = $result->getSuccess();
-            } elseif (method_exists($result, 'getMessage')) {
-                $data['success'] = true;
-            } else {
-                $data['success'] = true;
+            $d = [];
+            $d['success']   = method_exists($result, 'getSuccess') ? $result->getSuccess() : true;
+            $d['message']   = method_exists($result, 'getMessage') ? ($result->getMessage() ?? 'OK') : 'OK';
+            $d['idMapping'] = method_exists($result, 'getIdMapping') ? ($result->getIdMapping() ?? []) : [];
+            if (!empty($d['idMapping'])) {
+                $d['idMapping'] = json_decode(json_encode($d['idMapping']), true) ?? [];
             }
-
-            $data['message'] = method_exists($result, 'getMessage')
-                ? ($result->getMessage() ?? 'OK')
-                : 'OK';
-
-            $data['idMapping'] = method_exists($result, 'getIdMapping')
-                ? ($result->getIdMapping() ?? [])
-                : [];
-
-            if (!empty($data['idMapping'])) {
-                $data['idMapping'] = json_decode(json_encode($data['idMapping']), true) ?? [];
-            }
-
-            if (method_exists($result, 'getRowsSaved')) {
-                $data['rowsSaved'] = $result->getRowsSaved();
-            }
-            if (method_exists($result, 'getRecordsCreated')) {
-                $data['recordsCreated'] = $result->getRecordsCreated();
-            }
-
-            return $data;
+            return $d;
         }
-
         if (is_array($result)) {
             return [
-                'success'   => $result['success'] ?? true,
-                'message'   => $result['message'] ?? 'OK',
+                'success' => $result['success'] ?? true, 'message' => $result['message'] ?? 'OK',
                 'idMapping' => $result['idMapping'] ?? [],
             ];
         }
-
         return ['success' => false, 'message' => 'Unexpected response type', 'idMapping' => []];
     }
 
-    /**
-     * Log ID mapping from upload result.
-     */
     private function logIdMapping(array $result): void
     {
         if (isset($result['data']['rowsSaved'])) {
             $total = $result['data']['totalRows'] ?? '?';
             $this->logger->info("    Rows saved: {$result['data']['rowsSaved']}/{$total}");
         }
-        if (isset($result['data']['recordsCreated'])) {
-            $this->logger->info("    New Records created: {$result['data']['recordsCreated']}");
-        }
-
         $idMapping = $result['idMapping'] ?? [];
         if (!empty($idMapping) && is_array($idMapping)) {
-            foreach ($idMapping as $mapping) {
-                $studyId = $mapping['ExternalID'] ?? $mapping['StudyID'] ?? $mapping['externalId'] ?? '?';
-                $candId  = $mapping['CandID'] ?? $mapping['candid'] ?? $mapping['candId'] ?? '?';
-                $this->logger->debug("      StudyID {$studyId} → CandID {$candId}");
+            foreach ($idMapping as $m) {
+                $sid = $m['ExternalID'] ?? $m['StudyID'] ?? $m['externalId'] ?? '?';
+                $cid = $m['CandID'] ?? $m['candid'] ?? $m['candId'] ?? '?';
+                $this->logger->debug("      StudyID {$sid} → CandID {$cid}");
             }
         }
     }
@@ -1666,33 +1410,10 @@ PHPCODE;
     // ACCESSORS
     // ──────────────────────────────────────────────────────────────────
 
-    public function getToken(): ?string
-    {
-        return $this->token;
-    }
-
-    public function getBaseUrl(): string
-    {
-        return $this->baseUrl;
-    }
-
-    public function getActiveVersion(): string
-    {
-        return $this->activeVersion ?? $this->apiVersion;
-    }
-
-    public function hasApiClient(): bool
-    {
-        return $this->hasApiClient;
-    }
-
-    public function getApiConfig(): mixed
-    {
-        return $this->apiConfig;
-    }
-
-    public function getModuleConfig(): mixed
-    {
-        return $this->moduleConfig;
-    }
+    public function getToken(): ?string        { return $this->token; }
+    public function getBaseUrl(): string       { return $this->baseUrl; }
+    public function getActiveVersion(): string { return $this->activeVersion ?? $this->apiVersion; }
+    public function hasApiClient(): bool       { return $this->hasApiClient; }
+    public function getApiConfig(): mixed      { return $this->apiConfig; }
+    public function getModuleConfig(): mixed   { return $this->moduleConfig; }
 }
