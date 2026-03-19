@@ -29,6 +29,14 @@
     "Example-PET"
   ],
 
+  "candidate_defaults": {
+      "sex":     "Other",
+      "dob":     "1970-01-01",
+      "cohort":  "Control",
+      "site":    "University of Ottawa Heart Institute (UOHI)",
+      "project": "FDG-PET"
+  },
+
   "data_access": {
     "mount_enabled": true,
     "mount_path": "/data/projects/Example-Study"
