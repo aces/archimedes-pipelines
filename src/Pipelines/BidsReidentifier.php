@@ -556,6 +556,24 @@ class BidsReidentifier
             return $this->stats;
         }
 
+        // Handle --force: delete target directory for clean reidentification
+        $force = $options['force'] ?? false;
+        if ($force && is_dir($targetDir)) {
+            $this->_log("  --force: removing existing target directory: {$targetDir}");
+            // Use shell rm -rf since PHP's recursive delete is verbose
+            exec('rm -rf ' . escapeshellarg($targetDir), $out, $rc);
+            if ($rc !== 0 || is_dir($targetDir)) {
+                $this->_error("TARGET_DIR",
+                    "Failed to remove existing target: {$targetDir}"
+                    . " — check for open file handles (NFS locks)"
+                );
+                $this->_printSummary();
+                $this->_closeLogs();
+                return $this->stats;
+            }
+            $this->_log("  ✓ Target directory removed");
+        }
+
         // Ensure target directory exists
         if (!is_dir($targetDir)) {
             $this->_log("  Creating target directory: {$targetDir}");
@@ -615,14 +633,17 @@ class BidsReidentifier
         // Subsequent polls every POLL_INTERVAL_SECONDS.
         $t0           = microtime(true);
         $pollStart    = $t0;
-        $pollFailures = 0;
-        $wasRunning   = false;
-        $firstPoll    = true;
+        $pollFailures    = 0;
+        $wasRunning      = false;
+        $firstPoll       = true;
+        $firstPollRetry  = false; // retry once if DB row not yet written
 
         while (true) {
             if ($firstPoll) {
                 $firstPoll = false;
-                sleep(15);
+                // Short first poll — catches fast-completing scripts
+                // (all files already reidentified → script exits in ~1s)
+                sleep(5);
             } else {
                 sleep(self::POLL_INTERVAL_SECONDS);
             }
@@ -641,6 +662,15 @@ class BidsReidentifier
             $status = $this->_pollJob($jobId);
 
             if ($status === null) {
+                // First poll null — SPM DB row may not be written yet.
+                // Retry once after a short delay before counting as failure.
+                if (!$firstPollRetry) {
+                    $firstPollRetry = true;
+                    $this->logger->debug("  First poll null — SPM row may not be ready, retrying in 3s");
+                    sleep(3);
+                    continue;
+                }
+
                 $pollFailures++;
                 $this->_warn("POLL",
                     "Poll failed for job {$jobId} at {$elapsed}s"
@@ -658,6 +688,9 @@ class BidsReidentifier
                 }
                 continue;
             }
+
+            // Once we get a real response, disable the first-poll retry logic
+            $firstPollRetry = true;
 
             $pollFailures = 0;
             $state        = $status['state'] ?? 'UNKNOWN';
@@ -706,18 +739,42 @@ class BidsReidentifier
             // Race condition: script completed before first 15s poll,
             // deleteProcessFiles() deleted temp files on exit 0,
             // SPM reports ERROR with "exit code unknown".
-            // Confirm success by checking target has sub-* directories.
-            $targetSubjects = glob("{$targetDir}/sub-*", GLOB_ONLYDIR) ?: [];
-            if ((str_contains(strtolower($errorDetail), 'exit code unknown')
-                    || $exitCode === '?')
-                && !empty($targetSubjects)
+            //
+            // This ONLY applies when exit code is genuinely unknown (not when
+            // SPM has a real non-zero exit code). Confirm by checking:
+            //   1. Error detail says "exit code unknown" (SPM race condition marker)
+            //   2. Target has the same number of sub-* dirs as source (real work done)
+            //
+            // A genuine failure (permission error, DB error, fatal exception)
+            // will either have a real non-zero exit code (not '?') or have
+            // zero/fewer target dirs than expected.
+            $isExitCodeUnknown = str_contains(strtolower($errorDetail), 'exit code unknown');
+            $targetSubjects    = glob("{$targetDir}/sub-*", GLOB_ONLYDIR) ?: [];
+            $targetCount       = count($targetSubjects);
+            $sourceCount       = $this->stats['subjects_found'];
+
+            if ($isExitCodeUnknown
+                && $targetCount > 0
+                && $targetCount >= $sourceCount
             ) {
                 $this->_log(
-                    "  ✓ SUCCESS (exit code race condition — files cleaned up"
-                    . " after successful run, target has "
-                    . count($targetSubjects) . " sub-* dirs) ({$elapsed}s)"
+                    "  ✓ SUCCESS (exit code race condition — script completed"
+                    . " before first poll. Target has {$targetCount}/{$sourceCount}"
+                    . " sub-* dirs) ({$elapsed}s)"
                 );
-                $this->stats['subjects_mapped'] = $this->stats['subjects_found'];
+                $this->stats['subjects_mapped'] = $sourceCount;
+                $this->_printSummary();
+                $this->_closeLogs();
+                return $this->stats;
+            }
+
+            // If exit code unknown but target is empty or partial → genuine failure
+            if ($isExitCodeUnknown && $targetCount < $sourceCount) {
+                $this->_error("SCRIPT_FAILED",
+                    "bids_reidentifier.php failed — exit code unknown and only"
+                    . " {$targetCount}/{$sourceCount} sub-* dirs in target."
+                    . " job_id={$jobId}. Check Apache error log."
+                );
                 $this->_printSummary();
                 $this->_closeLogs();
                 return $this->stats;
