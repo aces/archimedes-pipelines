@@ -541,7 +541,7 @@ Per-project in `project.json`:
             "on_success": ["team@example.com"],
             "on_error": ["admin@example.com"]
         },
-        "imaging": {
+        "bids": {
             "enabled": true,
             "on_success": ["imaging@example.com"],
             "on_error": ["admin@example.com"]
