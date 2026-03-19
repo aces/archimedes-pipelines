@@ -234,61 +234,61 @@ sub-EXTERNAL002	34	Male	patient	EXTERNAL-002	UOHI	1989-06-20
 ### Step 1: Participant Sync
 
 Create LORIS candidates and link ExternalIDs.
+Source/target directories are resolved automatically from `project.json → data_access.mount_path`.
 
 ```bash
 # Dry run (recommended first)
 php scripts/run_bids_participant_sync.php \
-  {collection_base_path}/{ProjectName}/deidentified-raw/bids \
-  --project="PROJECT" \
-  --dry-run -v
+    --collection=COLLECTION --project=PROJECT --dry-run -v
 
 # Live run
 php scripts/run_bids_participant_sync.php \
-  {collection_base_path}/{ProjectName}/deidentified-raw/bids \
-  --project="PROJECT"
+    --collection=COLLECTION --project=PROJECT --confirm
+
+# All projects
+php scripts/run_bids_participant_sync.php --all --confirm
 ```
 
 ### Step 2: BIDS Reidentification
 
-Map ExternalIDs to PSCIDs and copy to lorisid directory.
+Map ExternalIDs to PSCIDs and copy to `deidentified-lorisid/bids/`.
+Source/target directories are resolved automatically from `project.json → data_access.mount_path`.
 
 ```bash
 # Dry run (recommended first)
 php scripts/run_bids_reidentifier.php \
-  {collection_base_path}/{ProjectName}/deidentified-raw/bids \
-  {collection_base_path}/{ProjectName}/deidentified-lorisid/bids \
-  --dry-run -v
+    --collection=COLLECTION --project=PROJECT --dry-run -v
 
-# Live run 
+# Live run
 php scripts/run_bids_reidentifier.php \
-  {collection_base_path}/{ProjectName}/deidentified-raw/bids \
-  {collection_base_path}/{ProjectName}/deidentified-lorisid/bids
+    --collection=COLLECTION --project=PROJECT --confirm
 
-# Or with explicit project name
+# Force overwrite existing target directory
 php scripts/run_bids_reidentifier.php \
-  {collection_base_path}/{ProjectName}/deidentified-raw/bids \
-  {collection_base_path}/{ProjectName}/deidentified-lorisid/bids \
-  --project="PROJECT"
+    --collection=COLLECTION --project=PROJECT --confirm --force
+
+# All projects
+php scripts/run_bids_reidentifier.php --all --confirm
 ```
 
 ### Step 3: BIDS Import
 
-Import imaging data into LORIS-MRI.
+Import BIDS imaging data into LORIS-MRI.
+Source directory is resolved automatically from `project.json → data_access.mount_path`.
+Skips automatically if already successfully imported (tracked per project).
+
 
 ```bash
 # Dry run (recommended first)
-php scripts/run_imaging_pipeline.php \
-  --collection={collection} \
-  --project={project} \
-  --dry-run --verbose
+php scripts/run_bids_import_pipeline.php \
+    --collection=COLLECTION --project=PROJECT --dry-run -v
 
-# Process specific project
-php scripts/run_imaging_pipeline.php \
-  --collection={collection} \
-  --project={project} \
+# Live run
+php scripts/run_bids_import_pipeline.php \
+    --collection=COLLECTION --project=PROJECT --confirm
 
-# Process all projects
-php scripts/run_imaging_pipeline.php --all
+# All projects
+php scripts/run_bids_import_pipeline.php --all --confirm
 ```
 
 ---
@@ -299,8 +299,10 @@ php scripts/run_imaging_pipeline.php --all
 
 | Option | Description |
 |--------|-------------|
-| `<bids_directory>` | Path to BIDS root (required) |
-| `--project=NAME` | Override project name from project.json |
+| `--all` | Process all projects |
+| `--collection=NAME` | Specific collection |
+| `--project=NAME` | Specific project (requires `--collection`) |
+| `--confirm` | Execute live run (default is dry run) |
 | `--dry-run` | Test without changes |
 | `-v, --verbose` | Detailed output |
 | `--help` | Show help |
@@ -309,26 +311,26 @@ php scripts/run_imaging_pipeline.php --all
 
 | Option | Description |
 |--------|-------------|
-| `<source_dir>` | deidentified-raw/bids (required) |
-| `<target_dir>` | deidentified-lorisid/bids (required) |
-| `--project=NAME` | Project name (overrides project.json) |
+| `--all` | Process all projects |
+| `--collection=NAME` | Specific collection |
+| `--project=NAME` | Specific project (requires `--collection`) |
+| `--confirm` | Execute live run (default is dry run) |
 | `--dry-run` | Test without execution |
-| `--force` | Overwrite target if exists |
+| `--force` | Delete and overwrite existing target directory |
 | `-v, --verbose` | Detailed output |
-| `-h, --help` | Show help |
+| `--help` | Show help |
 
-### Imaging Pipeline (Step 3)
+### BIDS Import (Step 3)
 
 | Option | Description |
 |--------|-------------|
 | `--all` | Process all projects |
 | `--collection=NAME` | Specific collection |
-| `--project=NAME` | Specific project |
-| `--force` | Reprocess all scans |
-| `--async` | Run asynchronously |
-| `--no-validate` | Skip BIDS validation |
+| `--project=NAME` | Specific project (requires `--collection`) |
+| `--confirm` | Execute live run (default is dry run) |
 | `--dry-run` | Test without changes |
-| `--verbose` | Detailed output |
+| `--no-validate` | Skip BIDS validation |
+| `-v, --verbose` | Detailed output |
 | `--help` | Show help |
 
 ---

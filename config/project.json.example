@@ -30,11 +30,11 @@
   ],
 
   "candidate_defaults": {
-      "sex":     "Other",
-      "dob":     "1970-01-01",
-      "cohort":  "Control",
-      "site":    "University of Ottawa Heart Institute (UOHI)",
-      "project": "FDG-PET"
+    "sex":     "Other",
+    "dob":     "1970-01-01",
+    "cohort":  "Control",
+    "site":    "University of Ottawa Heart Institute (UOHI)",
+    "project": "FDG-PET"
   },
 
   "data_access": {
@@ -44,17 +44,17 @@
 
   "notification_emails": {
     "clinical": {
-     "enabled": true,
+      "enabled": true,
       "on_success": ["clinical_team@example.org"],
       "on_error": ["clinical_team@example.org"]
     },
-     "dicom": {
-          "enabled": true,
-          "on_success": ["team@example.com"],
-          "on_error": ["admin@example.com"]
-        }
-    "imaging": {
-     "enabled": true,
+    "dicom": {
+      "enabled": true,
+      "on_success": ["team@example.com"],
+      "on_error": ["admin@example.com"]
+    },
+    "bids": {
+      "enabled": true,
       "on_success": ["imaging_team@example.org"],
       "on_error": ["imaging_team@example.org"]
     }
@@ -63,8 +63,9 @@
   "logging": {
     "level": "INFO",
     "log_path": "/data/projects/Example-Study/logs"
-  }
+  },
+
   "project_mappings": {
-      "PROJECT": "1"
-    }
+    "PROJECT": "1"
+  }
 }
