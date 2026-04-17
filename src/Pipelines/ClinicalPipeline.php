@@ -19,6 +19,14 @@ use Psr\Log\LoggerInterface;
  *   4. Email          → success or failure notification with full summary
  *
  * Run log and error log share the same timestamp so they pair up.
+ *
+ * Reingestion tracking:
+ *   processed/clinical/.clinical_tracking.json stores MD5 hash per file.
+ *   On each run the current file hash is compared to the stored hash:
+ *     - No entry         → first insertion, upload everything
+ *     - Hash matches     → skip (no changes)
+ *     - Hash differs     → re-ingestion, upload full file (LORIS skips already-existing rows)
+ *   Use --force to bypass the hash check and always re-upload.
  */
 class ClinicalPipeline
 {
@@ -28,6 +36,7 @@ class ClinicalPipeline
     private Notification $notification;
     private bool $dryRun;
     private bool $verbose;
+    private bool $force;
 
     /** Timestamp for this pipeline run — shared across log files */
     private string $runTimestamp;
@@ -41,6 +50,11 @@ class ClinicalPipeline
     private ?string $runLogPath = null;
 
     private ?string $logDir = null;
+
+    // ── Change tracking ───────────────────────────────────────────────
+    /** Loaded from .clinical_tracking.json, written back after each project */
+    private array $trackingData     = [];
+    private ?string $trackingFilePath = null;
 
     // ── Tracking ─────────────────────────────────────────────────────
 
@@ -60,9 +74,9 @@ class ClinicalPipeline
         'data_uploaded'         => 0,
         'data_failed'           => 0,
         'data_skipped'          => 0,
-        'rows_uploaded'         => 0,
-        'rows_skipped'          => 0,
-        'candidates_created'    => 0,
+        'rows_inserted'         => 0,  // net-new rows saved by LORIS
+        'rows_existed'          => 0,  // rows already in LORIS, skipped
+        'pairs_processed'       => 0,  // candidate-session pairs touched (created or updated)
     ];
 
     /** DD extensions → instrument_type for LORIS */
@@ -85,11 +99,12 @@ class ClinicalPipeline
     // Constructor
     // ──────────────────────────────────────────────────────────────────
 
-    public function __construct(array $config, bool $dryRun = false, bool $verbose = false)
+    public function __construct(array $config, bool $dryRun = false, bool $verbose = false, bool $force = false)
     {
         $this->config       = $config;
         $this->dryRun       = $dryRun;
         $this->verbose      = $verbose;
+        $this->force        = $force;
         $this->runTimestamp  = date('Y-m-d_H-i-s');
 
         $logLevel = $verbose ? Logger::DEBUG : Logger::INFO;
@@ -121,6 +136,9 @@ class ClinicalPipeline
         $this->logger->info("Run: {$this->runTimestamp}");
         if ($this->dryRun) {
             $this->logger->info("MODE: DRY RUN");
+        }
+        if ($this->force) {
+            $this->logger->info("MODE: FORCE — hash check bypassed, all files will be re-uploaded");
         }
 
         try {
@@ -176,8 +194,15 @@ class ClinicalPipeline
         $this->installResults = [];
         $this->dataResults    = [];
 
+        // Load hash tracking for this project
+        $this->loadTrackingFile($project);
+
         $this->installFromDirectory($ddDir);
         $this->uploadFromDirectory($project, $dataDir);
+
+        // Flush tracking JSON after all uploads for this project
+        $this->saveTrackingFile();
+
         $this->writeProjectSummary($name);
         $this->sendNotification($project);
     }
@@ -321,18 +346,48 @@ class ClinicalPipeline
                 continue;
             }
 
-            if ($this->isAlreadyProcessed($project, $filename)) {
-                $this->log("  [{$filename}] SKIPPED — already processed");
-                $this->dataResults[$filename] = ['status' => 'skipped', 'reason' => 'already processed'];
+            // ── Hash-based change detection (replaces filename-only isAlreadyProcessed) ──
+            $changeStatus = $this->detectFileChange($filename, $f['path']);
+
+            if ($changeStatus === 'unchanged') {
+                // Pull last-known row counts from tracking so summary stays meaningful
+                $tracked = $this->trackingData[$filename] ?? [];
+                $lastInserted = $tracked['rows_saved']    ?? null;
+                $lastExisted  = $tracked['rows_existed']  ?? null;
+                $lastTotal    = isset($lastInserted, $lastExisted)
+                    ? $lastInserted + $lastExisted
+                    : null;
+                $lastRun      = $tracked['last_uploaded_at'] ?? null;
+
+                $detail = '';
+                if ($lastTotal !== null) {
+                    $detail = " (last run: {$lastInserted} new, {$lastExisted} existed";
+                    $detail .= $lastRun ? ", uploaded {$lastRun})" : ")";
+                }
+
+                $this->log("  [{$filename}] SKIPPED — no changes since last upload (hash match){$detail}");
+
+                $this->dataResults[$filename] = [
+                    'status'       => 'skipped',
+                    'reason'       => 'no changes',
+                    'last_inserted'=> $lastInserted,
+                    'last_existed' => $lastExisted,
+                    'last_run'     => $lastRun,
+                ];
+
+                // Accumulate last-known counts into global stats so final summary is honest
+                $this->stats['rows_existed']    += $lastExisted  ?? 0;
+                $this->stats['rows_inserted']   += $lastInserted ?? 0;
                 $this->stats['data_skipped']++;
                 continue;
             }
 
-            $this->processOneDataFile($project, $f);
+            // Pass first_upload / reingestion label through for summary reporting
+            $this->processOneDataFile($project, $f, $changeStatus);
         }
     }
 
-    private function processOneDataFile(array $project, array $fileInfo): void
+    private function processOneDataFile(array $project, array $fileInfo, string $changeStatus = 'first_upload'): void
     {
         $filePath = $fileInfo['path'];
         $filename = $fileInfo['name'];
@@ -341,7 +396,8 @@ class ClinicalPipeline
 
         $rows = $this->countRows($filePath);
 
-        $this->log("  [{$filename}] {$rows} rows, format: {$format}");
+        $label = ($changeStatus === 'reingestion') ? 'RE-INGEST' : 'NEW';
+        $this->log("  [{$filename}] {$rows} rows, format: {$format}, mode: {$label}");
 
         if ($rows === 0) {
             $this->log("    SKIPPED — empty file");
@@ -355,10 +411,16 @@ class ClinicalPipeline
             $this->log("    Instrument: {$baseName} (matched by filename)");
             $result = $this->doSingleUpload($baseName, $filePath, $format, $rows);
             $this->dataResults[$filename] = array_merge($result, [
-                'instruments' => [$baseName], 'rows' => $rows,
+                'instruments'   => [$baseName],
+                'rows'          => $rows,
+                'change_status' => $changeStatus,
+                'pairs'         => $result['pairs']     ?? 0,
+                'cand_ids'      => $result['cand_ids']  ?? [],
+                'rows_existed'  => $result['rows_existed'] ?? 0,
             ]);
             if ($result['status'] === 'success') {
-                $this->archiveFile($project, $filePath);
+                $this->updateTracking($filename, $filePath, $result);
+                $this->archiveSnapshot($project, $filePath);
             }
             return;
         }
@@ -370,8 +432,11 @@ class ClinicalPipeline
             $this->log("    FAILED — no matching instruments found in headers");
             $this->writeError($filename, "No matching instruments found");
             $this->dataResults[$filename] = [
-                'status' => 'failed', 'reason' => 'no matching instruments',
-                'instruments' => [], 'rows' => $rows,
+                'status'        => 'failed',
+                'reason'        => 'no matching instruments',
+                'instruments'   => [],
+                'rows'          => $rows,
+                'change_status' => $changeStatus,
             ];
             $this->stats['data_failed']++;
             return;
@@ -386,11 +451,17 @@ class ClinicalPipeline
         }
 
         $this->dataResults[$filename] = array_merge($result, [
-            'instruments' => $instruments, 'rows' => $rows,
+            'instruments'   => $instruments,
+            'rows'          => $rows,
+            'change_status' => $changeStatus,
+            'pairs'         => $result['pairs']     ?? 0,
+            'cand_ids'      => $result['cand_ids']  ?? [],
+            'rows_existed'  => $result['rows_existed'] ?? 0,
         ]);
 
         if ($result['status'] === 'success') {
-            $this->archiveFile($project, $filePath);
+            $this->updateTracking($filename, $filePath, $result);
+            $this->archiveSnapshot($project, $filePath);
         }
     }
 
@@ -499,18 +570,30 @@ class ClinicalPipeline
 
     private function extractUploadInfo(array $result): array
     {
-        $info = ['rows_saved' => null, 'rows_total' => null, 'rows_skipped' => 0, 'candidates' => 0];
+        $info = [
+            'rows_saved'   => null,
+            'rows_total'   => null,
+            'rows_existed' => 0,    // rows LORIS skipped — already in DB
+            'pairs'        => 0,    // candidate-session pairs touched
+            'cand_ids'     => [],   // CandID list for per-file display
+        ];
 
         $msg = $result['message'] ?? null;
         if (is_string($msg) && preg_match('/Saved (\d+) out of (\d+)/', $msg, $m)) {
             $info['rows_saved']   = (int)$m[1];
             $info['rows_total']   = (int)$m[2];
-            $info['rows_skipped'] = $info['rows_total'] - $info['rows_saved'];
+            $info['rows_existed'] = $info['rows_total'] - $info['rows_saved'];
         }
 
         $idMap = $result['idMapping'] ?? [];
         if (!empty($idMap) && is_array($idMap)) {
-            $info['candidates'] = count($idMap);
+            $info['pairs'] = count($idMap);
+            foreach ($idMap as $m) {
+                $cid = $m['CandID'] ?? $m['candid'] ?? $m['candId'] ?? null;
+                if ($cid) {
+                    $info['cand_ids'][] = (string)$cid;
+                }
+            }
         }
 
         return $info;
@@ -522,21 +605,158 @@ class ClinicalPipeline
         if ($instCount !== null) {
             $parts[] = "{$instCount} instruments";
         }
+
         if ($ui['rows_saved'] !== null) {
-            $parts[] = "{$ui['rows_saved']}/{$ui['rows_total']} rows saved";
+            if ($ui['rows_saved'] === 0 && $ui['rows_existed'] > 0) {
+                $parts[] = "0 new rows — {$ui['rows_existed']} already existed in LORIS";
+            } elseif ($ui['rows_existed'] > 0) {
+                $parts[] = "{$ui['rows_saved']} new rows inserted, {$ui['rows_existed']} already existed";
+            } else {
+                $parts[] = "{$ui['rows_saved']} rows inserted";
+            }
         }
-        if ($ui['candidates'] > 0) {
-            $parts[] = "{$ui['candidates']} new candidates";
+
+        if ($ui['pairs'] > 0) {
+            $parts[] = "{$ui['pairs']} candidate-session pair(s) processed";
         }
+
         $this->log("    " . implode(' — ', $parts));
+
+        // CandID list (compact, max 10 before truncating)
+        if (!empty($ui['cand_ids'])) {
+            $display = array_slice($ui['cand_ids'], 0, 10);
+            $suffix  = count($ui['cand_ids']) > 10 ? ' … +' . (count($ui['cand_ids']) - 10) . ' more' : '';
+            $this->log("    CandIDs: " . implode(', ', $display) . $suffix);
+        }
     }
 
     private function tallyUploadSuccess(array $ui): void
     {
         $this->stats['data_uploaded']++;
-        $this->stats['rows_uploaded']      += $ui['rows_saved'] ?? 0;
-        $this->stats['rows_skipped']       += $ui['rows_skipped'] ?? 0;
-        $this->stats['candidates_created'] += $ui['candidates'];
+        $this->stats['rows_inserted']    += $ui['rows_saved']   ?? 0;
+        $this->stats['rows_existed']     += $ui['rows_existed'] ?? 0;
+        $this->stats['pairs_processed']  += $ui['pairs']        ?? 0;
+    }
+
+    // ══════════════════════════════════════════════════════════════════
+    //  HASH-BASED REINGESTION TRACKING
+    //
+    //  Tracking file: processed/clinical/.clinical_tracking.json
+    //  Schema per entry:
+    //    {
+    //      "hash":             "md5 of file at last successful upload",
+    //      "first_uploaded_at": "ISO timestamp of very first upload",
+    //      "last_uploaded_at": "ISO timestamp of most recent upload",
+    //      "run_timestamp":    "pipeline run ID",
+    //      "upload_count":     number of times this file has been uploaded,
+    //      "rows_total":       total rows in file at last upload,
+    //      "rows_saved":       rows LORIS actually inserted at last upload,
+    //      "rows_skipped":     rows LORIS skipped (already existed)
+    //    }
+    //
+    //  Decision logic (detectFileChange):
+    //    no entry in tracking → "first_upload"
+    //    hash differs         → "reingestion"   (LORIS will only save new rows)
+    //    hash matches         → "unchanged"     (skip entirely)
+    //    --force flag         → always "reingestion" regardless of hash
+    // ══════════════════════════════════════════════════════════════════
+
+    private function loadTrackingFile(array $project): void
+    {
+        $base = rtrim($project['data_access']['mount_path'] ?? '', '/') . '/processed/clinical';
+
+        if (!is_dir($base)) {
+            mkdir($base, 0755, true);
+        }
+
+        $this->trackingFilePath = "{$base}/.clinical_tracking.json";
+        $this->trackingData     = [];
+
+        if (file_exists($this->trackingFilePath)) {
+            $raw = file_get_contents($this->trackingFilePath);
+            $decoded = json_decode($raw, true);
+            $this->trackingData = is_array($decoded) ? $decoded : [];
+            $this->log("  Tracking: loaded " . count($this->trackingData) . " file(s) from {$this->trackingFilePath}");
+        } else {
+            $this->log("  Tracking: no existing tracking file — all files treated as first upload");
+        }
+    }
+
+    private function saveTrackingFile(): void
+    {
+        if ($this->trackingFilePath === null) {
+            return;
+        }
+        file_put_contents(
+            $this->trackingFilePath,
+            json_encode($this->trackingData, JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES)
+        );
+    }
+
+    /**
+     * Compare current file hash against stored hash.
+     *
+     * @return string  "first_upload" | "reingestion" | "unchanged"
+     */
+    private function detectFileChange(string $filename, string $filePath): string
+    {
+        if ($this->force) {
+            // --force bypasses hash check; treat as reingestion so label is clear
+            return 'reingestion';
+        }
+
+        $currentHash = md5_file($filePath);
+        $stored      = $this->trackingData[$filename] ?? null;
+
+        if ($stored === null) {
+            return 'first_upload';
+        }
+
+        return ($currentHash !== ($stored['hash'] ?? '')) ? 'reingestion' : 'unchanged';
+    }
+
+    /**
+     * Record a successful upload into the tracking JSON.
+     * Preserves first_uploaded_at across re-runs.
+     */
+    private function updateTracking(string $filename, string $filePath, array $uploadResult): void
+    {
+        $existing = $this->trackingData[$filename] ?? null;
+        $now      = date('Y-m-d\TH:i:s');
+
+        $this->trackingData[$filename] = [
+            'hash'             => md5_file($filePath),
+            'first_uploaded_at'=> $existing['first_uploaded_at'] ?? $now,
+            'last_uploaded_at' => $now,
+            'run_timestamp'    => $this->runTimestamp,
+            'upload_count'     => ($existing['upload_count'] ?? 0) + 1,
+            'rows_total'       => $uploadResult['rows_total'] ?? null,
+            'rows_saved'       => $uploadResult['rows_saved'] ?? null,
+            'rows_existed'     => $uploadResult['rows_existed'] ?? 0,
+        ];
+
+        // Flush immediately so a mid-run crash doesn't lose the entry
+        $this->saveTrackingFile();
+    }
+
+    /**
+     * Archive a snapshot of the processed file for audit purposes.
+     * Named with date prefix; timestamp suffix avoids overwrite on same-day re-runs.
+     */
+    private function archiveSnapshot(array $project, string $src): void
+    {
+        $dest = rtrim($project['data_access']['mount_path'] ?? '', '/')
+            . '/processed/clinical/' . date('Y-m-d');
+        if (!is_dir($dest)) {
+            mkdir($dest, 0755, true);
+        }
+        $target = "{$dest}/" . basename($src);
+        if (file_exists($target)) {
+            $target = "{$dest}/" . time() . '_' . basename($src);
+        }
+        if (copy($src, $target)) {
+            $this->log("    Snapshot archived → processed/clinical/" . date('Y-m-d') . "/" . basename($target));
+        }
     }
 
     // ══════════════════════════════════════════════════════════════════
@@ -565,6 +785,7 @@ class ClinicalPipeline
                 . " ARCHIMEDES Clinical Pipeline — Run Log\n"
                 . " Started: " . date('Y-m-d H:i:s T') . "\n"
                 . ($this->dryRun ? " Mode: DRY RUN\n" : "")
+                . ($this->force  ? " Mode: FORCE (hash check bypassed)\n" : "")
                 . "{$sep}\n\n"
             );
         }
@@ -718,34 +939,36 @@ class ClinicalPipeline
         if (empty($this->dataResults)) {
             $this->log("    (no data files)");
         } else {
-            $success = $failed = $skipped = [];
+            // Separate success into first-upload vs re-ingestion for clarity
+            $firstUpload  = [];
+            $reingested   = [];
+            $failed       = [];
+            $skipped      = [];
+
             foreach ($this->dataResults as $file => $r) {
                 switch ($r['status']) {
-                    case 'success': $success[] = $file; break;
+                    case 'success':
+                        if (($r['change_status'] ?? '') === 'reingestion') {
+                            $reingested[] = $file;
+                        } else {
+                            $firstUpload[] = $file;
+                        }
+                        break;
                     case 'failed':  $failed[]  = $file; break;
                     case 'skipped': $skipped[] = $file; break;
                 }
             }
 
-            if (!empty($success)) {
-                $this->log("    Uploaded (" . count($success) . "):");
-                foreach ($success as $f) {
-                    $r    = $this->dataResults[$f];
-                    $inst = implode(', ', $r['instruments'] ?? []);
-                    $info = "rows={$r['rows']}";
-                    if (isset($r['rows_saved'])) {
-                        $info .= " saved={$r['rows_saved']}";
-                    }
-                    if (($r['rows_skipped'] ?? 0) > 0) {
-                        $info .= " existing={$r['rows_skipped']}";
-                    }
-                    if (($r['candidates'] ?? 0) > 0) {
-                        $info .= " new_candidates={$r['candidates']}";
-                    }
-                    if (isset($r['elapsed'])) {
-                        $info .= " time={$r['elapsed']}s";
-                    }
-                    $this->log("      + {$f} [{$inst}] ({$info})");
+            if (!empty($firstUpload)) {
+                $this->log("    First upload (" . count($firstUpload) . "):");
+                foreach ($firstUpload as $f) {
+                    $this->log("      + " . $this->formatDataResultLine($f));
+                }
+            }
+            if (!empty($reingested)) {
+                $this->log("    Re-ingested — file changed, new rows only (" . count($reingested) . "):");
+                foreach ($reingested as $f) {
+                    $this->log("      ↺ " . $this->formatDataResultLine($f));
                 }
             }
             if (!empty($failed)) {
@@ -756,16 +979,64 @@ class ClinicalPipeline
                 }
             }
             if (!empty($skipped)) {
-                $this->log("    Skipped (" . count($skipped) . "):");
+                $this->log("    Skipped — no changes (" . count($skipped) . "):");
                 foreach ($skipped as $f) {
-                    $reason = $this->dataResults[$f]['reason'] ?? '?';
-                    $this->log("      - {$f} — {$reason}");
+                    $r      = $this->dataResults[$f];
+                    $reason = $r['reason'] ?? '?';
+                    if ($reason === 'no changes' && isset($r['last_inserted'], $r['last_existed'])) {
+                        $lastRun = $r['last_run'] ? " @ {$r['last_run']}" : '';
+                        $this->log("      - {$f} — {$r['last_inserted']} new / {$r['last_existed']} existed (last run{$lastRun})");
+                    } else {
+                        $this->log("      - {$f} — {$reason}");
+                    }
                 }
             }
         }
 
         $this->log("");
         $this->log("────────────────────────────────────────");
+    }
+
+    private function formatDataResultLine(string $file): string
+    {
+        $r    = $this->dataResults[$file];
+        $inst = implode(', ', $r['instruments'] ?? []);
+
+        // Row accounting
+        $rowParts = [];
+        if (isset($r['rows_saved'])) {
+            if ($r['rows_saved'] === 0 && ($r['rows_existed'] ?? 0) > 0) {
+                $rowParts[] = "0 new rows — {$r['rows_existed']} already existed";
+            } elseif (($r['rows_existed'] ?? 0) > 0) {
+                $rowParts[] = "{$r['rows_saved']} new, {$r['rows_existed']} existed";
+            } else {
+                $rowParts[] = "{$r['rows_saved']} rows inserted";
+            }
+        } elseif (isset($r['rows'])) {
+            $rowParts[] = "{$r['rows']} rows";
+        }
+
+        // Candidate-session pairs
+        if (($r['pairs'] ?? 0) > 0) {
+            $rowParts[] = "{$r['pairs']} candidate-session pair(s)";
+        }
+
+        // CandID list
+        $candStr = '';
+        if (!empty($r['cand_ids'])) {
+            $display = array_slice($r['cand_ids'], 0, 8);
+            $suffix  = count($r['cand_ids']) > 8 ? ' +' . (count($r['cand_ids']) - 8) . ' more' : '';
+            $candStr = " [" . implode(', ', $display) . $suffix . "]";
+        }
+
+        if (isset($r['elapsed'])) {
+            $rowParts[] = "{$r['elapsed']}s";
+        }
+
+        $infoStr = !empty($rowParts) ? ' (' . implode(', ', $rowParts) . ')' : '';
+        $instStr = $inst ? " [{$inst}]" : '';
+
+        return "{$file}{$instStr}{$infoStr}{$candStr}";
     }
 
     // ══════════════════════════════════════════════════════════════════
@@ -789,13 +1060,13 @@ class ClinicalPipeline
         $this->log("    Install failures:   {$s['dd_failed']}");
         $this->log("");
         $this->log("  Data:");
-        $this->log("    Data files found:   {$s['data_files_found']}");
-        $this->log("    Uploaded:           {$s['data_uploaded']}");
-        $this->log("    Failed:             {$s['data_failed']}");
-        $this->log("    Skipped:            {$s['data_skipped']}");
-        $this->log("    Rows uploaded:      {$s['rows_uploaded']}");
-        $this->log("    Rows skipped:       {$s['rows_skipped']}");
-        $this->log("    Candidates created: {$s['candidates_created']}");
+        $this->log("    Data files found:    {$s['data_files_found']}");
+        $this->log("    Data files processed:{$s['data_uploaded']}");
+        $this->log("    Data files failed:   {$s['data_failed']}");
+        $this->log("    Data files skipped:  {$s['data_skipped']} (hash unchanged)");
+        $this->log("    Rows inserted:       {$s['rows_inserted']} (net-new rows saved by LORIS)");
+        $this->log("    Rows existed:        {$s['rows_existed']} (already in LORIS — includes last-known from skipped files)");
+        $this->log("    Candidate-session pairs touched: {$s['pairs_processed']}");
         $this->log("");
 
         if ($this->runLogPath) {
@@ -841,13 +1112,16 @@ class ClinicalPipeline
         $body  = "Project: {$name}\n";
         $body .= "Modality: clinical\n";
         $body .= "Timestamp: " . date('Y-m-d H:i:s') . "\n";
-        $body .= "Run: {$this->runTimestamp}\n\n";
+        $body .= "Run: {$this->runTimestamp}\n";
+        if ($this->force) {
+            $body .= "Mode: FORCE (hash check bypassed)\n";
+        }
+        $body .= "\n";
 
         // ── Instrument Installation ──────────────────────────────────
 
         $body .= "Instrument Installation:\n";
 
-        // Group install results by status
         $installByStatus = ['installed' => [], 'exists' => [], 'failed' => [], 'dry_run' => []];
         foreach ($this->installResults as $file => $r) {
             $installByStatus[$r['status']][] = $file;
@@ -857,17 +1131,14 @@ class ClinicalPipeline
         if ($installCount === 0) {
             $body .= "  (no DD files found)\n";
         } else {
-            // Newly installed
             if (!empty($installByStatus['installed'])) {
                 $count = count($installByStatus['installed']);
                 $body .= "  ✔ Installed: {$count} (" . implode(', ', $installByStatus['installed']) . ")\n";
             }
-            // Already existed
             if (!empty($installByStatus['exists'])) {
                 $count = count($installByStatus['exists']);
                 $body .= "  ● Already existed: {$count} (" . implode(', ', $installByStatus['exists']) . ")\n";
             }
-            // Failed — group by error reason
             if (!empty($installByStatus['failed'])) {
                 $failedByReason = [];
                 foreach ($installByStatus['failed'] as $file) {
@@ -889,61 +1160,61 @@ class ClinicalPipeline
 
         $body .= "Data Ingestion:\n";
 
-        // Group data results by status
-        $dataByStatus = ['success' => [], 'failed' => [], 'skipped' => []];
+        $firstUpload = $reingested = $failed = $skipped = [];
         foreach ($this->dataResults as $file => $r) {
-            $dataByStatus[$r['status']][] = $file;
+            switch ($r['status']) {
+                case 'success':
+                    if (($r['change_status'] ?? '') === 'reingestion') {
+                        $reingested[] = $file;
+                    } else {
+                        $firstUpload[] = $file;
+                    }
+                    break;
+                case 'failed':  $failed[]  = $file; break;
+                case 'skipped': $skipped[] = $file; break;
+            }
         }
 
         $dataCount = count($this->dataResults);
         if ($dataCount === 0) {
             $body .= "  (no data files found)\n";
         } else {
-            // Uploaded — show each with detail
-            if (!empty($dataByStatus['success'])) {
-                $count = count($dataByStatus['success']);
-                $body .= "  ✔ Uploaded: {$count}\n";
-                foreach ($dataByStatus['success'] as $file) {
-                    $r = $this->dataResults[$file];
-                    $inst = implode(', ', $r['instruments'] ?? []);
-                    $info = [];
-                    if (isset($r['rows_saved']) && isset($r['rows'])) {
-                        $info[] = "{$r['rows_saved']}/{$r['rows']} rows";
-                    } elseif (isset($r['rows'])) {
-                        $info[] = "{$r['rows']} rows";
-                    }
-                    if (($r['candidates'] ?? 0) > 0) {
-                        $info[] = "{$r['candidates']} new candidates";
-                    }
-                    $infoStr = !empty($info) ? ' (' . implode(', ', $info) . ')' : '';
-                    $instStr = $inst ? " [{$inst}]" : '';
-                    $body .= "     {$file}{$instStr}{$infoStr}\n";
+            // First uploads
+            if (!empty($firstUpload)) {
+                $body .= "  ✔ First upload (" . count($firstUpload) . "):\n";
+                foreach ($firstUpload as $file) {
+                    $body .= "     " . $this->formatDataResultLine($file) . "\n";
                 }
             }
-
-            // Failed — group by reason
-            if (!empty($dataByStatus['failed'])) {
+            // Re-ingestions
+            if (!empty($reingested)) {
+                $body .= "  ↺ Re-ingested — file changed, new rows only (" . count($reingested) . "):\n";
+                foreach ($reingested as $file) {
+                    $body .= "     " . $this->formatDataResultLine($file) . "\n";
+                }
+            }
+            // Failed
+            if (!empty($failed)) {
                 $failedByReason = [];
-                foreach ($dataByStatus['failed'] as $file) {
+                foreach ($failed as $file) {
                     $reason = $this->dataResults[$file]['reason'] ?? 'error';
                     $failedByReason[$reason][] = $file;
                 }
-                $count = count($dataByStatus['failed']);
+                $count = count($failed);
                 $failedParts = [];
                 foreach ($failedByReason as $reason => $files) {
                     $failedParts[] = implode(', ', $files) . " [{$reason}]";
                 }
                 $body .= "  ✗ Failed: {$count} (" . implode('; ', $failedParts) . ")\n";
             }
-
-            // Skipped — group by reason
-            if (!empty($dataByStatus['skipped'])) {
+            // Skipped
+            if (!empty($skipped)) {
                 $skippedByReason = [];
-                foreach ($dataByStatus['skipped'] as $file) {
+                foreach ($skipped as $file) {
                     $reason = $this->dataResults[$file]['reason'] ?? 'unknown';
                     $skippedByReason[$reason][] = $file;
                 }
-                $count = count($dataByStatus['skipped']);
+                $count = count($skipped);
                 $skippedParts = [];
                 foreach ($skippedByReason as $reason => $files) {
                     $skippedParts[] = implode(', ', $files) . " [{$reason}]";
@@ -959,18 +1230,15 @@ class ClinicalPipeline
         $body .= str_repeat('-', 50) . "\n";
         $body .= "Totals:\n";
         $body .= "  DD files: {$s['dd_files_found']} found, {$s['dd_installed']} installed, {$s['dd_already_existed']} existed, {$s['dd_failed']} failed\n";
-        $body .= "  Data files: {$s['data_files_found']} found, {$s['data_uploaded']} uploaded, {$s['data_failed']} failed, {$s['data_skipped']} skipped\n";
+        $body .= "  Data files: {$s['data_files_found']} found, {$s['data_uploaded']} processed, {$s['data_failed']} failed, {$s['data_skipped']} skipped\n";
 
-        if ($s['rows_uploaded'] > 0 || $s['rows_skipped'] > 0) {
-            $totalRows = $s['rows_uploaded'] + $s['rows_skipped'];
-            $body .= "  Rows: {$s['rows_uploaded']}/{$totalRows} saved";
-            if ($s['rows_skipped'] > 0) {
-                $body .= " ({$s['rows_skipped']} already exist)";
-            }
-            $body .= "\n";
+        $totalRows = $s['rows_inserted'] + $s['rows_existed'];
+        if ($totalRows > 0) {
+            $body .= "  Rows inserted (new):           {$s['rows_inserted']}\n";
+            $body .= "  Rows existed  (skipped LORIS): {$s['rows_existed']}\n";
         }
-        if ($s['candidates_created'] > 0) {
-            $body .= "  Candidates created: {$s['candidates_created']}\n";
+        if ($s['pairs_processed'] > 0) {
+            $body .= "  Candidate-session pairs touched: {$s['pairs_processed']}\n";
         }
 
         $body .= "\n";
@@ -983,8 +1251,7 @@ class ClinicalPipeline
         } elseif ($s['data_uploaded'] > 0) {
             $body .= "✔ Ingestion completed successfully.\n";
         } elseif ($s['data_skipped'] > 0 && $s['data_uploaded'] === 0) {
-            $body .= "✔ Ingestion completed. All data files were skipped\n";
-            $body .= "   (already processed or no new data available).\n";
+            $body .= "✔ Ingestion completed. All files skipped — no content changes detected (hash match).\n";
         } else {
             $body .= "✔ Ingestion completed. No data files to process.\n";
         }
@@ -1035,36 +1302,6 @@ class ClinicalPipeline
         }
         fclose($fh);
         return $c;
-    }
-
-    private function isAlreadyProcessed(array $project, string $filename): bool
-    {
-        $base = rtrim($project['data_access']['mount_path'] ?? '', '/') . '/processed/clinical';
-        if (!is_dir($base)) {
-            return false;
-        }
-        foreach (glob("{$base}/*", GLOB_ONLYDIR) as $d) {
-            if (file_exists("{$d}/{$filename}")) {
-                return true;
-            }
-        }
-        return false;
-    }
-
-    private function archiveFile(array $project, string $src): void
-    {
-        $dest = rtrim($project['data_access']['mount_path'] ?? '', '/')
-            . '/processed/clinical/' . date('Y-m-d');
-        if (!is_dir($dest)) {
-            mkdir($dest, 0755, true);
-        }
-        $target = "{$dest}/" . basename($src);
-        if (file_exists($target)) {
-            $target = "{$dest}/" . time() . '_' . basename($src);
-        }
-        if (copy($src, $target)) {
-            $this->log("    Archived to processed/clinical/" . date('Y-m-d') . "/");
-        }
     }
 
     private function discoverProjects(array $filters): array

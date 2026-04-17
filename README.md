@@ -470,6 +470,20 @@ php scripts/run_dicom_import.php --collection=archimedes --project=FDG-PET --con
 {collection_base_path}/{ProjectName}/
 ├── project.json                          # Project configuration
 │
+├── coded-raw/                            # coded raw participant data
+│   ├── clinical/                         # coded raw Patient records & clinical assessment in csv/tsv
+│   ├── imaging/
+│   │   └── dicoms/                       # coded raw DICOM studies (one folder per study)
+│   ├── bids/                             # coded raw MRI and EEG Data (ExternalIDs)
+│   └── genomics/
+│
+├──coded-lorisid/                         # LORIS-relabelled coded data
+│   ├── clinical/                         #  coded Patient records & clinical assessment in csv/tsv
+│   ├── imaging/
+│   │   └── dicoms/                       # coded  DICOM studies (one folder per study)
+│   ├── bids/                             # coded MRI and EEG Data (ExternalIDs)
+│   └── genomics/
+│
 ├── deidentified-raw/                     # De-identified participant data
 │   ├── clinical/                         # Raw Patient records & clinical assessment in csv/tsv
 │   ├── imaging/
@@ -477,7 +491,7 @@ php scripts/run_dicom_import.php --collection=archimedes --project=FDG-PET --con
 │   ├── bids/                             # Deidentified MRI and EEG Data (ExternalIDs)
 │   └── genomics/
 │
-├── deidentified-lorisid/                 # LORIS-relabelled data
+├── deidentified-lorisid/                 # LORIS-relabelled deidentified data
 │   ├── imaging/
 │   │   └── dicoms/                       # DICOM data with LORIS IDs
 │   ├── bids/                             # Reidentified MRI and EEG Data with LORIS IDs
