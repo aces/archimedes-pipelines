@@ -27,6 +27,12 @@ use Psr\Log\LoggerInterface;
  *     - Hash matches     → skip (no changes)
  *     - Hash differs     → re-ingestion, upload full file (LORIS skips already-existing rows)
  *   Use --force to bypass the hash check and always re-upload.
+ *
+ * DoB normalization:
+ *   Before upload, the pipeline rewrites the DoB column to YYYY-MM-01 per
+ *   ARCHIMEDES privacy policy (day jittered to 01, missing parts default to 01).
+ *   Hash tracking and snapshot archiving continue to use the original source
+ *   file - only the upload step sees the normalized copy.
  */
 class ClinicalPipeline
 {
@@ -38,30 +44,30 @@ class ClinicalPipeline
     private bool $verbose;
     private bool $force;
 
-    /** Timestamp for this pipeline run — shared across log files */
+    /** Timestamp for this pipeline run - shared across log files */
     private string $runTimestamp;
 
-    /** @var resource|null Error log — opened lazily on first error */
+    /** @var resource|null Error log - opened lazily on first error */
     private $errorFh = null;
     private ?string $errorLogPath = null;
 
-    /** @var resource|null Run log — opened per project */
+    /** @var resource|null Run log - opened per project */
     private $runLogFh = null;
     private ?string $runLogPath = null;
 
     private ?string $logDir = null;
 
-    // ── Change tracking ───────────────────────────────────────────────
+    // -- Change tracking --------------------------------------------------
     /** Loaded from .clinical_tracking.json, written back after each project */
     private array $trackingData     = [];
     private ?string $trackingFilePath = null;
 
-    // ── Tracking ─────────────────────────────────────────────────────
+    // -- Tracking ---------------------------------------------------------
 
-    /** Install results per file: filename → {status, type, time, error} */
+    /** Install results per file: filename -> {status, type, time, error} */
     private array $installResults = [];
 
-    /** Data upload results per file: filename → {status, reason, instruments, rows, ...} */
+    /** Data upload results per file: filename -> {status, reason, instruments, rows, ...} */
     private array $dataResults = [];
 
     /** Global stats across all projects in this run */
@@ -79,14 +85,14 @@ class ClinicalPipeline
         'pairs_processed'       => 0,  // candidate-session pairs touched (created or updated)
     ];
 
-    /** DD extensions → instrument_type for LORIS */
+    /** DD extensions -> instrument_type for LORIS */
     private const DD_EXTENSIONS = [
         'csv'   => 'redcap',
         'linst' => 'linst',
         'json'  => 'bids',
     ];
 
-    /** Data file extensions → format for LORIS */
+    /** Data file extensions -> format for LORIS */
     private const DATA_EXTENSIONS = [
         'csv' => 'LORIS_CSV',
         'tsv' => 'BIDS_TSV',
@@ -94,6 +100,9 @@ class ClinicalPipeline
 
     /** Admin forms to exclude */
     private const DEFAULT_EXCLUDE_FORMS = ['nip_connector', 'project_request_form'];
+
+    /** DoB column names recognized for normalization (case-insensitive) */
+    private const DOB_COLUMN_NAMES = ['dob', 'date_of_birth', 'birth_date'];
 
     // ──────────────────────────────────────────────────────────────────
     // Constructor
@@ -138,7 +147,7 @@ class ClinicalPipeline
             $this->logger->info("MODE: DRY RUN");
         }
         if ($this->force) {
-            $this->logger->info("MODE: FORCE — hash check bypassed, all files will be re-uploaded");
+            $this->logger->info("MODE: FORCE - hash check bypassed, all files will be re-uploaded");
         }
 
         try {
@@ -252,7 +261,7 @@ class ClinicalPipeline
         $this->log("  [{$type}] {$filename}");
 
         if ($this->dryRun) {
-            $this->log("    DRY RUN — would install");
+            $this->log("    DRY RUN - would install");
             $this->installResults[$filename] = ['status' => 'dry_run', 'type' => $type];
             return;
         }
@@ -305,7 +314,7 @@ class ClinicalPipeline
     }
 
     // ══════════════════════════════════════════════════════════════════
-    //  STEP 2: Upload data — file by file
+    //  STEP 2: Upload data - file by file
     // ══════════════════════════════════════════════════════════════════
 
     private function uploadFromDirectory(array $project, string $dataDir): void
@@ -340,13 +349,13 @@ class ClinicalPipeline
             $filename = $f['name'];
 
             if (in_array($filename, $excludeFiles, true)) {
-                $this->log("  [{$filename}] SKIPPED — excluded in project.json");
+                $this->log("  [{$filename}] SKIPPED - excluded in project.json");
                 $this->dataResults[$filename] = ['status' => 'skipped', 'reason' => 'excluded'];
                 $this->stats['data_skipped']++;
                 continue;
             }
 
-            // ── Hash-based change detection (replaces filename-only isAlreadyProcessed) ──
+            // -- Hash-based change detection --
             $changeStatus = $this->detectFileChange($filename, $f['path']);
 
             if ($changeStatus === 'unchanged') {
@@ -365,7 +374,7 @@ class ClinicalPipeline
                     $detail .= $lastRun ? ", uploaded {$lastRun})" : ")";
                 }
 
-                $this->log("  [{$filename}] SKIPPED — no changes since last upload (hash match){$detail}");
+                $this->log("  [{$filename}] SKIPPED - no changes since last upload (hash match){$detail}");
 
                 $this->dataResults[$filename] = [
                     'status'       => 'skipped',
@@ -400,68 +409,84 @@ class ClinicalPipeline
         $this->log("  [{$filename}] {$rows} rows, format: {$format}, mode: {$label}");
 
         if ($rows === 0) {
-            $this->log("    SKIPPED — empty file");
+            $this->log("    SKIPPED - empty file");
             $this->dataResults[$filename] = ['status' => 'skipped', 'reason' => 'empty', 'rows' => 0];
             $this->stats['data_skipped']++;
             return;
         }
 
-        // Case A: filename matches instrument
-        if ($this->client->instrumentExists($baseName)) {
-            $this->log("    Instrument: {$baseName} (matched by filename)");
-            $result = $this->doSingleUpload($baseName, $filePath, $format, $rows);
+        // -- DoB normalization ---------------------------------------------
+        // Upload a rewritten copy with DoB forced to YYYY-MM-01. Hash
+        // tracking and snapshot archiving continue to use $filePath (the
+        // original source), so change detection and audit trail are
+        // unaffected by this rewrite.
+        $uploadPath = $this->normalizeDobInFile($filePath, $format);
+        $usingTemp  = ($uploadPath !== $filePath);
+
+        try {
+            // Case A: filename matches instrument
+            if ($this->client->instrumentExists($baseName)) {
+                $this->log("    Instrument: {$baseName} (matched by filename)");
+                $result = $this->doSingleUpload($baseName, $uploadPath, $format, $rows);
+                $this->dataResults[$filename] = array_merge($result, [
+                    'instruments'   => [$baseName],
+                    'rows'          => $rows,
+                    'change_status' => $changeStatus,
+                    'pairs'         => $result['pairs']        ?? 0,
+                    'cand_ids'      => $result['cand_ids']     ?? [],
+                    'rows_existed'  => $result['rows_existed'] ?? 0,
+                ]);
+                if ($result['status'] === 'success') {
+                    $this->updateTracking($filename, $filePath, $result);
+                    $this->archiveSnapshot($project, $filePath);
+                }
+                return;
+            }
+
+            // Case B: detect from headers (read from uploadPath for consistency
+            // with what actually gets uploaded; headers are identical anyway)
+            $instruments = $this->detectInstrumentsFromHeaders($uploadPath, $format);
+
+            if (empty($instruments)) {
+                $this->log("    FAILED - no matching instruments found in headers");
+                $this->writeError($filename, "No matching instruments found");
+                $this->dataResults[$filename] = [
+                    'status'        => 'failed',
+                    'reason'        => 'no matching instruments',
+                    'instruments'   => [],
+                    'rows'          => $rows,
+                    'change_status' => $changeStatus,
+                ];
+                $this->stats['data_failed']++;
+                return;
+            }
+
+            $this->log("    Instruments (" . count($instruments) . "): " . implode(', ', $instruments));
+
+            if (count($instruments) === 1) {
+                $result = $this->doSingleUpload($instruments[0], $uploadPath, $format, $rows);
+            } else {
+                $result = $this->doMultiUpload($instruments, $uploadPath, $format, $rows);
+            }
+
             $this->dataResults[$filename] = array_merge($result, [
-                'instruments'   => [$baseName],
+                'instruments'   => $instruments,
                 'rows'          => $rows,
                 'change_status' => $changeStatus,
-                'pairs'         => $result['pairs']     ?? 0,
-                'cand_ids'      => $result['cand_ids']  ?? [],
+                'pairs'         => $result['pairs']        ?? 0,
+                'cand_ids'      => $result['cand_ids']     ?? [],
                 'rows_existed'  => $result['rows_existed'] ?? 0,
             ]);
+
             if ($result['status'] === 'success') {
                 $this->updateTracking($filename, $filePath, $result);
                 $this->archiveSnapshot($project, $filePath);
             }
-            return;
-        }
-
-        // Case B: detect from headers
-        $instruments = $this->detectInstrumentsFromHeaders($filePath, $format);
-
-        if (empty($instruments)) {
-            $this->log("    FAILED — no matching instruments found in headers");
-            $this->writeError($filename, "No matching instruments found");
-            $this->dataResults[$filename] = [
-                'status'        => 'failed',
-                'reason'        => 'no matching instruments',
-                'instruments'   => [],
-                'rows'          => $rows,
-                'change_status' => $changeStatus,
-            ];
-            $this->stats['data_failed']++;
-            return;
-        }
-
-        $this->log("    Instruments (" . count($instruments) . "): " . implode(', ', $instruments));
-
-        if (count($instruments) === 1) {
-            $result = $this->doSingleUpload($instruments[0], $filePath, $format, $rows);
-        } else {
-            $result = $this->doMultiUpload($instruments, $filePath, $format, $rows);
-        }
-
-        $this->dataResults[$filename] = array_merge($result, [
-            'instruments'   => $instruments,
-            'rows'          => $rows,
-            'change_status' => $changeStatus,
-            'pairs'         => $result['pairs']     ?? 0,
-            'cand_ids'      => $result['cand_ids']  ?? [],
-            'rows_existed'  => $result['rows_existed'] ?? 0,
-        ]);
-
-        if ($result['status'] === 'success') {
-            $this->updateTracking($filename, $filePath, $result);
-            $this->archiveSnapshot($project, $filePath);
+        } finally {
+            // Always clean up the normalized temp file, even on exception
+            if ($usingTemp && file_exists($uploadPath)) {
+                @unlink($uploadPath);
+            }
         }
     }
 
@@ -500,7 +525,7 @@ class ClinicalPipeline
     private function doSingleUpload(string $instrument, string $filePath, string $format, int $rows): array
     {
         if ($this->dryRun) {
-            $this->log("    DRY RUN — would upload {$rows} rows to {$instrument}");
+            $this->log("    DRY RUN - would upload {$rows} rows to {$instrument}");
             return ['status' => 'success', 'reason' => 'dry run'];
         }
 
@@ -536,7 +561,7 @@ class ClinicalPipeline
         $count = count($instruments);
 
         if ($this->dryRun) {
-            $this->log("    DRY RUN — would upload {$rows} rows for {$count} instruments");
+            $this->log("    DRY RUN - would upload {$rows} rows for {$count} instruments");
             return ['status' => 'success', 'reason' => 'dry run'];
         }
 
@@ -573,7 +598,7 @@ class ClinicalPipeline
         $info = [
             'rows_saved'   => null,
             'rows_total'   => null,
-            'rows_existed' => 0,    // rows LORIS skipped — already in DB
+            'rows_existed' => 0,    // rows LORIS skipped - already in DB
             'pairs'        => 0,    // candidate-session pairs touched
             'cand_ids'     => [],   // CandID list for per-file display
         ];
@@ -608,7 +633,7 @@ class ClinicalPipeline
 
         if ($ui['rows_saved'] !== null) {
             if ($ui['rows_saved'] === 0 && $ui['rows_existed'] > 0) {
-                $parts[] = "0 new rows — {$ui['rows_existed']} already existed in LORIS";
+                $parts[] = "0 new rows - {$ui['rows_existed']} already existed in LORIS";
             } elseif ($ui['rows_existed'] > 0) {
                 $parts[] = "{$ui['rows_saved']} new rows inserted, {$ui['rows_existed']} already existed";
             } else {
@@ -620,12 +645,12 @@ class ClinicalPipeline
             $parts[] = "{$ui['pairs']} candidate-session pair(s) processed";
         }
 
-        $this->log("    " . implode(' — ', $parts));
+        $this->log("    " . implode(' - ', $parts));
 
         // CandID list (compact, max 10 before truncating)
         if (!empty($ui['cand_ids'])) {
             $display = array_slice($ui['cand_ids'], 0, 10);
-            $suffix  = count($ui['cand_ids']) > 10 ? ' … +' . (count($ui['cand_ids']) - 10) . ' more' : '';
+            $suffix  = count($ui['cand_ids']) > 10 ? ' ... +' . (count($ui['cand_ids']) - 10) . ' more' : '';
             $this->log("    CandIDs: " . implode(', ', $display) . $suffix);
         }
     }
@@ -655,10 +680,15 @@ class ClinicalPipeline
     //    }
     //
     //  Decision logic (detectFileChange):
-    //    no entry in tracking → "first_upload"
-    //    hash differs         → "reingestion"   (LORIS will only save new rows)
-    //    hash matches         → "unchanged"     (skip entirely)
-    //    --force flag         → always "reingestion" regardless of hash
+    //    no entry in tracking -> "first_upload"
+    //    hash differs         -> "reingestion"   (LORIS will only save new rows)
+    //    hash matches         -> "unchanged"     (skip entirely)
+    //    --force flag         -> always "reingestion" regardless of hash
+    //
+    //  NOTE: hashing is always performed on the ORIGINAL source file, not
+    //  the DoB-normalized temp file. If the normalization rules ever change
+    //  but the source file does not, the pipeline will NOT re-upload
+    //  automatically - use --force to re-apply.
     // ══════════════════════════════════════════════════════════════════
 
     private function loadTrackingFile(array $project): void
@@ -678,7 +708,7 @@ class ClinicalPipeline
             $this->trackingData = is_array($decoded) ? $decoded : [];
             $this->log("  Tracking: loaded " . count($this->trackingData) . " file(s) from {$this->trackingFilePath}");
         } else {
-            $this->log("  Tracking: no existing tracking file — all files treated as first upload");
+            $this->log("  Tracking: no existing tracking file - all files treated as first upload");
         }
     }
 
@@ -742,6 +772,9 @@ class ClinicalPipeline
     /**
      * Archive a snapshot of the processed file for audit purposes.
      * Named with date prefix; timestamp suffix avoids overwrite on same-day re-runs.
+     *
+     * Archives the ORIGINAL source file (not the DoB-normalized temp copy),
+     * so the audit trail matches what upstream teams delivered.
      */
     private function archiveSnapshot(array $project, string $src): void
     {
@@ -755,12 +788,12 @@ class ClinicalPipeline
             $target = "{$dest}/" . time() . '_' . basename($src);
         }
         if (copy($src, $target)) {
-            $this->log("    Snapshot archived → processed/clinical/" . date('Y-m-d') . "/" . basename($target));
+            $this->log("    Snapshot archived -> processed/clinical/" . date('Y-m-d') . "/" . basename($target));
         }
     }
 
     // ══════════════════════════════════════════════════════════════════
-    //  RUN LOG — per pipeline run, all detail
+    //  RUN LOG - per pipeline run, all detail
     // ══════════════════════════════════════════════════════════════════
 
     private function openRunLog(): void
@@ -782,7 +815,7 @@ class ClinicalPipeline
             $sep = str_repeat('=', 72);
             fwrite($this->runLogFh,
                 "{$sep}\n"
-                . " ARCHIMEDES Clinical Pipeline — Run Log\n"
+                . " ARCHIMEDES Clinical Pipeline - Run Log\n"
                 . " Started: " . date('Y-m-d H:i:s T') . "\n"
                 . ($this->dryRun ? " Mode: DRY RUN\n" : "")
                 . ($this->force  ? " Mode: FORCE (hash check bypassed)\n" : "")
@@ -803,7 +836,7 @@ class ClinicalPipeline
     }
 
     // ══════════════════════════════════════════════════════════════════
-    //  ERROR LOG — only created when errors occur
+    //  ERROR LOG - only created when errors occur
     // ══════════════════════════════════════════════════════════════════
 
     private function writeError(string $context, string $msg): void
@@ -821,7 +854,7 @@ class ClinicalPipeline
                 $sep = str_repeat('=', 72);
                 fwrite($this->errorFh,
                     "{$sep}\n"
-                    . " ARCHIMEDES Clinical Pipeline — Error Log\n"
+                    . " ARCHIMEDES Clinical Pipeline - Error Log\n"
                     . " Run: {$this->runTimestamp}\n"
                     . "{$sep}\n\n"
                 );
@@ -886,7 +919,7 @@ class ClinicalPipeline
     }
 
     // ══════════════════════════════════════════════════════════════════
-    //  PROJECT SUMMARY — written to run log after each project
+    //  PROJECT SUMMARY - written to run log after each project
     // ══════════════════════════════════════════════════════════════════
 
     private function writeProjectSummary(string $projectName): void
@@ -894,7 +927,7 @@ class ClinicalPipeline
         $this->log("");
         $this->log("──── PROJECT SUMMARY: {$projectName} ────");
 
-        // ── Install summary ──────────────────────────────────────────
+        // -- Install summary --
         $this->log("");
         $this->log("  INSTRUMENT INSTALLATION:");
 
@@ -927,12 +960,12 @@ class ClinicalPipeline
                 $this->log("    Failed (" . count($failed) . "):");
                 foreach ($failed as $f) {
                     $err = $this->installResults[$f]['error'] ?? '?';
-                    $this->log("      ! {$f} — {$err}");
+                    $this->log("      ! {$f} - {$err}");
                 }
             }
         }
 
-        // ── Data upload summary ──────────────────────────────────────
+        // -- Data upload summary --
         $this->log("");
         $this->log("  DATA INGESTION:");
 
@@ -966,7 +999,7 @@ class ClinicalPipeline
                 }
             }
             if (!empty($reingested)) {
-                $this->log("    Re-ingested — file changed, new rows only (" . count($reingested) . "):");
+                $this->log("    Re-ingested - file changed, new rows only (" . count($reingested) . "):");
                 foreach ($reingested as $f) {
                     $this->log("      ↺ " . $this->formatDataResultLine($f));
                 }
@@ -975,19 +1008,19 @@ class ClinicalPipeline
                 $this->log("    Failed (" . count($failed) . "):");
                 foreach ($failed as $f) {
                     $reason = $this->dataResults[$f]['reason'] ?? '?';
-                    $this->log("      ! {$f} — {$reason}");
+                    $this->log("      ! {$f} - {$reason}");
                 }
             }
             if (!empty($skipped)) {
-                $this->log("    Skipped — no changes (" . count($skipped) . "):");
+                $this->log("    Skipped - no changes (" . count($skipped) . "):");
                 foreach ($skipped as $f) {
                     $r      = $this->dataResults[$f];
                     $reason = $r['reason'] ?? '?';
                     if ($reason === 'no changes' && isset($r['last_inserted'], $r['last_existed'])) {
                         $lastRun = $r['last_run'] ? " @ {$r['last_run']}" : '';
-                        $this->log("      - {$f} — {$r['last_inserted']} new / {$r['last_existed']} existed (last run{$lastRun})");
+                        $this->log("      - {$f} - {$r['last_inserted']} new / {$r['last_existed']} existed (last run{$lastRun})");
                     } else {
-                        $this->log("      - {$f} — {$reason}");
+                        $this->log("      - {$f} - {$reason}");
                     }
                 }
             }
@@ -1006,7 +1039,7 @@ class ClinicalPipeline
         $rowParts = [];
         if (isset($r['rows_saved'])) {
             if ($r['rows_saved'] === 0 && ($r['rows_existed'] ?? 0) > 0) {
-                $rowParts[] = "0 new rows — {$r['rows_existed']} already existed";
+                $rowParts[] = "0 new rows - {$r['rows_existed']} already existed";
             } elseif (($r['rows_existed'] ?? 0) > 0) {
                 $rowParts[] = "{$r['rows_saved']} new, {$r['rows_existed']} existed";
             } else {
@@ -1040,7 +1073,7 @@ class ClinicalPipeline
     }
 
     // ══════════════════════════════════════════════════════════════════
-    //  FINAL SUMMARY — end of entire pipeline run
+    //  FINAL SUMMARY - end of entire pipeline run
     // ══════════════════════════════════════════════════════════════════
 
     private function writeFinalSummary(): void
@@ -1065,7 +1098,7 @@ class ClinicalPipeline
         $this->log("    Data files failed:   {$s['data_failed']}");
         $this->log("    Data files skipped:  {$s['data_skipped']} (hash unchanged)");
         $this->log("    Rows inserted:       {$s['rows_inserted']} (net-new rows saved by LORIS)");
-        $this->log("    Rows existed:        {$s['rows_existed']} (already in LORIS — includes last-known from skipped files)");
+        $this->log("    Rows existed:        {$s['rows_existed']} (already in LORIS - includes last-known from skipped files)");
         $this->log("    Candidate-session pairs touched: {$s['pairs_processed']}");
         $this->log("");
 
@@ -1107,7 +1140,7 @@ class ClinicalPipeline
         $status = $hasFailures ? 'FAILED' : 'SUCCESS';
         $subject = "{$status}: {$name} Clinical Ingestion";
 
-        // ── Build email body ─────────────────────────────────────────
+        // -- Build email body --
 
         $body  = "Project: {$name}\n";
         $body .= "Modality: clinical\n";
@@ -1118,7 +1151,7 @@ class ClinicalPipeline
         }
         $body .= "\n";
 
-        // ── Instrument Installation ──────────────────────────────────
+        // -- Instrument Installation --
 
         $body .= "Instrument Installation:\n";
 
@@ -1156,7 +1189,7 @@ class ClinicalPipeline
 
         $body .= "\n";
 
-        // ── Data Ingestion ───────────────────────────────────────────
+        // -- Data Ingestion --
 
         $body .= "Data Ingestion:\n";
 
@@ -1188,7 +1221,7 @@ class ClinicalPipeline
             }
             // Re-ingestions
             if (!empty($reingested)) {
-                $body .= "  ↺ Re-ingested — file changed, new rows only (" . count($reingested) . "):\n";
+                $body .= "  ↺ Re-ingested - file changed, new rows only (" . count($reingested) . "):\n";
                 foreach ($reingested as $file) {
                     $body .= "     " . $this->formatDataResultLine($file) . "\n";
                 }
@@ -1225,7 +1258,7 @@ class ClinicalPipeline
 
         $body .= "\n";
 
-        // ── Totals ───────────────────────────────────────────────────
+        // -- Totals --
 
         $body .= str_repeat('-', 50) . "\n";
         $body .= "Totals:\n";
@@ -1243,7 +1276,7 @@ class ClinicalPipeline
 
         $body .= "\n";
 
-        // ── Status message ───────────────────────────────────────────
+        // -- Status message --
 
         if ($hasFailures) {
             $body .= "⚠ Some instruments failed to install or ingest.\n";
@@ -1251,12 +1284,12 @@ class ClinicalPipeline
         } elseif ($s['data_uploaded'] > 0) {
             $body .= "✔ Ingestion completed successfully.\n";
         } elseif ($s['data_skipped'] > 0 && $s['data_uploaded'] === 0) {
-            $body .= "✔ Ingestion completed. All files skipped — no content changes detected (hash match).\n";
+            $body .= "✔ Ingestion completed. All files skipped - no content changes detected (hash match).\n";
         } else {
             $body .= "✔ Ingestion completed. No data files to process.\n";
         }
 
-        // ── Log paths ────────────────────────────────────────────────
+        // -- Log paths --
 
         $body .= "\n";
         if ($this->runLogPath) {
@@ -1266,7 +1299,7 @@ class ClinicalPipeline
             $body .= "Error log: {$this->errorLogPath}\n";
         }
 
-        // ── Send ─────────────────────────────────────────────────────
+        // -- Send --
 
         $this->log("  Sending notification to: " . implode(', ', $emailsToSend));
 
@@ -1302,6 +1335,118 @@ class ClinicalPipeline
         }
         fclose($fh);
         return $c;
+    }
+
+    // ══════════════════════════════════════════════════════════════════
+    //  DOB NORMALIZATION
+    //
+    //  LORIS requires DoB as YYYY-MM-DD. Per ARCHIMEDES privacy policy,
+    //  the day portion is always jittered to 01; missing parts default
+    //  to 01 as well. The pipeline enforces this here, rewriting the
+    //  DoB column in a temp copy before upload.
+    //
+    //  Rules:
+    //    YYYY-MM-DD  ->  YYYY-MM-01  (day stripped, forced to 01)
+    //    YYYY-MM     ->  YYYY-MM-01  (day missing, default to 01)
+    //    YYYY        ->  YYYY-01-01  (month+day missing, default to 01)
+    //    empty/null  ->  unchanged
+    //    other       ->  unchanged (let LORIS surface the validation error)
+    //
+    //  Hash tracking and snapshot archiving continue to use the original
+    //  source file - only the upload step sees the normalized copy.
+    // ══════════════════════════════════════════════════════════════════
+
+    /**
+     * Rewrite the DoB column in a data file to YYYY-MM-01.
+     *
+     * @param string $srcPath Path to source CSV/TSV
+     * @param string $format  LORIS_CSV | REDCAP_CSV | BIDS_TSV
+     * @return string Path to the file that should be uploaded. Returns the
+     *                original path unchanged if no DoB column is present.
+     */
+    private function normalizeDobInFile(string $srcPath, string $format): string
+    {
+        $delimiter = ($format === 'BIDS_TSV') ? "\t" : ',';
+
+        $in = fopen($srcPath, 'r');
+        if ($in === false) {
+            return $srcPath;
+        }
+
+        $headers = fgetcsv($in, 0, $delimiter);
+        if ($headers === false) {
+            fclose($in);
+            return $srcPath;
+        }
+
+        // Find DoB column (case-insensitive)
+        $dobIdx = null;
+        foreach ($headers as $i => $h) {
+            $norm = strtolower(trim((string)$h));
+            if (in_array($norm, self::DOB_COLUMN_NAMES, true)) {
+                $dobIdx = $i;
+                break;
+            }
+        }
+
+        if ($dobIdx === null) {
+            fclose($in);
+            return $srcPath; // no DoB column - nothing to do
+        }
+
+        $tmpPath = tempnam(sys_get_temp_dir(), 'clinical_dob_') . '_' . basename($srcPath);
+        $out = fopen($tmpPath, 'w');
+        fputcsv($out, $headers, $delimiter);
+
+        $changed = 0;
+        $total   = 0;
+        while (($row = fgetcsv($in, 0, $delimiter)) !== false) {
+            $total++;
+            if (array_key_exists($dobIdx, $row)) {
+                $orig = (string)$row[$dobIdx];
+                $norm = $this->normalizeDobValue($orig);
+                if ($norm !== $orig) {
+                    $changed++;
+                }
+                $row[$dobIdx] = $norm;
+            }
+            fputcsv($out, $row, $delimiter);
+        }
+
+        fclose($in);
+        fclose($out);
+
+        $this->log("    DoB normalized: column '{$headers[$dobIdx]}' - {$changed}/{$total} row(s) rewritten to YYYY-MM-01");
+
+        return $tmpPath;
+    }
+
+    /**
+     * Normalize a single DoB string to YYYY-MM-01 per ARCHIMEDES policy.
+     * See class-level DOB NORMALIZATION block for full rules.
+     */
+    private function normalizeDobValue(string $dob): string
+    {
+        $dob = trim($dob);
+        if ($dob === '') {
+            return $dob;
+        }
+
+        // YYYY-MM-DD -> YYYY-MM-01 (strip DD, force 01)
+        if (preg_match('/^(\d{4})-(\d{2})-\d{2}$/', $dob, $m)) {
+            return "{$m[1]}-{$m[2]}-01";
+        }
+        // YYYY-MM -> YYYY-MM-01 (DD missing -> 01)
+        if (preg_match('/^(\d{4})-(\d{2})$/', $dob, $m)) {
+            return "{$m[1]}-{$m[2]}-01";
+        }
+        // YYYY -> YYYY-01-01 (MM missing -> 01, DD -> 01)
+        if (preg_match('/^(\d{4})$/', $dob, $m)) {
+            return "{$m[1]}-01-01";
+        }
+
+        // Unknown shape - leave untouched; LORIS will flag it.
+        return $dob;
     }
 
     private function discoverProjects(array $filters): array
