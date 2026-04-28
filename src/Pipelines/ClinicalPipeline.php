@@ -12,126 +12,159 @@ use Psr\Log\LoggerInterface;
 /**
  * Clinical Data Ingestion Pipeline
  *
- * Logging:
- *   1. Console        → stdout (always)
- *   2. Run log        → logs/clinical/clinical_run_{timestamp}.log  (per run, all detail)
- *   3. Error log      → logs/clinical/clinical_errors_{timestamp}.log (per run, only if errors)
- *   4. Email          → success or failure notification with full summary
+ * Read-only contract:
+ *   The user-shared input subdirectories are treated as READ-ONLY. The
+ *   pipeline NEVER writes to:
+ *     - deidentified-raw/clinical/      (clinical data files)
+ *     - documentation/data_dictionary/  (DD files)
+ *   The backing storage is irrelevant (local mount, S3, file transfer drop,
+ *   etc.); the contract is the same. Transient work (DoB normalization)
+ *   uses sys_get_temp_dir() and the temp copy is unlinked after upload.
+ *   The pipeline only writes to its own controlled subdirectories:
+ *     - processed/clinical/  (tracking JSON, daily snapshots)
+ *     - logs/clinical/       (run log, error log)
  *
- * Run log and error log share the same timestamp so they pair up.
+ * Logging:
+ *   1. Console        -> stdout (always)
+ *   2. Run log        -> logs/clinical/clinical_run_{timestamp}.log    (per run, all detail)
+ *   3. Error log      -> logs/clinical/clinical_errors_{timestamp}.log (per run, only if errors)
+ *   4. Email          -> success or failure notification with full summary
+ *   Run log and error log share the same timestamp so they pair up.
  *
  * Reingestion tracking:
- *   processed/clinical/.clinical_tracking.json stores MD5 hash per file.
+ *   processed/clinical/.clinical_tracking.json stores an MD5 hash per file.
  *   On each run the current file hash is compared to the stored hash:
- *     - No entry         → first insertion, upload everything
- *     - Hash matches     → skip (no changes)
- *     - Hash differs     → re-ingestion, upload full file (LORIS skips already-existing rows)
+ *     - No entry         -> first insertion, upload everything
+ *     - Hash matches     -> skip (no changes)
+ *     - Hash differs     -> re-ingestion, upload full file (LORIS skips already-existing rows)
  *   Use --force to bypass the hash check and always re-upload.
  *
  * DoB normalization:
- *   Before upload, the pipeline rewrites the DoB column to YYYY-MM-01 per
- *   ARCHIMEDES privacy policy (day jittered to 01, missing parts default to 01).
- *   Hash tracking and snapshot archiving continue to use the original source
- *   file - only the upload step sees the normalized copy.
+ *   Before upload, the DoB column is rewritten to YYYY-MM-01 per ARCHIMEDES
+ *   privacy policy (day jittered to 01, missing parts default to 01). The
+ *   rewrite goes into a temp file in sys_get_temp_dir(); the original
+ *   source file is never modified. Hash tracking and snapshot archiving
+ *   continue to use the original source file; only the upload step sees
+ *   the normalized copy.
  */
 class ClinicalPipeline
 {
+    // -- Dependencies and flags ------------------------------------------
+
     private array $config;
     private LoggerInterface $logger;
     private ClinicalClient $client;
     private Notification $notification;
+
     private bool $dryRun;
     private bool $verbose;
     private bool $force;
 
-    /** Timestamp for this pipeline run - shared across log files */
+    /** Timestamp for this pipeline run, shared across all log files. */
     private string $runTimestamp;
 
-    /** @var resource|null Error log - opened lazily on first error */
+    // -- Log file handles ------------------------------------------------
+
+    /** @var resource|null Error log handle, opened lazily on first error. */
     private $errorFh = null;
     private ?string $errorLogPath = null;
 
-    /** @var resource|null Run log - opened per project */
+    /** @var resource|null Run log handle, opened per project. */
     private $runLogFh = null;
     private ?string $runLogPath = null;
 
     private ?string $logDir = null;
 
-    // -- Change tracking --------------------------------------------------
-    /** Loaded from .clinical_tracking.json, written back after each project */
-    private array $trackingData     = [];
+    // -- Reingestion tracking --------------------------------------------
+
+    /** Loaded from .clinical_tracking.json, written back after each project. */
+    private array $trackingData = [];
     private ?string $trackingFilePath = null;
 
-    // -- Tracking ---------------------------------------------------------
+    // -- Per-run results -------------------------------------------------
 
-    /** Install results per file: filename -> {status, type, time, error} */
+    /** filename -> {status, type, time, error} */
     private array $installResults = [];
 
-    /** Data upload results per file: filename -> {status, reason, instruments, rows, ...} */
+    /** filename -> {status, reason, instruments, rows, ...} */
     private array $dataResults = [];
 
-    /** Global stats across all projects in this run */
+    /** Aggregate stats across all projects in this run. */
     private array $stats = [
-        'dd_files_found'        => 0,
-        'dd_installed'          => 0,
-        'dd_already_existed'    => 0,
-        'dd_failed'             => 0,
-        'data_files_found'      => 0,
-        'data_uploaded'         => 0,
-        'data_failed'           => 0,
-        'data_skipped'          => 0,
-        'rows_inserted'         => 0,  // net-new rows saved by LORIS
-        'rows_existed'          => 0,  // rows already in LORIS, skipped
-        'pairs_processed'       => 0,  // candidate-session pairs touched (created or updated)
+        'dd_files_found'     => 0,
+        'dd_installed'       => 0,
+        'dd_already_existed' => 0,
+        'dd_failed'          => 0,
+        'data_files_found'   => 0,
+        'data_uploaded'      => 0,
+        'data_failed'        => 0,
+        'data_skipped'       => 0,
+        'rows_inserted'      => 0,  // net-new rows saved by LORIS
+        'rows_existed'       => 0,  // rows already in LORIS, skipped
+        'pairs_processed'    => 0,  // candidate-session pairs touched
     ];
 
-    /** CandIDs already in LORIS BEFORE this project's uploads began.
-     *  Captured once per project in loadExistingCandidatesForProject().
-     *  Any CandID returned by an upload that's NOT in this set is treated
-     *  as a newly-created candidate for the email's "new candidates" count. */
+    /**
+     * CandIDs that exist in LORIS BEFORE this project's uploads begin.
+     * Captured once per project in loadExistingCandidatesForProject().
+     * Any CandID returned by an upload that is NOT in this set is treated
+     * as a newly-created candidate for the email's "new candidates" count.
+     */
     private array $existingCandIdsAtProjectStart = [];
 
-    /** True only when the pre-run snapshot call succeeded. When false, the
-     *  email says "classification unavailable" instead of guessing a count. */
+    /**
+     * True only when the pre-run snapshot call succeeded. When false,
+     * the email reports "classification unavailable" instead of guessing.
+     */
     private bool $candidateClassificationAvailable = false;
 
-    /** DD extensions -> instrument_type for LORIS */
+    // -- Constants -------------------------------------------------------
+
+    /** DD file extension -> instrument_type recognized by LORIS. */
     private const DD_EXTENSIONS = [
         'csv'   => 'redcap',
         'linst' => 'linst',
         'json'  => 'bids',
     ];
 
-    /** Data file extensions -> format for LORIS */
+    /** Data file extension -> upload format expected by LORIS. */
     private const DATA_EXTENSIONS = [
         'csv' => 'LORIS_CSV',
         'tsv' => 'BIDS_TSV',
     ];
 
-    /** Admin forms to exclude */
+    /** Admin forms excluded from header-based instrument detection. */
     private const DEFAULT_EXCLUDE_FORMS = ['nip_connector', 'project_request_form'];
 
-    /** DoB column names recognized for normalization (case-insensitive) */
+    /** Column names recognized for DoB normalization (case-insensitive). */
     private const DOB_COLUMN_NAMES = ['dob', 'date_of_birth', 'birth_date'];
 
     // ──────────────────────────────────────────────────────────────────
     // Constructor
     // ──────────────────────────────────────────────────────────────────
 
-    public function __construct(array $config, bool $dryRun = false, bool $verbose = false, bool $force = false)
-    {
+    /**
+     * Initialize pipeline state, set up console logging, and build the
+     * LORIS API client and notification helper from config.
+     */
+    public function __construct(
+        array $config,
+        bool $dryRun = false,
+        bool $verbose = false,
+        bool $force = false
+    ) {
         $this->config       = $config;
         $this->dryRun       = $dryRun;
         $this->verbose      = $verbose;
         $this->force        = $force;
-        $this->runTimestamp  = date('Y-m-d_H-i-s');
+        $this->runTimestamp = date('Y-m-d_H-i-s');
 
-        $logLevel = $verbose ? Logger::DEBUG : Logger::INFO;
-        $this->logger = new Logger('clinical');
+        $logLevel  = $verbose ? Logger::DEBUG : Logger::INFO;
         $formatter = new CleanLogFormatter();
-
-        $console = new StreamHandler('php://stdout', $logLevel);
+        $console   = new StreamHandler('php://stdout', $logLevel);
         $console->setFormatter($formatter);
+
+        $this->logger = new Logger('clinical');
         $this->logger->pushHandler($console);
 
         $this->client = new ClinicalClient(
@@ -149,6 +182,11 @@ class ClinicalPipeline
     // Main entry
     // ──────────────────────────────────────────────────────────────────
 
+    /**
+     * Pipeline entry point. Authenticates, discovers projects matching
+     * the filters, processes each, writes the final summary, and returns
+     * the process exit code (0 on success, 1 on any failure).
+     */
     public function run(array $filters = []): int
     {
         $this->logger->info("=== CLINICAL DATA INGESTION PIPELINE ===");
@@ -189,9 +227,14 @@ class ClinicalPipeline
     }
 
     // ──────────────────────────────────────────────────────────────────
-    // Process project
+    // Project orchestration
     // ──────────────────────────────────────────────────────────────────
 
+    /**
+     * Run the full ingestion flow for one project: open log, snapshot
+     * existing candidates, load hash tracking, install instruments,
+     * upload data, flush tracking, write summary, send notification.
+     */
     private function processProject(array $project): void
     {
         $name      = $project['project_common_name'] ?? basename($project['_projectPath']);
@@ -205,25 +248,20 @@ class ClinicalPipeline
         $this->log("========================================");
         $this->log("Project: {$name}");
         $this->log("Run: {$this->runTimestamp}");
-        $this->log("DD dir: {$ddDir}");
-        $this->log("Data dir: {$dataDir}");
+        $this->log("DD dir   (read-only): {$ddDir}");
+        $this->log("Data dir (read-only): {$dataDir}");
         $this->log("========================================");
 
-        // Reset per-project tracking
+        // Reset per-project state.
         $this->installResults = [];
         $this->dataResults    = [];
 
-        // Snapshot the CandIDs already in LORIS before any upload runs.
-        // Lets the email report "N new candidates created" accurately.
         $this->loadExistingCandidatesForProject();
-
-        // Load hash tracking for this project
         $this->loadTrackingFile($project);
 
         $this->installFromDirectory($ddDir);
         $this->uploadFromDirectory($project, $dataDir);
 
-        // Flush tracking JSON after all uploads for this project
         $this->saveTrackingFile();
 
         $this->writeProjectSummary($name);
@@ -231,17 +269,14 @@ class ClinicalPipeline
     }
 
     /**
-     * Capture CandIDs that exist in LORIS before uploads begin. These are
-     * the reference set — any CandID returned by a subsequent upload that
-     * is NOT in this set was created by this pipeline run.
-     *
-     * Silent fallback: if the snapshot call fails, classification disables
-     * itself. The email will report total candidates touched without
-     * claiming a new/existing split rather than making up a wrong number.
+     * Capture every CandID in LORIS before any upload runs. Used later to
+     * decide which CandIDs returned by uploads are new vs already-existing.
+     * If the snapshot call fails, classification disables itself and the
+     * email reports the total count without guessing the new/existing split.
      */
     private function loadExistingCandidatesForProject(): void
     {
-        $this->existingCandIdsAtProjectStart   = [];
+        $this->existingCandIdsAtProjectStart    = [];
         $this->candidateClassificationAvailable = false;
 
         try {
@@ -261,7 +296,7 @@ class ClinicalPipeline
                 . " CandID(s) already in LORIS");
         } catch (\Exception $e) {
             $this->log("  Pre-run candidate snapshot FAILED: " . $e->getMessage()
-                . " — new-candidate count unavailable for this run");
+                . " - new-candidate count unavailable for this run");
         }
     }
 
@@ -269,6 +304,10 @@ class ClinicalPipeline
     //  STEP 1: Install instruments
     // ══════════════════════════════════════════════════════════════════
 
+    /**
+     * Find every DD file (.csv / .linst / .json) in the data dictionary
+     * directory and install each one into LORIS.
+     */
     private function installFromDirectory(string $ddDir): void
     {
         $this->log("");
@@ -301,6 +340,11 @@ class ClinicalPipeline
         }
     }
 
+    /**
+     * Install one DD file. Treats "already installed" (including HTTP 409)
+     * as a non-error. After a fresh install the client's instrument cache
+     * is cleared so subsequent uploads see the new instrument.
+     */
     private function installOneDDFile(array $f): void
     {
         $filePath = $f['path'];
@@ -322,7 +366,7 @@ class ClinicalPipeline
             $msg     = $result['message'] ?? '';
 
             if ($result['success'] ?? false) {
-                if (stripos($msg, 'already') !== false || stripos($msg, 'Already') !== false) {
+                if (stripos($msg, 'already') !== false) {
                     $this->log("    Already installed ({$elapsed}s)");
                     $this->installResults[$filename] = ['status' => 'exists', 'type' => $type, 'time' => $elapsed];
                     $this->stats['dd_already_existed']++;
@@ -363,9 +407,14 @@ class ClinicalPipeline
     }
 
     // ══════════════════════════════════════════════════════════════════
-    //  STEP 2: Upload data - file by file
+    //  STEP 2: Upload data, file by file
     // ══════════════════════════════════════════════════════════════════
 
+    /**
+     * Find every data file (.csv / .tsv) in the clinical data directory.
+     * Skip files that are excluded in project.json or whose hash matches
+     * the last upload; process the rest.
+     */
     private function uploadFromDirectory(array $project, string $dataDir): void
     {
         $this->log("");
@@ -404,47 +453,51 @@ class ClinicalPipeline
                 continue;
             }
 
-            // -- Hash-based change detection --
             $changeStatus = $this->detectFileChange($filename, $f['path']);
 
             if ($changeStatus === 'unchanged') {
-                // Pull last-known row counts from tracking so summary stays meaningful
-                $tracked = $this->trackingData[$filename] ?? [];
-                $lastInserted = $tracked['rows_saved']    ?? null;
-                $lastExisted  = $tracked['rows_existed']  ?? null;
+                // Pull last-known row counts from tracking so the summary
+                // still tells the operator what is currently in LORIS.
+                $tracked      = $this->trackingData[$filename] ?? [];
+                $lastInserted = $tracked['rows_saved']       ?? null;
+                $lastExisted  = $tracked['rows_existed']     ?? null;
+                $lastRun      = $tracked['last_uploaded_at'] ?? null;
                 $lastTotal    = isset($lastInserted, $lastExisted)
                     ? $lastInserted + $lastExisted
                     : null;
-                $lastRun      = $tracked['last_uploaded_at'] ?? null;
 
                 $detail = '';
                 if ($lastTotal !== null) {
-                    $detail = " (last run: {$lastInserted} new, {$lastExisted} existed";
+                    $detail  = " (last run: {$lastInserted} new, {$lastExisted} existed";
                     $detail .= $lastRun ? ", uploaded {$lastRun})" : ")";
                 }
 
                 $this->log("  [{$filename}] SKIPPED - no changes since last upload (hash match){$detail}");
 
                 $this->dataResults[$filename] = [
-                    'status'       => 'skipped',
-                    'reason'       => 'no changes',
-                    'last_inserted'=> $lastInserted,
-                    'last_existed' => $lastExisted,
-                    'last_run'     => $lastRun,
+                    'status'        => 'skipped',
+                    'reason'        => 'no changes',
+                    'last_inserted' => $lastInserted,
+                    'last_existed'  => $lastExisted,
+                    'last_run'      => $lastRun,
                 ];
 
-                // Accumulate last-known counts into global stats so final summary is honest
-                $this->stats['rows_existed']    += $lastExisted  ?? 0;
-                $this->stats['rows_inserted']   += $lastInserted ?? 0;
+                $this->stats['rows_existed']  += $lastExisted  ?? 0;
+                $this->stats['rows_inserted'] += $lastInserted ?? 0;
                 $this->stats['data_skipped']++;
                 continue;
             }
 
-            // Pass first_upload / reingestion label through for summary reporting
+            // Pass first_upload / reingestion label through for summary reporting.
             $this->processOneDataFile($project, $f, $changeStatus);
         }
     }
 
+    /**
+     * Process one data file end-to-end: count rows, normalize DoB into a
+     * temp copy, pick instrument(s), upload, and on success update tracking
+     * and archive a snapshot. The temp copy is always cleaned up.
+     */
     private function processOneDataFile(array $project, array $fileInfo, string $changeStatus = 'first_upload'): void
     {
         $filePath = $fileInfo['path'];
@@ -452,9 +505,9 @@ class ClinicalPipeline
         $format   = $fileInfo['format'];
         $baseName = pathinfo($filename, PATHINFO_FILENAME);
 
-        $rows = $this->countRows($filePath);
-
+        $rows  = $this->countRows($filePath);
         $label = ($changeStatus === 'reingestion') ? 'RE-INGEST' : 'NEW';
+
         $this->log("  [{$filename}] {$rows} rows, format: {$format}, mode: {$label}");
 
         if ($rows === 0) {
@@ -464,12 +517,11 @@ class ClinicalPipeline
             return;
         }
 
-        // -- DoB normalization ---------------------------------------------
         $uploadPath = $this->normalizeDobInFile($filePath, $format);
         $usingTemp  = ($uploadPath !== $filePath);
 
         try {
-            // Case A: filename matches instrument
+            // Case A: filename matches an existing instrument exactly.
             if ($this->client->instrumentExists($baseName)) {
                 $this->log("    Instrument: {$baseName} (matched by filename)");
                 $result = $this->doSingleUpload($baseName, $uploadPath, $format, $rows);
@@ -488,7 +540,7 @@ class ClinicalPipeline
                 return;
             }
 
-            // Case B: detect from headers
+            // Case B: detect instruments from `*_complete` columns in the header.
             $instruments = $this->detectInstrumentsFromHeaders($uploadPath, $format);
 
             if (empty($instruments)) {
@@ -527,16 +579,24 @@ class ClinicalPipeline
                 $this->archiveSnapshot($project, $filePath);
             }
         } finally {
+            // Only the temp normalized copy is unlinked; the read-only
+            // source file is never touched.
             if ($usingTemp && file_exists($uploadPath)) {
                 @unlink($uploadPath);
             }
         }
     }
 
+    /**
+     * Read the file's header row and return instrument names matching
+     * `{instrument}_complete` columns, filtered to those that actually
+     * exist in LORIS. Admin forms are excluded.
+     */
     private function detectInstrumentsFromHeaders(string $filePath, string $format): array
     {
         $delimiter = ($format === 'BIDS_TSV') ? "\t" : ',';
-        $fh = fopen($filePath, 'r');
+
+        $fh         = fopen($filePath, 'r');
         $headerLine = fgets($fh);
         fclose($fh);
 
@@ -544,7 +604,7 @@ class ClinicalPipeline
             return [];
         }
 
-        $columns = array_map('trim', str_getcsv(trim($headerLine), $delimiter));
+        $columns     = array_map('trim', str_getcsv(trim($headerLine), $delimiter));
         $instruments = [];
 
         foreach ($columns as $col) {
@@ -565,6 +625,10 @@ class ClinicalPipeline
     //  Upload execution
     // ══════════════════════════════════════════════════════════════════
 
+    /**
+     * Upload one file targeting a single instrument. Logs, updates global
+     * stats, and returns a normalized result array.
+     */
     private function doSingleUpload(string $instrument, string $filePath, string $format, int $rows): array
     {
         if ($this->dryRun) {
@@ -599,6 +663,10 @@ class ClinicalPipeline
         }
     }
 
+    /**
+     * Upload one file spanning multiple instruments via the multi-instrument
+     * endpoint. Same logging, stats, and result contract as doSingleUpload().
+     */
     private function doMultiUpload(array $instruments, string $filePath, string $format, int $rows): array
     {
         $count = count($instruments);
@@ -610,8 +678,7 @@ class ClinicalPipeline
 
         try {
             $t0      = microtime(true);
-            $result = $this->client->uploadMultiInstrumentData($instruments, $filePath, 'CREATE_SESSIONS');
-
+            $result  = $this->client->uploadMultiInstrumentData($instruments, $filePath, 'CREATE_SESSIONS');
             $elapsed = round(microtime(true) - $t0, 2);
 
             if ($result['success'] ?? false) {
@@ -636,6 +703,11 @@ class ClinicalPipeline
         }
     }
 
+    /**
+     * Parse a LORIS upload response into rows_saved / rows_total /
+     * rows_existed (from the "Saved N out of M" message) and the
+     * candidate-session pair count and CandID list (from idMapping).
+     */
     private function extractUploadInfo(array $result): array
     {
         $info = [
@@ -667,6 +739,11 @@ class ClinicalPipeline
         return $info;
     }
 
+    /**
+     * Print a one-line success summary covering elapsed time, instrument
+     * count (multi-upload only), row counts, candidate-session pair count,
+     * and a truncated CandID list.
+     */
     private function logUploadSuccess(float $elapsed, array $ui, ?int $instCount = null): void
     {
         $parts = ["SUCCESS ({$elapsed}s)"];
@@ -697,6 +774,7 @@ class ClinicalPipeline
         }
     }
 
+    /** Add this upload's row counts and pair count to the run-wide stats. */
     private function tallyUploadSuccess(array $ui): void
     {
         $this->stats['data_uploaded']++;
@@ -706,8 +784,10 @@ class ClinicalPipeline
     }
 
     /**
-     * Classify CandIDs touched this run into new vs existing, using the
-     * pre-run snapshot as the reference. Aggregates across all files.
+     * Classify CandIDs touched this run as new vs already-existing using
+     * the pre-run snapshot. If the snapshot was unavailable, returns the
+     * full list with available=false so the renderer can be honest about
+     * not knowing the split.
      *
      * @return array{new_count:int, new_candids:string[], existing_count:int, total_candids:string[], available:bool}
      */
@@ -746,9 +826,15 @@ class ClinicalPipeline
     }
 
     // ══════════════════════════════════════════════════════════════════
-    //  HASH-BASED REINGESTION TRACKING
+    //  Hash-based reingestion tracking (writes to processed/clinical/)
     // ══════════════════════════════════════════════════════════════════
 
+    /**
+     * Load the per-project tracking dictionary
+     * (filename -> {hash, timestamps, last row counts}) from disk.
+     * Creates the directory if missing; in-memory state is empty if no
+     * tracking file exists yet.
+     */
     private function loadTrackingFile(array $project): void
     {
         $base = rtrim($project['data_access']['mount_path'] ?? '', '/') . '/processed/clinical';
@@ -761,15 +847,17 @@ class ClinicalPipeline
         $this->trackingData     = [];
 
         if (file_exists($this->trackingFilePath)) {
-            $raw = file_get_contents($this->trackingFilePath);
+            $raw     = file_get_contents($this->trackingFilePath);
             $decoded = json_decode($raw, true);
             $this->trackingData = is_array($decoded) ? $decoded : [];
-            $this->log("  Tracking: loaded " . count($this->trackingData) . " file(s) from {$this->trackingFilePath}");
+            $this->log("  Tracking: loaded " . count($this->trackingData)
+                . " file(s) from {$this->trackingFilePath}");
         } else {
             $this->log("  Tracking: no existing tracking file - all files treated as first upload");
         }
     }
 
+    /** Persist the in-memory tracking dictionary to disk as pretty-printed JSON. */
     private function saveTrackingFile(): void
     {
         if ($this->trackingFilePath === null) {
@@ -781,6 +869,11 @@ class ClinicalPipeline
         );
     }
 
+    /**
+     * Compare current MD5 to the stored hash.
+     * Returns 'first_upload' | 'reingestion' | 'unchanged'.
+     * --force always returns 'reingestion'.
+     */
     private function detectFileChange(string $filename, string $filePath): string
     {
         if ($this->force) {
@@ -797,53 +890,70 @@ class ClinicalPipeline
         return ($currentHash !== ($stored['hash'] ?? '')) ? 'reingestion' : 'unchanged';
     }
 
+    /**
+     * Refresh a file's tracking entry after a successful upload: new hash,
+     * bumped upload_count, latest counts and timestamps. first_uploaded_at
+     * is preserved across runs.
+     */
     private function updateTracking(string $filename, string $filePath, array $uploadResult): void
     {
         $existing = $this->trackingData[$filename] ?? null;
         $now      = date('Y-m-d\TH:i:s');
 
         $this->trackingData[$filename] = [
-            'hash'             => md5_file($filePath),
-            'first_uploaded_at'=> $existing['first_uploaded_at'] ?? $now,
-            'last_uploaded_at' => $now,
-            'run_timestamp'    => $this->runTimestamp,
-            'upload_count'     => ($existing['upload_count'] ?? 0) + 1,
-            'rows_total'       => $uploadResult['rows_total'] ?? null,
-            'rows_saved'       => $uploadResult['rows_saved'] ?? null,
-            'rows_existed'     => $uploadResult['rows_existed'] ?? 0,
+            'hash'              => md5_file($filePath),
+            'first_uploaded_at' => $existing['first_uploaded_at'] ?? $now,
+            'last_uploaded_at'  => $now,
+            'run_timestamp'     => $this->runTimestamp,
+            'upload_count'      => ($existing['upload_count'] ?? 0) + 1,
+            'rows_total'        => $uploadResult['rows_total']   ?? null,
+            'rows_saved'        => $uploadResult['rows_saved']   ?? null,
+            'rows_existed'      => $uploadResult['rows_existed'] ?? 0,
         ];
 
         $this->saveTrackingFile();
     }
 
+    /**
+     * Archive a copy of the source file under processed/clinical/{date}/
+     * for audit. The read-only source is never touched. If a same-named
+     * file already exists for today, a timestamp prefix is added.
+     */
     private function archiveSnapshot(array $project, string $src): void
     {
         $dest = rtrim($project['data_access']['mount_path'] ?? '', '/')
             . '/processed/clinical/' . date('Y-m-d');
+
         if (!is_dir($dest)) {
             mkdir($dest, 0755, true);
         }
+
         $target = "{$dest}/" . basename($src);
         if (file_exists($target)) {
             $target = "{$dest}/" . time() . '_' . basename($src);
         }
+
+        // Copy out to processed/; the source file is read-only and untouched.
         if (copy($src, $target)) {
-            $this->log("    Snapshot archived -> processed/clinical/" . date('Y-m-d') . "/" . basename($target));
+            $this->log("    Snapshot archived -> processed/clinical/"
+                . date('Y-m-d') . "/" . basename($target));
         }
     }
 
     // ══════════════════════════════════════════════════════════════════
-    //  RUN LOG - per pipeline run, all detail
+    //  Run log + error log (writes to logs/clinical/)
     // ══════════════════════════════════════════════════════════════════
 
+    /**
+     * Open the per-run log file with a header banner including start time
+     * and any active modes. Idempotent within a single run.
+     */
     private function openRunLog(): void
     {
-        if ($this->runLogFh !== null) {
+        if ($this->runLogFh !== null || $this->logDir === null) {
             return;
         }
-        if ($this->logDir === null) {
-            return;
-        }
+
         if (!is_dir($this->logDir)) {
             mkdir($this->logDir, 0755, true);
         }
@@ -864,6 +974,7 @@ class ClinicalPipeline
         }
     }
 
+    /** Write a line to the console (via Monolog) and the per-run log file. */
     private function log(string $msg): void
     {
         $this->logger->info($msg);
@@ -874,10 +985,11 @@ class ClinicalPipeline
         }
     }
 
-    // ══════════════════════════════════════════════════════════════════
-    //  ERROR LOG - only created when errors occur
-    // ══════════════════════════════════════════════════════════════════
-
+    /**
+     * Log an error to console + run log + error log. The error log is
+     * opened lazily on the first error so successful runs leave no
+     * error log file behind.
+     */
     private function writeError(string $context, string $msg): void
     {
         $this->logger->error("[{$context}] {$msg}");
@@ -887,7 +999,8 @@ class ClinicalPipeline
                 mkdir($this->logDir, 0755, true);
             }
             $this->errorLogPath = "{$this->logDir}/clinical_errors_{$this->runTimestamp}.log";
-            $this->errorFh = fopen($this->errorLogPath, 'a');
+            $this->errorFh      = fopen($this->errorLogPath, 'a');
+
             if ($this->errorFh) {
                 $sep = str_repeat('=', 72);
                 fwrite($this->errorFh,
@@ -910,6 +1023,11 @@ class ClinicalPipeline
         }
     }
 
+    /**
+     * Append an indented continuation line to the error log + run log.
+     * Used by writeUploadErrorDetails() to elaborate on a previous
+     * writeError() entry.
+     */
     private function writeErrorDetail(string $text): void
     {
         if ($this->errorFh) {
@@ -920,6 +1038,10 @@ class ClinicalPipeline
         }
     }
 
+    /**
+     * Dump up to the first 20 LORIS error messages from a failed upload,
+     * with an "and N more" line if the list was truncated.
+     */
     private function writeUploadErrorDetails(string $context, string $file, array $result): void
     {
         $errors = isset($result['message'])
@@ -936,6 +1058,7 @@ class ClinicalPipeline
         }
     }
 
+    /** Write closing banners and close the run + error log handles. */
     private function closeAllLogs(): void
     {
         if ($this->errorFh) {
@@ -954,9 +1077,13 @@ class ClinicalPipeline
     }
 
     // ══════════════════════════════════════════════════════════════════
-    //  PROJECT SUMMARY - written to run log after each project
+    //  Project + final summaries
     // ══════════════════════════════════════════════════════════════════
 
+    /**
+     * Write the per-project summary block to the run log: instrument
+     * installs, data uploads, and candidates touched.
+     */
     private function writeProjectSummary(string $projectName): void
     {
         $this->log("");
@@ -1007,10 +1134,10 @@ class ClinicalPipeline
         if (empty($this->dataResults)) {
             $this->log("    (no data files)");
         } else {
-            $firstUpload  = [];
-            $reingested   = [];
-            $failed       = [];
-            $skipped      = [];
+            $firstUpload = [];
+            $reingested  = [];
+            $failed      = [];
+            $skipped     = [];
 
             foreach ($this->dataResults as $file => $r) {
                 switch ($r['status']) {
@@ -1077,7 +1204,7 @@ class ClinicalPipeline
                     $this->log("      CandIDs: " . implode(', ', $existingIds));
                 }
             } else {
-                $this->log("    (classification unavailable — pre-run LORIS snapshot failed)");
+                $this->log("    (classification unavailable - pre-run LORIS snapshot failed)");
                 $this->log("    All CandIDs: " . implode(', ', $nc['total_candids']));
             }
         }
@@ -1086,6 +1213,10 @@ class ClinicalPipeline
         $this->log("────────────────────────────────────────");
     }
 
+    /**
+     * Render one data file's outcome as a single human-readable line for
+     * use in run-log summaries and the email body.
+     */
     private function formatDataResultLine(string $file): string
     {
         $r    = $this->dataResults[$file];
@@ -1125,10 +1256,15 @@ class ClinicalPipeline
         return "{$file}{$instStr}{$infoStr}{$candStr}";
     }
 
-    // ══════════════════════════════════════════════════════════════════
-    //  FINAL SUMMARY - end of entire pipeline run
-    // ══════════════════════════════════════════════════════════════════
-
+    /**
+     * End-of-run aggregate across all projects: file counts, row counts,
+     * log paths, overall pass/fail outcome.
+     *
+     * Note: a "rows inserted (new)" line is intentionally omitted. The
+     * LORIS multi-instrument endpoint does not report net-new row counts,
+     * so the value is meaningless across runs. rows_existed is kept since
+     * it reflects last-known state from skipped files (genuine info).
+     */
     private function writeFinalSummary(): void
     {
         $s = $this->stats;
@@ -1150,10 +1286,6 @@ class ClinicalPipeline
         $this->log("    Data files processed:{$s['data_uploaded']}");
         $this->log("    Data files failed:   {$s['data_failed']}");
         $this->log("    Data files skipped:  {$s['data_skipped']} (hash unchanged)");
-        // Rows inserted line removed — LORIS multi-instrument endpoint doesn't
-        // report net-new row counts, so this line was always showing 0 and
-        // causing confusion. Keep rows_existed since it reflects last-known
-        // state from skipped files, which is genuine information.
         $this->log("    Rows existed:        {$s['rows_existed']} (already in LORIS - includes last-known from skipped files)");
         $this->log("    Candidate-session pairs touched: {$s['pairs_processed']}");
         $this->log("");
@@ -1173,32 +1305,31 @@ class ClinicalPipeline
     }
 
     // ══════════════════════════════════════════════════════════════════
-    //  EMAIL NOTIFICATION
-    //
-    //  Same structure as before. Two edits from the previous version:
-    //    1. "Rows inserted (new)" line removed — always 0, confusing.
-    //    2. Added "New candidates created" section above the status line,
-    //       using pre-run LORIS snapshot.
+    //  Email notification
     // ══════════════════════════════════════════════════════════════════
 
+    /**
+     * Send the project's clinical-modality notification email to the
+     * appropriate recipient list (on_success or on_error from
+     * project.json). Notification failures are logged but never crash
+     * the pipeline since ingestion is already complete.
+     */
     private function sendNotification(array $project): void
     {
-        $name = $project['project_common_name'] ?? 'Unknown';
-        $s    = $this->stats;
-
+        $name        = $project['project_common_name'] ?? 'Unknown';
+        $s           = $this->stats;
         $hasFailures = ($s['data_failed'] > 0 || $s['dd_failed'] > 0);
 
         $successEmails = $project['notification_emails']['clinical']['on_success'] ?? [];
-        $errorEmails   = $project['notification_emails']['clinical']['on_error'] ?? [];
-
-        $emailsToSend = $hasFailures ? $errorEmails : $successEmails;
+        $errorEmails   = $project['notification_emails']['clinical']['on_error']   ?? [];
+        $emailsToSend  = $hasFailures ? $errorEmails : $successEmails;
 
         if (empty($emailsToSend)) {
             $this->log("  No notification emails configured for clinical");
             return;
         }
 
-        $status = $hasFailures ? 'FAILED' : 'SUCCESS';
+        $status  = $hasFailures ? 'FAILED' : 'SUCCESS';
         $subject = "{$status}: {$name} Clinical Ingestion";
 
         // -- Build email body --
@@ -1221,8 +1352,7 @@ class ClinicalPipeline
             $installByStatus[$r['status']][] = $file;
         }
 
-        $installCount = count($this->installResults);
-        if ($installCount === 0) {
+        if (count($this->installResults) === 0) {
             $body .= "  (no DD files found)\n";
         } else {
             if (!empty($installByStatus['installed'])) {
@@ -1269,8 +1399,7 @@ class ClinicalPipeline
             }
         }
 
-        $dataCount = count($this->dataResults);
-        if ($dataCount === 0) {
+        if (count($this->dataResults) === 0) {
             $body .= "  (no data files found)\n";
         } else {
             if (!empty($firstUpload)) {
@@ -1319,15 +1448,13 @@ class ClinicalPipeline
 
         $body .= str_repeat('-', 50) . "\n";
         $body .= "Totals:\n";
-        $body .= "  DD files: {$s['dd_files_found']} found, {$s['dd_installed']} installed, {$s['dd_already_existed']} existed, {$s['dd_failed']} failed\n";
-        $body .= "  Data files: {$s['data_files_found']} found, {$s['data_uploaded']} processed, {$s['data_failed']} failed, {$s['data_skipped']} skipped\n";
+        $body .= "  DD files: {$s['dd_files_found']} found, {$s['dd_installed']} installed, "
+            . "{$s['dd_already_existed']} existed, {$s['dd_failed']} failed\n";
+        $body .= "  Data files: {$s['data_files_found']} found, {$s['data_uploaded']} processed, "
+            . "{$s['data_failed']} failed, {$s['data_skipped']} skipped\n";
 
-        // "Rows inserted (new)" line removed — LORIS multi-instrument endpoint
-        // does not report net-new row counts, so this line was always 0 and
-        // added only confusion. Keep rows_existed since it reflects
-        // last-known state from skipped files (genuine info from tracking).
         if ($s['rows_existed'] > 0) {
-            $body .= "  Rows existed  (skipped LORIS): {$s['rows_existed']}\n";
+            $body .= "  Rows existed (skipped LORIS): {$s['rows_existed']}\n";
         }
         if ($s['pairs_processed'] > 0) {
             $body .= "  Candidate-session pairs touched: {$s['pairs_processed']}\n";
@@ -1335,13 +1462,13 @@ class ClinicalPipeline
 
         $body .= "\n";
 
-        // -- Candidates breakdown (new in this version) --
-        // Only counts — full CandID lists live in the run log.
+        // -- Candidates breakdown (counts only; full lists live in run log) --
+
         $nc = $this->computeNewCandidates();
         if (!empty($nc['total_candids'])) {
             $body .= "Candidates:\n";
             if ($nc['available']) {
-                $body .= "  New candidates created:       {$nc['new_count']}\n";
+                $body .= "  New candidates created:        {$nc['new_count']}\n";
                 if ($nc['existing_count'] > 0) {
                     $body .= "  Existing candidates refreshed: {$nc['existing_count']}\n";
                 }
@@ -1383,12 +1510,10 @@ class ClinicalPipeline
             try {
                 $this->notification->send($to, $subject, $body);
             } catch (\Exception $e) {
-                // Notification failures must not crash the pipeline — data
-                // ingestion already succeeded at this point. Log the failure
-                // so the operator can investigate (SMTP, address, etc.).
-                $this->writeError('notification',
-                    "Failed to send to {$to}: " . $e->getMessage()
-                );
+                // Notification failures must not crash the pipeline; ingestion
+                // already succeeded by this point. Log so the operator can
+                // investigate (SMTP, address, etc.).
+                $this->writeError('notification', "Failed to send to {$to}: " . $e->getMessage());
             }
         }
     }
@@ -1397,6 +1522,10 @@ class ClinicalPipeline
     //  Helpers
     // ══════════════════════════════════════════════════════════════════
 
+    /**
+     * Pull a single error string out of a LORIS response, whether the
+     * 'message' field is a plain string or a list of error objects.
+     */
     private function firstErrorMsg(array $result): string
     {
         $m = $result['message'] ?? null;
@@ -1410,22 +1539,31 @@ class ClinicalPipeline
         return 'Unknown error';
     }
 
+    /** Count data rows in a CSV/TSV (header line excluded). */
     private function countRows(string $file): int
     {
-        $c  = 0;
-        $fh = fopen($file, 'r');
+        $count = 0;
+        $fh    = fopen($file, 'r');
         fgetcsv($fh); // skip header
         while (fgetcsv($fh) !== false) {
-            $c++;
+            $count++;
         }
         fclose($fh);
-        return $c;
+        return $count;
     }
 
     // ══════════════════════════════════════════════════════════════════
-    //  DOB NORMALIZATION
+    //  DoB normalization
+    //  Reads source (read-only) and writes the normalized copy to a temp
+    //  file in sys_get_temp_dir(). Original is never modified.
     // ══════════════════════════════════════════════════════════════════
 
+    /**
+     * Write a copy of the source file with the DoB column rewritten to
+     * YYYY-MM-01 into a temp file, and return the temp path. If no DoB
+     * column is present the original path is returned unchanged.
+     * Caller must unlink the temp file when done.
+     */
     private function normalizeDobInFile(string $srcPath, string $format): string
     {
         $delimiter = ($format === 'BIDS_TSV') ? "\t" : ',';
@@ -1455,8 +1593,9 @@ class ClinicalPipeline
             return $srcPath;
         }
 
+        // Write to system temp; the source file is read-only and never modified.
         $tmpPath = tempnam(sys_get_temp_dir(), 'clinical_dob_') . '_' . basename($srcPath);
-        $out = fopen($tmpPath, 'w');
+        $out     = fopen($tmpPath, 'w');
         fputcsv($out, $headers, $delimiter);
 
         $changed = 0;
@@ -1482,6 +1621,12 @@ class ClinicalPipeline
         return $tmpPath;
     }
 
+    /**
+     * Coerce one DoB string to YYYY-MM-01.
+     * Accepts: full YYYY-MM-DD (day -> 01), YYYY-MM (day -> 01), or
+     * YYYY only (month and day -> 01-01). Anything unrecognized is
+     * returned unchanged.
+     */
     private function normalizeDobValue(string $dob): string
     {
         $dob = trim($dob);
@@ -1502,6 +1647,11 @@ class ClinicalPipeline
         return $dob;
     }
 
+    /**
+     * Walk the config's collections and projects, load each project.json,
+     * attach the collection name and project path, and return only the
+     * enabled entries that match any --collection / --project filter.
+     */
     private function discoverProjects(array $filters): array
     {
         $projects = [];
