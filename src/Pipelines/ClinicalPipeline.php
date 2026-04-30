@@ -18,7 +18,7 @@ use Psr\Log\LoggerInterface;
  *     - deidentified-raw/clinical/      (clinical data files)
  *     - documentation/data_dictionary/  (DD files)
  *   The backing storage is irrelevant (local mount, S3, file transfer drop,
- *   etc.); the contract is the same. Transient work (DoB normalization)
+ *   etc.); the contract is the same. Transient work (date normalization)
  *   uses sys_get_temp_dir() and the temp copy is unlinked after upload.
  *   The pipeline only writes to its own controlled subdirectories:
  *     - processed/clinical/  (tracking JSON, daily snapshots)
@@ -39,13 +39,13 @@ use Psr\Log\LoggerInterface;
  *     - Hash differs     -> re-ingestion, upload full file (LORIS skips already-existing rows)
  *   Use --force to bypass the hash check and always re-upload.
  *
- * DoB normalization:
- *   Before upload, the DoB column is rewritten to YYYY-MM-01 per ARCHIMEDES
- *   privacy policy (day jittered to 01, missing parts default to 01). The
- *   rewrite goes into a temp file in sys_get_temp_dir(); the original
- *   source file is never modified. Hash tracking and snapshot archiving
- *   continue to use the original source file; only the upload step sees
- *   the normalized copy.
+ * Date normalization (DoB and DoD):
+ *   Before upload, the DoB and DoD columns are rewritten to YYYY-MM-01
+ *   per ARCHIMEDES privacy policy (day jittered to 01, missing parts
+ *   default to 01). The rewrite goes into a temp file in
+ *   sys_get_temp_dir(); the original source file is never modified.
+ *   Hash tracking and snapshot archiving continue to use the original
+ *   source file; only the upload step sees the normalized copy.
  */
 class ClinicalPipeline
 {
@@ -136,8 +136,19 @@ class ClinicalPipeline
     /** Admin forms excluded from header-based instrument detection. */
     private const DEFAULT_EXCLUDE_FORMS = ['nip_connector', 'project_request_form'];
 
-    /** Column names recognized for DoB normalization (case-insensitive). */
-    private const DOB_COLUMN_NAMES = ['dob', 'date_of_birth', 'birth_date'];
+    /**
+     * Date columns that get YYYY-MM-01 normalization (case-insensitive).
+     * Both DoB and DoD are jittered to the first of the month per
+     * ARCHIMEDES privacy policy. Add new aliases here only if they share
+     * the same normalization rule — anything with different semantics
+     * (e.g. session dates, scan dates) needs its own pathway.
+     */
+    private const DATE_COLUMN_NAMES = [
+        // Date of birth
+        'dob', 'date_of_birth', 'birth_date',
+        // Date of death
+        'dod', 'date_of_death', 'death_date',
+    ];
 
     // ──────────────────────────────────────────────────────────────────
     // Constructor
@@ -494,9 +505,10 @@ class ClinicalPipeline
     }
 
     /**
-     * Process one data file end-to-end: count rows, normalize DoB into a
-     * temp copy, pick instrument(s), upload, and on success update tracking
-     * and archive a snapshot. The temp copy is always cleaned up.
+     * Process one data file end-to-end: count rows, normalize date columns
+     * (DoB and DoD) into a temp copy, pick instrument(s), upload, and on
+     * success update tracking and archive a snapshot. The temp copy is
+     * always cleaned up.
      */
     private function processOneDataFile(array $project, array $fileInfo, string $changeStatus = 'first_upload'): void
     {
@@ -517,7 +529,7 @@ class ClinicalPipeline
             return;
         }
 
-        $uploadPath = $this->normalizeDobInFile($filePath, $format);
+        $uploadPath = $this->normalizeDatesInFile($filePath, $format);
         $usingTemp  = ($uploadPath !== $filePath);
 
         try {
@@ -1553,18 +1565,22 @@ class ClinicalPipeline
     }
 
     // ══════════════════════════════════════════════════════════════════
-    //  DoB normalization
+    //  Date normalization (DoB and DoD)
     //  Reads source (read-only) and writes the normalized copy to a temp
     //  file in sys_get_temp_dir(). Original is never modified.
     // ══════════════════════════════════════════════════════════════════
 
     /**
-     * Write a copy of the source file with the DoB column rewritten to
-     * YYYY-MM-01 into a temp file, and return the temp path. If no DoB
-     * column is present the original path is returned unchanged.
-     * Caller must unlink the temp file when done.
+     * Write a copy of the source file with every recognized date column
+     * (DoB and DoD aliases) rewritten to YYYY-MM-01 into a temp file,
+     * and return the temp path. If no recognized date column is present
+     * the original path is returned unchanged. Caller must unlink the
+     * temp file when done.
+     *
+     * Multi-column safe: a single file containing both DoB and DoD will
+     * have both rewritten in one pass; we don't make multiple temp copies.
      */
-    private function normalizeDobInFile(string $srcPath, string $format): string
+    private function normalizeDatesInFile(string $srcPath, string $format): string
     {
         $delimiter = ($format === 'BIDS_TSV') ? "\t" : ',';
 
@@ -1579,36 +1595,42 @@ class ClinicalPipeline
             return $srcPath;
         }
 
-        $dobIdx = null;
+        // Find every column whose header matches a recognized date-column name.
+        // Map: column index -> original header text (used for the log message).
+        $dateCols = [];
         foreach ($headers as $i => $h) {
             $norm = strtolower(trim((string)$h));
-            if (in_array($norm, self::DOB_COLUMN_NAMES, true)) {
-                $dobIdx = $i;
-                break;
+            if (in_array($norm, self::DATE_COLUMN_NAMES, true)) {
+                $dateCols[$i] = (string)$h;
             }
         }
 
-        if ($dobIdx === null) {
+        if (empty($dateCols)) {
             fclose($in);
             return $srcPath;
         }
 
         // Write to system temp; the source file is read-only and never modified.
-        $tmpPath = tempnam(sys_get_temp_dir(), 'clinical_dob_') . '_' . basename($srcPath);
+        $tmpPath = tempnam(sys_get_temp_dir(), 'clinical_dates_') . '_' . basename($srcPath);
         $out     = fopen($tmpPath, 'w');
         fputcsv($out, $headers, $delimiter);
 
-        $changed = 0;
-        $total   = 0;
+        // Per-column change counter so the log line names which columns
+        // were rewritten and how many rows each changed.
+        $changedPerCol = array_fill_keys(array_keys($dateCols), 0);
+        $total         = 0;
+
         while (($row = fgetcsv($in, 0, $delimiter)) !== false) {
             $total++;
-            if (array_key_exists($dobIdx, $row)) {
-                $orig = (string)$row[$dobIdx];
-                $norm = $this->normalizeDobValue($orig);
-                if ($norm !== $orig) {
-                    $changed++;
+            foreach ($dateCols as $idx => $_label) {
+                if (array_key_exists($idx, $row)) {
+                    $orig = (string)$row[$idx];
+                    $norm = $this->normalizeDateValue($orig);
+                    if ($norm !== $orig) {
+                        $changedPerCol[$idx]++;
+                    }
+                    $row[$idx] = $norm;
                 }
-                $row[$dobIdx] = $norm;
             }
             fputcsv($out, $row, $delimiter);
         }
@@ -1616,35 +1638,43 @@ class ClinicalPipeline
         fclose($in);
         fclose($out);
 
-        $this->log("    DoB normalized: column '{$headers[$dobIdx]}' - {$changed}/{$total} row(s) rewritten to YYYY-MM-01");
+        // One log line summarizing every column that was touched, e.g.:
+        //   Date columns normalized: dob 8/8, dod 1/8 row(s) rewritten to YYYY-MM-01
+        $parts = [];
+        foreach ($dateCols as $idx => $label) {
+            $parts[] = "{$label} {$changedPerCol[$idx]}/{$total}";
+        }
+        $this->log("    Date columns normalized: " . implode(', ', $parts) . " row(s) rewritten to YYYY-MM-01");
 
         return $tmpPath;
     }
 
     /**
-     * Coerce one DoB string to YYYY-MM-01.
+     * Coerce one date string to YYYY-MM-01.
      * Accepts: full YYYY-MM-DD (day -> 01), YYYY-MM (day -> 01), or
      * YYYY only (month and day -> 01-01). Anything unrecognized is
      * returned unchanged.
+     *
+     * Same rule applies to both DoB and DoD per ARCHIMEDES privacy policy.
      */
-    private function normalizeDobValue(string $dob): string
+    private function normalizeDateValue(string $value): string
     {
-        $dob = trim($dob);
-        if ($dob === '') {
-            return $dob;
+        $value = trim($value);
+        if ($value === '') {
+            return $value;
         }
 
-        if (preg_match('/^(\d{4})-(\d{2})-\d{2}$/', $dob, $m)) {
+        if (preg_match('/^(\d{4})-(\d{2})-\d{2}$/', $value, $m)) {
             return "{$m[1]}-{$m[2]}-01";
         }
-        if (preg_match('/^(\d{4})-(\d{2})$/', $dob, $m)) {
+        if (preg_match('/^(\d{4})-(\d{2})$/', $value, $m)) {
             return "{$m[1]}-{$m[2]}-01";
         }
-        if (preg_match('/^(\d{4})$/', $dob, $m)) {
+        if (preg_match('/^(\d{4})$/', $value, $m)) {
             return "{$m[1]}-01-01";
         }
 
-        return $dob;
+        return $value;
     }
 
     /**
