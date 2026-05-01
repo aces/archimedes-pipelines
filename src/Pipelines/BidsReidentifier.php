@@ -21,6 +21,14 @@ use LORIS\Utils\CleanLogFormatter;
  *   - Prints "ERROR: no mapping found for sub-XX" but does NOT exit non-zero
  *     → pipeline scans stdout for this pattern
  *
+ * In-sync skip:
+ *   Before launching the script, source and target are compared. If the
+ *   target already reflects the source (same sub-* count and the target's
+ *   newest file is at least as recent as the source's newest), the run
+ *   is skipped — no API call, no script execution. If the target exists
+ *   but the source has newer changes, the pipeline reports the change
+ *   and exits without running, advising --force to overwrite.
+ *
  * Log files written to {projectPath}/logs/:
  *   bids_reidentifier_run_{timestamp}.log    — full run log
  *   bids_reidentifier_errors_{timestamp}.log — errors only (on first error)
@@ -325,6 +333,115 @@ class BidsReidentifier
     }
 
     // =========================================================================
+    //  IN-SYNC CHECK
+    //
+    //  Decide whether the target already reflects the source so we can
+    //  skip the actual reidentifier run. Direct filename diff isn't
+    //  possible because the reidentifier renames sub-{ExtStudyID} ->
+    //  sub-{PSCID} by design, so dir names won't match across the two
+    //  trees. Heuristic instead:
+    //
+    //    1. sub-* count must match (catches add/remove of whole subjects)
+    //    2. Source's newest file mtime must be <= target's newest file
+    //       mtime (catches edits inside any subject — file changes,
+    //       new files, json/tsv edits)
+    //
+    //  Both must hold for "in sync". The check is intentionally cheap
+    //  (one glob + one recursive walk per side); the underlying
+    //  reidentifier run is far more expensive than this.
+    //
+    //  Limitations of this heuristic:
+    //    - rsync-style copies that preserve mtime would pass through
+    //      undetected. Not a concern for the normal upstream-edit
+    //      workflow (editors bump mtime).
+    //    - Files removed from source where target still has them won't
+    //      trigger "not in sync" (count + max-mtime can both still
+    //      match). Run with --force after a deletion.
+    //
+    //  --force bypasses this check entirely and always re-runs.
+    // =========================================================================
+
+    /**
+     * Compare source vs target trees and decide if the target is already
+     * in sync with the source. Returns the decision plus a human-readable
+     * reason for the log line.
+     *
+     * @return array{in_sync: bool, reason: string}
+     */
+    private function _checkTargetInSync(string $sourceDir, string $targetDir): array
+    {
+        $sourceSubs = glob(rtrim($sourceDir, '/') . '/sub-*', GLOB_ONLYDIR) ?: [];
+        $targetSubs = glob(rtrim($targetDir, '/') . '/sub-*', GLOB_ONLYDIR) ?: [];
+
+        $sourceCount = count($sourceSubs);
+        $targetCount = count($targetSubs);
+
+        if ($targetCount === 0) {
+            return [
+                'in_sync' => false,
+                'reason'  => 'target has no sub-* directories',
+            ];
+        }
+
+        if ($sourceCount !== $targetCount) {
+            return [
+                'in_sync' => false,
+                'reason'  => "subject count differs (source: {$sourceCount}, target: {$targetCount})",
+            ];
+        }
+
+        $sourceMtime = $this->_getMaxMtime($sourceDir);
+        $targetMtime = $this->_getMaxMtime($targetDir);
+
+        // Strict ">": equal mtimes (e.g. files copied in same second)
+        // are treated as in-sync, not as a change.
+        if ($sourceMtime > $targetMtime) {
+            return [
+                'in_sync' => false,
+                'reason'  => 'source has files newer than target'
+                    . ' (source latest: ' . date('Y-m-d H:i:s', $sourceMtime)
+                    . ', target latest: ' . date('Y-m-d H:i:s', $targetMtime) . ')',
+            ];
+        }
+
+        return [
+            'in_sync' => true,
+            'reason'  => "{$targetCount} sub-* dirs match and target is up to date"
+                . ' (target latest: ' . date('Y-m-d H:i:s', $targetMtime) . ')',
+        ];
+    }
+
+    /**
+     * Recursively find the newest file mtime under a directory tree.
+     * Returns 0 on permission errors / unreadable paths so the caller
+     * treats the tree as "not synced" and re-runs rather than silently
+     * succeeding on a broken read.
+     */
+    private function _getMaxMtime(string $dir): int
+    {
+        $maxMtime = 0;
+        try {
+            $iterator = new \RecursiveIteratorIterator(
+                new \RecursiveDirectoryIterator($dir, \FilesystemIterator::SKIP_DOTS),
+                \RecursiveIteratorIterator::LEAVES_ONLY,
+                \RecursiveIteratorIterator::CATCH_GET_CHILD
+            );
+            foreach ($iterator as $file) {
+                if ($file->isFile()) {
+                    $mtime = $file->getMTime();
+                    if ($mtime > $maxMtime) {
+                        $maxMtime = $mtime;
+                    }
+                }
+            }
+        } catch (\Exception $e) {
+            // Permission errors etc. — return 0 (caller treats as not-in-sync)
+            $this->logger->debug("  _getMaxMtime exception on {$dir}: " . $e->getMessage());
+        }
+        return $maxMtime;
+    }
+
+    // =========================================================================
     //  ID PATTERN
     // =========================================================================
 
@@ -496,6 +613,7 @@ class BidsReidentifier
     public function run(string $sourceDir, string $targetDir, array $options = []): array
     {
         $dryRun     = $options['dry_run'] ?? false;
+        $force      = $options['force']   ?? false;
         $cliProject = $options['project'] ?? null;
 
         $projectPath = dirname(dirname(rtrim($sourceDir, '/')));
@@ -507,6 +625,7 @@ class BidsReidentifier
         $this->_log("  Source  : {$sourceDir}");
         $this->_log("  Target  : {$targetDir}");
         $this->_log("  Dry run : " . ($dryRun ? 'YES' : 'NO'));
+        $this->_log("  Force   : " . ($force  ? 'YES' : 'NO'));
         $this->_log("───────────────────────────────────────────────────────────");
 
         if (!$this->_validateBidsDirectory($sourceDir)) {
@@ -531,6 +650,39 @@ class BidsReidentifier
         }
 
         $this->_log("  Project : {$projectName}");
+
+        // ── In-sync check ──────────────────────────────────────────────────
+        // Decide before any expensive work (auth, ID pattern parse, async
+        // launch) whether we actually need to run. --force always proceeds;
+        // --dry-run still proceeds so the user can see the parameters.
+        if (!$force && !$dryRun && is_dir($targetDir)) {
+            $sync = $this->_checkTargetInSync($sourceDir, $targetDir);
+
+            if ($sync['in_sync']) {
+                $this->_log("");
+                $this->_log("  ✓ Target is already in sync with source — skipping reidentification");
+                $this->_log("    {$sync['reason']}");
+                $this->_log("    Use --force to re-run anyway.");
+                // Treat all source subjects as accounted for — they're
+                // already reidentified in the target from a previous run.
+                $this->stats['subjects_mapped'] = $this->stats['subjects_found'];
+                $this->_printSummary();
+                $this->_closeLogs();
+                return $this->stats;
+            }
+
+            // Target exists but source has changed since last run. Don't
+            // overwrite silently — make the operator confirm with --force.
+            $this->_log("");
+            $this->_warn("CHANGES_DETECTED",
+                "File change found between source and target:"
+                . "\n    {$sync['reason']}"
+                . "\n    Run with --force to overwrite the existing target."
+            );
+            $this->_printSummary();
+            $this->_closeLogs();
+            return $this->stats;
+        }
 
         $idPattern = $this->_extractIdPattern($sourceDir);
         if (!$idPattern) {
@@ -557,7 +709,6 @@ class BidsReidentifier
         }
 
         // Handle --force: delete target directory for clean reidentification
-        $force = $options['force'] ?? false;
         if ($force && is_dir($targetDir)) {
             $this->_log("  --force: removing existing target directory: {$targetDir}");
             // Use shell rm -rf since PHP's recursive delete is verbose

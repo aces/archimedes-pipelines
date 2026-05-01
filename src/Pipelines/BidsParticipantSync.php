@@ -19,6 +19,13 @@ use LORIS\Utils\CleanLogFormatter;
  *   bids_sync_run_{timestamp}.log    — full run log
  *   bids_sync_errors_{timestamp}.log — errors only (created on first error)
  *
+ * Date normalization (DoB and DoD):
+ *   Per ARCHIMEDES privacy policy, DoB and DoD values are jittered to
+ *   YYYY-MM-01 before being sent to LORIS. Missing day -> 01, missing
+ *   month -> 01, year-only inputs become YYYY-01-01. Empty values stay
+ *   empty; unparseable values pass through unchanged so LORIS surfaces
+ *   the validation error rather than the pipeline silently mangling it.
+ *
  * @package LORIS\Pipelines
  */
 class BidsParticipantSync
@@ -172,6 +179,40 @@ class BidsParticipantSync
             fclose($this->runLogFh);
             $this->runLogFh = null;
         }
+    }
+
+    // =========================================================================
+    //  DATE NORMALIZATION (DoB and DoD)
+    //
+    //  Coerce one date string to YYYY-MM-01 per ARCHIMEDES privacy policy.
+    //  Same rule for both DoB and DoD; either one passes through this helper
+    //  before being sent to LORIS.
+    //    YYYY-MM-DD  -> YYYY-MM-01  (day forced to 01)
+    //    YYYY-MM     -> YYYY-MM-01  (day missing -> 01)
+    //    YYYY        -> YYYY-01-01  (month + day missing -> 01)
+    //    empty       -> empty       (unchanged)
+    //    other       -> unchanged   (let LORIS surface validation errors
+    //                                rather than silently mangling input)
+    // =========================================================================
+
+    private function _normalizeDateValue(string $value): string
+    {
+        $value = trim($value);
+        if ($value === '') {
+            return $value;
+        }
+
+        if (preg_match('/^(\d{4})-(\d{2})-\d{2}$/', $value, $m)) {
+            return "{$m[1]}-{$m[2]}-01";
+        }
+        if (preg_match('/^(\d{4})-(\d{2})$/', $value, $m)) {
+            return "{$m[1]}-{$m[2]}-01";
+        }
+        if (preg_match('/^(\d{4})$/', $value, $m)) {
+            return "{$m[1]}-01-01";
+        }
+
+        return $value;
     }
 
     // =========================================================================
@@ -940,6 +981,22 @@ class BidsParticipantSync
             }
 
             $pscid = $externalID;
+
+            // ── Date normalization (DoB and DoD) ──────────────────────────────
+            // Apply ARCHIMEDES YYYY-MM-01 jitter immediately before LORIS
+            // sees the value. DoB is the only date sent at candidate creation
+            // time; DoD support, if added later, can call _normalizeDateValue
+            // on its way through too. Empty/missing DoB is left as null so
+            // the existing "DoB optional in some LORIS configs" path keeps
+            // working unchanged.
+            if ($dob !== null && $dob !== '') {
+                $dobOriginal = $dob;
+                $dob         = $this->_normalizeDateValue($dob);
+                if ($dob !== $dobOriginal) {
+                    $this->_log("  DoB normalized: {$dobOriginal} → {$dob} (YYYY-MM-01 policy)");
+                }
+            }
+
             $this->_log("  ExtStudyID : {$externalID}");
             $this->_log("  Project    : {$project} (ExtID={$projectExternalID})");
             $this->_log("  Sex / Site : {$sex} / {$site}");
