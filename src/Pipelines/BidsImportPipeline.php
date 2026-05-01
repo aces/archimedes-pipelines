@@ -55,6 +55,22 @@ class BidsImportPipeline
     /** Temp staging dir for enriched participants.tsv; cleaned in _closeAllLogs(). */
     private ?string $stagingDir = null;
 
+    /**
+     * Per-subject scan inventory built from the BIDS tree at run time.
+     * Shape: ['subjects' => [PSCID => ['sessions' => [ses => [mod => count]]]],
+     *         'totals'   => ['subjects' => N, 'sessions' => N, 'scans' => N,
+     *                        'by_modality' => [mod => count]]].
+     */
+    private array $scanInventory = [];
+
+    /**
+     * Once-per-run guard for email notifications. Set true after the first
+     * sendNotification() actually dispatches; further calls (from the
+     * pipeline itself, or from a wrapper script that also calls it) are
+     * silently ignored to prevent the duplicate-email problem.
+     */
+    private bool $notificationSent = false;
+
     /** Tracking file name — stored in {projectPath}/processed/bids/ */
     private const TRACK_FILE = '.bids_import_processed.json';
 
@@ -83,6 +99,12 @@ class BidsImportPipeline
         'errors'          => [],
         'job_id'          => null,
         'pid'             => null,
+        // Populated when scans_skipped > 0 — explains why they were skipped
+        // so the summary doesn't just say "skipped 3" with no context.
+        'skip_reason'     => '',
+        // Timestamp of the original import run that processed these scans
+        // (when this run is a no-op because everything was already imported).
+        'last_imported_at' => '',
     ];
 
     public function __construct(array $config = [], bool $verbose = false)
@@ -655,7 +677,21 @@ class BidsImportPipeline
         $this->_log("  BIDS directory: {$bidsPath}");
 
         $this->stats['scans_found'] = $this->_countScans($bidsPath);
+        $this->scanInventory        = $this->_buildScanInventory($bidsPath);
         $this->_log("  Scans found: {$this->stats['scans_found']}");
+
+        // Brief inventory line — a one-shot summary so the operator sees
+        // what's about to be imported without scrolling. The full per-subject
+        // breakdown is logged on SUCCESS and included in the email body.
+        $totals = $this->scanInventory['totals'];
+        $modParts = [];
+        foreach ($totals['by_modality'] as $mod => $n) {
+            $modParts[] = "{$mod}: {$n}";
+        }
+        $this->_log("  Inventory  : {$totals['subjects']} subject(s), "
+            . "{$totals['sessions']} session(s), "
+            . "{$totals['scans']} scan file(s)"
+            . (empty($modParts) ? '' : " — " . implode(', ', $modParts)));
 
         // Load tracking — skip if already successfully imported
         // To reimport, delete the tracking file:
@@ -675,7 +711,9 @@ class BidsImportPipeline
                     . " — no new scans found. Skipping.");
                 $this->_log("  To reimport, delete:"
                     . " {$projectPath}/processed/bids/.bids_import_processed.json");
-                $this->stats['scans_skipped'] = $this->stats['scans_found'];
+                $this->stats['scans_skipped']    = $this->stats['scans_found'];
+                $this->stats['skip_reason']      = 'already processed';
+                $this->stats['last_imported_at'] = $lastTs;
                 $success = true;
                 $this->sendNotification($success);
                 $this->_closeAllLogs();
@@ -799,6 +837,7 @@ class BidsImportPipeline
                     );
                     $this->_markTracked($projectPath, $tracking, 'success');
                     $this->stats['scans_processed'] = $this->stats['scans_found'];
+                    $this->_logInventoryDetails();
                     $this->_closeAllLogs();
                     return $this->stats;
                 }
@@ -815,6 +854,7 @@ class BidsImportPipeline
                 $this->_log("  ✓ SUCCESS ({$elapsed}s)");
                 $this->_markTracked($projectPath, $tracking, 'success');
                 $this->stats['scans_processed'] = $this->stats['scans_found'];
+                $this->_logInventoryDetails();
                 $this->_closeAllLogs();
                 return $this->stats;
             }
@@ -867,6 +907,234 @@ class BidsImportPipeline
         return $count;
     }
 
+    /**
+     * Walk the BIDS tree and produce a per-subject / per-session /
+     * per-modality count of NIfTI scan files, used by both the run-log
+     * detailed summary and the email notification body.
+     *
+     * Counts only `.nii` and `.nii.gz` files — JSON sidecars, .bvec, .bval,
+     * and .tsv files don't count as scans (they're metadata for scans).
+     *
+     * Modality directories follow standard BIDS naming: anat, func, dwi,
+     * fmap, perf, pet, meg, eeg, ieeg, micr, beh, nirs. Anything found
+     * under any other subdir name is still counted under that name.
+     *
+     * @return array{
+     *   subjects: array<string, array{sessions: array<string, array<string,int>>, modalities?: array<string,int>}>,
+     *   totals:   array{subjects:int, sessions:int, scans:int, by_modality: array<string,int>}
+     * }
+     */
+    private function _buildScanInventory(string $bidsPath): array
+    {
+        $inventory = [
+            'subjects' => [],
+            'totals'   => [
+                'subjects'    => 0,
+                'sessions'    => 0,
+                'scans'       => 0,
+                'by_modality' => [],
+            ],
+        ];
+
+        $subjectDirs = glob("{$bidsPath}/sub-*", GLOB_ONLYDIR) ?: [];
+        sort($subjectDirs);
+
+        foreach ($subjectDirs as $subjectDir) {
+            $pscid    = preg_replace('/^sub-/', '', basename($subjectDir));
+            $sessions = glob("{$subjectDir}/ses-*", GLOB_ONLYDIR) ?: [];
+            sort($sessions);
+
+            $entry = ['sessions' => []];
+
+            if (empty($sessions)) {
+                // No sessions — modality dirs sit directly under the subject
+                $modCounts           = $this->_countModalitiesIn($subjectDir);
+                $entry['modalities'] = $modCounts;
+                $this->_addModCountsToTotals($inventory, $modCounts);
+            } else {
+                foreach ($sessions as $sessionDir) {
+                    $sesLabel = preg_replace('/^ses-/', '', basename($sessionDir));
+                    $modCounts = $this->_countModalitiesIn($sessionDir);
+                    $entry['sessions'][$sesLabel] = $modCounts;
+                    $this->_addModCountsToTotals($inventory, $modCounts);
+                    $inventory['totals']['sessions']++;
+                }
+            }
+
+            $inventory['subjects'][$pscid] = $entry;
+            $inventory['totals']['subjects']++;
+        }
+
+        return $inventory;
+    }
+
+    /**
+     * Count `.nii` and `.nii.gz` files per modality subdir under $parent.
+     * Returns ['anat' => N, 'func' => N, ...] sorted alphabetically; a
+     * modality with zero scans is omitted.
+     */
+    private function _countModalitiesIn(string $parent): array
+    {
+        $counts  = [];
+        $modDirs = glob("{$parent}/*", GLOB_ONLYDIR) ?: [];
+
+        foreach ($modDirs as $modDir) {
+            $modName  = basename($modDir);
+            $niiFiles = array_merge(
+                glob("{$modDir}/*.nii.gz") ?: [],
+                glob("{$modDir}/*.nii")    ?: []
+            );
+            if (!empty($niiFiles)) {
+                $counts[$modName] = count($niiFiles);
+            }
+        }
+
+        ksort($counts);
+        return $counts;
+    }
+
+    /**
+     * Roll one modality-count map up into the inventory totals.
+     * Mutates $inventory['totals'] in place.
+     */
+    private function _addModCountsToTotals(array &$inventory, array $modCounts): void
+    {
+        foreach ($modCounts as $mod => $n) {
+            $inventory['totals']['scans'] += $n;
+            $inventory['totals']['by_modality'][$mod] =
+                ($inventory['totals']['by_modality'][$mod] ?? 0) + $n;
+        }
+    }
+
+    /**
+     * Emit the per-subject inventory to the run log via _log() line by line.
+     * Called from each SUCCESS path so the operator can see exactly which
+     * subjects, sessions, and modalities were sent to bidsimport.
+     */
+    private function _logInventoryDetails(): void
+    {
+        $this->_log("");
+        $this->_log("  ═══ SCAN INVENTORY (sent to bidsimport) ═══");
+        foreach ($this->_renderInventoryLines('  ') as $line) {
+            $this->_log($line);
+        }
+        $this->_log("  ═════════════════════════════════════════════");
+    }
+
+    /**
+     * Render the inventory in compact form for the email body — totals
+     * plus a one-line-per-subject list of CandID and session labels.
+     * The full per-modality breakdown stays in the run log only, since
+     * email recipients want a quick "what landed for whom" summary.
+     */
+    private function _renderInventoryForEmail(): string
+    {
+        if (empty($this->scanInventory['subjects'])) {
+            return '';
+        }
+        $totals = $this->scanInventory['totals'];
+
+        // Compact totals line
+        $modParts = [];
+        ksort($totals['by_modality']);
+        foreach ($totals['by_modality'] as $mod => $n) {
+            $modParts[] = "{$mod}: {$n}";
+        }
+        $modText = empty($modParts) ? '' : ' — ' . implode(', ', $modParts);
+
+        $body  = "Scan inventory:\n" . str_repeat('-', 40) . "\n";
+        $body .= "{$totals['subjects']} subject(s), {$totals['sessions']} session(s), "
+            . "{$totals['scans']} scan file(s){$modText}\n\n";
+
+        // Per-subject: just CandID + session labels (no modalities here —
+        // those are in the run log via _logInventoryDetails()).
+        $body .= "Subjects:\n";
+        foreach ($this->scanInventory['subjects'] as $pscid => $entry) {
+            if (isset($entry['modalities'])) {
+                // No-sessions BIDS layout
+                $body .= "  sub-{$pscid} (no sessions)\n";
+                continue;
+            }
+            $sesLabels = array_keys($entry['sessions']);
+            if (empty($sesLabels)) {
+                $body .= "  sub-{$pscid} (no sessions)\n";
+                continue;
+            }
+            $sesList = array_map(fn($s) => "ses-{$s}", $sesLabels);
+            $body .= "  sub-{$pscid} — " . implode(', ', $sesList) . "\n";
+        }
+
+        return $body;
+    }
+
+    /**
+     * Render the inventory as plain text. Used for both run log (line by
+     * line via _log) and email body (single string). $indent is prepended
+     * to every line.
+     */
+    private function _renderInventoryLines(string $indent = ''): array
+    {
+        if (empty($this->scanInventory) || empty($this->scanInventory['subjects'])) {
+            return ["{$indent}(no subjects found)"];
+        }
+
+        $inv    = $this->scanInventory;
+        $totals = $inv['totals'];
+        $lines  = [];
+
+        // Top-level totals
+        $modSummary = [];
+        ksort($totals['by_modality']);
+        foreach ($totals['by_modality'] as $mod => $n) {
+            $modSummary[] = "{$mod}: {$n}";
+        }
+        $modText = empty($modSummary) ? '(none)' : implode(', ', $modSummary);
+
+        $lines[] = "{$indent}Subjects   : {$totals['subjects']}";
+        $lines[] = "{$indent}Sessions   : {$totals['sessions']}";
+        $lines[] = "{$indent}Scan files : {$totals['scans']} ({$modText})";
+        $lines[] = "{$indent}";
+        $lines[] = "{$indent}Per-subject breakdown:";
+
+        foreach ($inv['subjects'] as $pscid => $entry) {
+            $lines[] = "{$indent}  sub-{$pscid}";
+
+            // Subject without sessions
+            if (isset($entry['modalities'])) {
+                $mods = $entry['modalities'];
+                if (empty($mods)) {
+                    $lines[] = "{$indent}    (no scans)";
+                } else {
+                    $parts = [];
+                    foreach ($mods as $mod => $n) {
+                        $parts[] = "{$mod} ({$n})";
+                    }
+                    $lines[] = "{$indent}    " . implode(', ', $parts);
+                }
+                continue;
+            }
+
+            // Subject with sessions
+            if (empty($entry['sessions'])) {
+                $lines[] = "{$indent}    (no sessions)";
+                continue;
+            }
+            foreach ($entry['sessions'] as $sesLabel => $mods) {
+                if (empty($mods)) {
+                    $lines[] = "{$indent}    ses-{$sesLabel}: (no scans)";
+                    continue;
+                }
+                $parts = [];
+                foreach ($mods as $mod => $n) {
+                    $parts[] = "{$mod} ({$n})";
+                }
+                $lines[] = "{$indent}    ses-{$sesLabel}: " . implode(', ', $parts);
+            }
+        }
+
+        return $lines;
+    }
+
     // =========================================================================
     //  EMAIL NOTIFICATION
     // =========================================================================
@@ -880,6 +1148,11 @@ class BidsImportPipeline
      */
     public function sendNotification(bool $success): void
     {
+        if ($this->notificationSent) {
+            $this->_log("  Notification already sent this run — skipping duplicate");
+            return;
+        }
+
         if ($this->dryRun ?? false) {
             $this->_log("  Notification skipped (dry run)");
             return;
@@ -914,7 +1187,9 @@ class BidsImportPipeline
             return;
         }
 
-        $status  = $success ? 'SUCCESS' : 'FAILED';
+        $isNoOp  = ($this->stats['skip_reason'] !== ''
+            && $this->stats['scans_skipped'] === $this->stats['scans_found']);
+        $status  = $isNoOp ? 'ALREADY PROCESSED' : ($success ? 'SUCCESS' : 'FAILED');
         $subject = "{$status}: {$projectName} BIDS Import Pipeline";
         $body    = $this->_buildEmailBody($success, $projectName);
 
@@ -922,27 +1197,56 @@ class BidsImportPipeline
         foreach ($emailsToSend as $to) {
             $this->notification->send($to, $subject, $body);
         }
+        $this->notificationSent = true;
     }
 
     private function _buildEmailBody(bool $success, string $projectName): string
     {
-        $s    = $this->stats;
+        $s     = $this->stats;
+        $isNoOp = ($s['skip_reason'] !== '' && $s['scans_skipped'] === $s['scans_found']);
+
+        if ($isNoOp) {
+            $statusLine = 'ALREADY PROCESSED';
+        } else {
+            $statusLine = $success ? 'SUCCESS' : 'FAILED';
+        }
+
         $body = "Project    : {$projectName}\n";
         $body .= "Run        : {$this->runTimestamp}\n";
         $body .= "Timestamp  : " . date('Y-m-d H:i:s') . "\n";
-        $body .= "Status     : " . ($success ? 'SUCCESS' : 'FAILED') . "\n\n";
+        $body .= "Status     : {$statusLine}\n";
+        if ($isNoOp && !empty($s['last_imported_at'])) {
+            $body .= "Last import: {$s['last_imported_at']}\n";
+        }
+        $body .= "\n";
 
         if ($s['job_id']) {
             $body .= "SPM Job    : job_id={$s['job_id']}"
                 . ($s['pid'] ? " pid={$s['pid']}" : "") . "\n\n";
         }
 
+        // Annotate the skipped count with its reason so "skipped 3" doesn't
+        // look like an error or a mystery.
+        $skipSuffix = ($s['scans_skipped'] > 0 && $s['skip_reason'] !== '')
+            ? " ({$s['skip_reason']}"
+            . (!empty($s['last_imported_at']) ? " on {$s['last_imported_at']}" : '')
+            . ")"
+            : '';
+
         $body .= "Statistics:\n";
         $body .= str_repeat('-', 40) . "\n";
         $body .= "Scans found     : {$s['scans_found']}\n";
         $body .= "Scans processed : {$s['scans_processed']}\n";
-        $body .= "Scans skipped   : {$s['scans_skipped']}\n";
+        $body .= "Scans skipped   : {$s['scans_skipped']}{$skipSuffix}\n";
         $body .= "Scans failed    : {$s['scans_failed']}\n";
+
+        // Per-subject breakdown of what was sent to bidsimport.
+        // Built from the BIDS tree on disk — NIfTI scan files counted by
+        // subject → session → modality. Same content as the run log's
+        // SCAN INVENTORY block.
+        if (!empty($this->scanInventory['subjects'])) {
+            $body .= "\n" . $this->_renderInventoryForEmail();
+        }
 
         if (!empty($s['errors'])) {
             $body .= "\nErrors:\n" . str_repeat('-', 40) . "\n";

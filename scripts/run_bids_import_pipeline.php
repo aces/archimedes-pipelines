@@ -192,13 +192,13 @@ try {
         echo "BIDS dir   : {$projectInfo['bids_dir']}\n";
         echo str_repeat("─", 60) . "\n";
 
-        $stats   = $pipeline->run($projectInfo['path'], $pipelineOptions);
-        $success = $stats['scans_failed'] === 0 && empty($stats['errors']);
+        $stats = $pipeline->run($projectInfo['path'], $pipelineOptions);
 
-        // Send notification
-        if (!$dryRun) {
-            $pipeline->sendNotification($success);
-        }
+        // Notification is dispatched by BidsImportPipeline::run() itself.
+        // Do NOT call $pipeline->sendNotification() here — the class owns
+        // the notification lifecycle and a second call would either send a
+        // duplicate email (older versions) or log a "skipping duplicate"
+        // line on every run (current version with idempotency guard).
 
         echo "  Scans found     : {$stats['scans_found']}\n";
         echo "  Scans processed : {$stats['scans_processed']}\n";
