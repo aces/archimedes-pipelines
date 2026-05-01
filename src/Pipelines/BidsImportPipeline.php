@@ -52,8 +52,19 @@ class BidsImportPipeline
 
     private ?string $logDir = null;
 
-    /** Tracking file name — stored in {projectPath}/processed/ */
+    /** Temp staging dir for enriched participants.tsv; cleaned in _closeAllLogs(). */
+    private ?string $stagingDir = null;
+
+    /** Tracking file name — stored in {projectPath}/processed/bids/ */
     private const TRACK_FILE = '.bids_import_processed.json';
+
+    /**
+     * Persisted copy of the enriched participants.tsv handed to bidsimport,
+     * stored in {projectPath}/processed/bids/. Kept for audit so an operator
+     * can verify which cohort/site/sex values were applied to which subjects
+     * in the most recent run. Overwritten on each enrichment.
+     */
+    private const PROCESSED_TSV = 'participants_processed.tsv';
 
     /** Seconds between job status poll requests */
     private const POLL_INTERVAL_SECONDS = 30;
@@ -110,7 +121,7 @@ class BidsImportPipeline
 
     private function _initProjectLogger(string $projectPath): void
     {
-        $this->logDir = "{$projectPath}/logs";
+        $this->logDir = "{$projectPath}/logs/bids";
         if (!is_dir($this->logDir)) {
             mkdir($this->logDir, 0755, true);
         }
@@ -166,6 +177,11 @@ class BidsImportPipeline
 
     private function _closeAllLogs(): void
     {
+        // Always tear down the temp staging dir before closing logs so its
+        // cleanup line shows up in the run log and an interrupted run doesn't
+        // leave orphan symlink trees in /tmp.
+        $this->_cleanupStaging();
+
         $sep = str_repeat('=', 72);
         $ts  = date('Y-m-d H:i:s T');
         if ($this->errorFh) {
@@ -274,7 +290,7 @@ class BidsImportPipeline
 
     private function _loadTracking(string $projectPath): array
     {
-        $path = rtrim($projectPath, '/') . '/processed/' . self::TRACK_FILE;
+        $path = rtrim($projectPath, '/') . '/processed/bids/' . self::TRACK_FILE;
         if (!file_exists($path)) {
             return [];
         }
@@ -283,7 +299,7 @@ class BidsImportPipeline
 
     private function _saveTracking(string $projectPath, array $tracking): void
     {
-        $dir = rtrim($projectPath, '/') . '/processed';
+        $dir = rtrim($projectPath, '/') . '/processed/bids';
         if (!is_dir($dir)) {
             @mkdir($dir, 0755, true);
         }
@@ -329,21 +345,42 @@ class BidsImportPipeline
      *
      * @param string $bidsPath BIDS directory containing participants.tsv
      */
-    private function _enrichParticipantsTsv(string $bidsPath): void
+    /**
+     * Produce a BIDS directory ready for bidsimport.
+     *
+     * If participants.tsv is already complete (has cohort/site/sex), returns
+     * $bidsPath unchanged. Otherwise builds a temp BIDS tree under
+     * sys_get_temp_dir() that symlinks every source item EXCEPT
+     * participants.tsv, and writes the enriched tsv as a real file in the
+     * temp tree. bidsimport sees a complete BIDS dataset; the source
+     * deidentified-lorisid/bids/ is never modified.
+     *
+     * The temp dir is recorded on $this->stagingDir so _closeAllLogs()
+     * cleans it up on every exit path.
+     *
+     * @return string|null Path to use for bidsimport, or null on hard error
+     */
+    private function _enrichParticipantsTsv(string $bidsPath): ?string
     {
         $tsvPath = rtrim($bidsPath, '/') . '/participants.tsv';
 
         if (!file_exists($tsvPath)) {
             $this->_log("  No participants.tsv found in {$bidsPath} — skipping enrich");
-            return;
+            return $bidsPath;
         }
 
-        // Read existing TSV
-        $handle = fopen($tsvPath, 'r');
-        if (!$handle) return;
+        // Read existing TSV (read-only — never write back to source)
+        $handle = @fopen($tsvPath, 'r');
+        if (!$handle) {
+            $this->_writeError("ENRICH",
+                "Cannot read participants.tsv at {$tsvPath}"
+                . " — check file permissions"
+            );
+            return null;
+        }
 
         $headerLine = fgets($handle);
-        if (!$headerLine) { fclose($handle); return; }
+        if (!$headerLine) { fclose($handle); return $bidsPath; }
         $headers = array_map('trim', explode("	", trim($headerLine)));
 
         $rows = [];
@@ -380,15 +417,52 @@ class BidsImportPipeline
         }
 
         if (empty($addedCols)) {
-            $this->_log("  participants.tsv has all required columns — no changes needed");
-            return;
+            $this->_log("  participants.tsv has all required columns — no enrichment needed");
+            return $bidsPath;
         }
 
-        // Rewrite TSV
-        $out = fopen($tsvPath, 'w');
+        // ── Stage a temp BIDS dir ─────────────────────────────────────────
+        // Source is treated as read-only. Symlink every top-level item
+        // except participants.tsv into a temp dir; write the enriched tsv
+        // there as a real file. Bidsimport reads through the symlinks for
+        // sub-* data and gets the enriched tsv from the temp dir.
+        $stagePath = sys_get_temp_dir() . '/bids_import_stage_' . $this->runTimestamp;
+
+        if (is_dir($stagePath)) {
+            exec('rm -rf ' . escapeshellarg($stagePath));
+        }
+        if (!@mkdir($stagePath, 0755, true)) {
+            $this->_writeError("ENRICH",
+                "Cannot create staging directory: {$stagePath}"
+                . " — check that " . sys_get_temp_dir() . " is writable"
+            );
+            return null;
+        }
+        $this->stagingDir = $stagePath;
+
+        // Symlink every top-level item except participants.tsv
+        $sourceDir = rtrim($bidsPath, '/');
+        foreach (glob("{$sourceDir}/*") as $item) {
+            $name = basename($item);
+            if ($name === 'participants.tsv') {
+                continue; // we'll write our own enriched copy
+            }
+            if (!@symlink($item, "{$stagePath}/{$name}")) {
+                $this->_writeError("ENRICH",
+                    "Failed to symlink {$name} into staging dir {$stagePath}"
+                );
+                return null;
+            }
+        }
+
+        // Write enriched participants.tsv as a real file in the staging dir
+        $stagedTsv = "{$stagePath}/participants.tsv";
+        $out       = @fopen($stagedTsv, 'w');
         if (!$out) {
-            $this->_log("  WARNING: Cannot write enriched participants.tsv");
-            return;
+            $this->_writeError("ENRICH",
+                "Cannot write enriched participants.tsv to {$stagedTsv}"
+            );
+            return null;
         }
 
         fwrite($out, implode("	", $headers) . "
@@ -403,9 +477,45 @@ class BidsImportPipeline
         }
         fclose($out);
 
-        $this->_log("  ✓ participants.tsv enriched ("
+        // Persist a durable copy under processed/bids/ so the operator can
+        // audit which cohort/site/sex values were applied without digging
+        // through /tmp (which is cleaned at the end of the run).
+        $processedDir = rtrim($this->projectPath, '/') . '/processed/bids';
+        if (!is_dir($processedDir)) {
+            @mkdir($processedDir, 0755, true);
+        }
+        $persistedTsv = "{$processedDir}/" . self::PROCESSED_TSV;
+        if (!@copy($stagedTsv, $persistedTsv)) {
+            // Non-fatal: bidsimport still gets the staged copy. Log so the
+            // operator knows the audit copy is missing.
+            $this->_log("    WARNING: Could not persist enriched copy to {$persistedTsv}"
+                . " — bidsimport will still receive the staged tsv");
+        }
+
+        $this->_log("  ✓ participants.tsv enriched in temp staging dir ("
             . count($rows) . " rows, added: "
             . implode(', ', array_keys($addedCols)) . ")");
+        $this->_log("    Staging dir         : {$stagePath}");
+        $this->_log("    Persisted audit copy: {$persistedTsv}");
+        $this->_log("    Source participants.tsv at {$tsvPath} is untouched");
+
+        return $stagePath;
+    }
+
+    /**
+     * Tear down the staging directory if one was created. Idempotent.
+     * Called from _closeAllLogs() so every exit path triggers cleanup.
+     */
+    private function _cleanupStaging(): void
+    {
+        if ($this->stagingDir === null) {
+            return;
+        }
+        if (is_dir($this->stagingDir)) {
+            exec('rm -rf ' . escapeshellarg($this->stagingDir));
+            $this->_log("  Staging directory removed: {$this->stagingDir}");
+        }
+        $this->stagingDir = null;
     }
 
     // =========================================================================
@@ -549,7 +659,7 @@ class BidsImportPipeline
 
         // Load tracking — skip if already successfully imported
         // To reimport, delete the tracking file:
-        //   {projectPath}/processed/.bids_import_processed.json
+        //   {projectPath}/processed/bids/.bids_import_processed.json
         $tracking   = $this->_loadTracking($projectPath);
         $lastRun    = $tracking['last_run'] ?? null;
         $lastStatus = $lastRun['status']    ?? '';
@@ -564,7 +674,7 @@ class BidsImportPipeline
                 $this->_log("  ✓ Already imported successfully (last run: {$lastTs})"
                     . " — no new scans found. Skipping.");
                 $this->_log("  To reimport, delete:"
-                    . " {$projectPath}/processed/.bids_import_processed.json");
+                    . " {$projectPath}/processed/bids/.bids_import_processed.json");
                 $this->stats['scans_skipped'] = $this->stats['scans_found'];
                 $success = true;
                 $this->sendNotification($success);
@@ -584,12 +694,21 @@ class BidsImportPipeline
         }
 
         // Enrich participants.tsv with missing required columns
-        // (cohort, site alias, sex) from project.json candidate_defaults
-        $this->_enrichParticipantsTsv($bidsPath);
+        // (cohort, site alias, sex) from project.json candidate_defaults.
+        // The source file is never modified — when enrichment is needed,
+        // a temp staging dir is built with symlinks to source items plus
+        // the enriched tsv, and bidsimport runs against that.
+        $effectiveBidsPath = $this->_enrichParticipantsTsv($bidsPath);
+        if ($effectiveBidsPath === null) {
+            $this->stats['scans_failed'] = $this->stats['scans_found'];
+            $this->sendNotification(false);
+            $this->_closeAllLogs();
+            return $this->stats;
+        }
 
         // Launch async bidsimport
         $this->_log("  Launching bidsimport ...");
-        $launch = $this->_launchBidsImport($bidsPath, $options);
+        $launch = $this->_launchBidsImport($effectiveBidsPath, $options);
 
         if (($launch['http_status'] ?? 0) !== 202) {
             $errMsg = $launch['error'] ?? "HTTP " . ($launch['http_status'] ?? '?');

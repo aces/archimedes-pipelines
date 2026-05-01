@@ -21,15 +21,19 @@ use LORIS\Utils\CleanLogFormatter;
  *   - Prints "ERROR: no mapping found for sub-XX" but does NOT exit non-zero
  *     → pipeline scans stdout for this pattern
  *
- * In-sync skip:
- *   Before launching the script, source and target are compared. If the
- *   target already reflects the source (same sub-* count and the target's
- *   newest file is at least as recent as the source's newest), the run
- *   is skipped — no API call, no script execution. If the target exists
- *   but the source has newer changes, the pipeline reports the change
- *   and exits without running, advising --force to overwrite.
+ * Per-subject tracking + incremental reidentification:
+ *   {projectPath}/processed/bids/.bids_reidentifier_processed.json records
+ *   every source sub-* folder that has been reidentified into the target.
+ *   On each run:
+ *     - If every source sub-* is already in tracking → skip the script entirely.
+ *     - If new sub-* folders are present in source → stage just those folders
+ *       (plus participants.tsv and other top-level files, via symlinks) into
+ *       a temp directory and point the reidentifier at it. Previously
+ *       reidentified subjects in the target are untouched.
+ *   --force bypasses tracking, deletes the target, and reidentifies
+ *   the full source from scratch.
  *
- * Log files written to {projectPath}/logs/:
+ * Log files written to {projectPath}/logs/bids/:
  *   bids_reidentifier_run_{timestamp}.log    — full run log
  *   bids_reidentifier_errors_{timestamp}.log — errors only (on first error)
  *
@@ -51,6 +55,9 @@ class BidsReidentifier
     /** @var resource|null */
     private $errorFh  = null;
 
+    /** Temp staging dir (symlink tree of new subjects). Cleaned in _closeLogs(). */
+    private ?string $stagingDir = null;
+
     /** Seconds between job status poll requests */
     private const POLL_INTERVAL_SECONDS = 30;
 
@@ -62,6 +69,9 @@ class BidsReidentifier
 
     /** Pattern printed by bids_reidentifier.php for unmapped subjects */
     private const UNMAPPED_PATTERN = '/ERROR: no mapping found for (sub-\S+)/i';
+
+    /** Tracking file name — stored in {projectPath}/processed/bids/ */
+    private const TRACK_FILE = '.bids_reidentifier_processed.json';
 
     private array $stats = [
         'subjects_found'    => 0,
@@ -104,7 +114,7 @@ class BidsReidentifier
 
     private function _openLogs(string $projectPath): void
     {
-        $logDir = "{$projectPath}/logs";
+        $logDir = "{$projectPath}/logs/bids";
         if (!is_dir($logDir)) {
             @mkdir($logDir, 0755, true);
         }
@@ -182,6 +192,11 @@ class BidsReidentifier
 
     private function _closeLogs(): void
     {
+        // Always tear down the temp staging dir before closing logs so its
+        // cleanup line shows up in the run log and so an interrupted run
+        // doesn't leave orphan symlink trees in /tmp.
+        $this->_cleanupStaging();
+
         $sep = str_repeat('=', 72);
         $ts  = date('Y-m-d H:i:s T');
         if ($this->errorFh) {
@@ -333,112 +348,225 @@ class BidsReidentifier
     }
 
     // =========================================================================
-    //  IN-SYNC CHECK
+    //  PER-SUBJECT TRACKING
     //
-    //  Decide whether the target already reflects the source so we can
-    //  skip the actual reidentifier run. Direct filename diff isn't
-    //  possible because the reidentifier renames sub-{ExtStudyID} ->
-    //  sub-{PSCID} by design, so dir names won't match across the two
-    //  trees. Heuristic instead:
+    //  processed/bids/.bids_reidentifier_processed.json keeps a record of
+    //  every source sub-* directory that has been successfully reidentified
+    //  into the target. The structure:
     //
-    //    1. sub-* count must match (catches add/remove of whole subjects)
-    //    2. Source's newest file mtime must be <= target's newest file
-    //       mtime (catches edits inside any subject — file changes,
-    //       new files, json/tsv edits)
+    //    {
+    //      "subjects": {
+    //        "sub-FDGP001": {
+    //          "reidentified_at": "2026-04-30T12:00:00+00:00",
+    //          "run_timestamp"  : "2026-04-30_12-00-00"
+    //        },
+    //        ...
+    //      },
+    //      "last_run": {
+    //        "status"             : "success" | "failed",
+    //        "timestamp"          : "...",
+    //        "run_timestamp"      : "...",
+    //        "subjects_processed" : N,
+    //        "subjects_total"     : M,
+    //        "detail"             : "..."
+    //      }
+    //    }
     //
-    //  Both must hold for "in sync". The check is intentionally cheap
-    //  (one glob + one recursive walk per side); the underlying
-    //  reidentifier run is far more expensive than this.
-    //
-    //  Limitations of this heuristic:
-    //    - rsync-style copies that preserve mtime would pass through
-    //      undetected. Not a concern for the normal upstream-edit
-    //      workflow (editors bump mtime).
-    //    - Files removed from source where target still has them won't
-    //      trigger "not in sync" (count + max-mtime can both still
-    //      match). Run with --force after a deletion.
-    //
-    //  --force bypasses this check entirely and always re-runs.
+    //  --force bypasses this entirely and rebuilds the target from scratch,
+    //  marking every source subject as freshly reidentified at the end.
     // =========================================================================
 
     /**
-     * Compare source vs target trees and decide if the target is already
-     * in sync with the source. Returns the decision plus a human-readable
-     * reason for the log line.
-     *
-     * @return array{in_sync: bool, reason: string}
+     * Load the tracking dictionary from {projectPath}/processed/bids/.
+     * Returns an empty skeleton (no subjects, no last_run) when no tracking
+     * file exists yet.
      */
-    private function _checkTargetInSync(string $sourceDir, string $targetDir): array
+    private function _loadTracking(string $projectPath): array
     {
-        $sourceSubs = glob(rtrim($sourceDir, '/') . '/sub-*', GLOB_ONLYDIR) ?: [];
-        $targetSubs = glob(rtrim($targetDir, '/') . '/sub-*', GLOB_ONLYDIR) ?: [];
-
-        $sourceCount = count($sourceSubs);
-        $targetCount = count($targetSubs);
-
-        if ($targetCount === 0) {
-            return [
-                'in_sync' => false,
-                'reason'  => 'target has no sub-* directories',
-            ];
+        $path = rtrim($projectPath, '/') . '/processed/bids/' . self::TRACK_FILE;
+        if (!file_exists($path)) {
+            return ['subjects' => [], 'last_run' => null];
         }
-
-        if ($sourceCount !== $targetCount) {
-            return [
-                'in_sync' => false,
-                'reason'  => "subject count differs (source: {$sourceCount}, target: {$targetCount})",
-            ];
+        $data = json_decode(file_get_contents($path), true);
+        if (!is_array($data)) {
+            return ['subjects' => [], 'last_run' => null];
         }
-
-        $sourceMtime = $this->_getMaxMtime($sourceDir);
-        $targetMtime = $this->_getMaxMtime($targetDir);
-
-        // Strict ">": equal mtimes (e.g. files copied in same second)
-        // are treated as in-sync, not as a change.
-        if ($sourceMtime > $targetMtime) {
-            return [
-                'in_sync' => false,
-                'reason'  => 'source has files newer than target'
-                    . ' (source latest: ' . date('Y-m-d H:i:s', $sourceMtime)
-                    . ', target latest: ' . date('Y-m-d H:i:s', $targetMtime) . ')',
-            ];
-        }
-
-        return [
-            'in_sync' => true,
-            'reason'  => "{$targetCount} sub-* dirs match and target is up to date"
-                . ' (target latest: ' . date('Y-m-d H:i:s', $targetMtime) . ')',
-        ];
+        $data['subjects'] = $data['subjects'] ?? [];
+        $data['last_run'] = $data['last_run'] ?? null;
+        return $data;
     }
 
     /**
-     * Recursively find the newest file mtime under a directory tree.
-     * Returns 0 on permission errors / unreadable paths so the caller
-     * treats the tree as "not synced" and re-runs rather than silently
-     * succeeding on a broken read.
+     * Persist the tracking dictionary. Creates processed/bids/ if missing.
      */
-    private function _getMaxMtime(string $dir): int
+    private function _saveTracking(string $projectPath, array $tracking): void
     {
-        $maxMtime = 0;
-        try {
-            $iterator = new \RecursiveIteratorIterator(
-                new \RecursiveDirectoryIterator($dir, \FilesystemIterator::SKIP_DOTS),
-                \RecursiveIteratorIterator::LEAVES_ONLY,
-                \RecursiveIteratorIterator::CATCH_GET_CHILD
-            );
-            foreach ($iterator as $file) {
-                if ($file->isFile()) {
-                    $mtime = $file->getMTime();
-                    if ($mtime > $maxMtime) {
-                        $maxMtime = $mtime;
-                    }
-                }
-            }
-        } catch (\Exception $e) {
-            // Permission errors etc. — return 0 (caller treats as not-in-sync)
-            $this->logger->debug("  _getMaxMtime exception on {$dir}: " . $e->getMessage());
+        $dir = rtrim($projectPath, '/') . '/processed/bids';
+        if (!is_dir($dir)) {
+            @mkdir($dir, 0755, true);
         }
-        return $maxMtime;
+        $path = "{$dir}/" . self::TRACK_FILE;
+        file_put_contents(
+            $path,
+            json_encode($tracking, JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES)
+        );
+    }
+
+    /**
+     * Record a successful reidentification: stamp every $subjects entry
+     * with this run's timestamp, refresh last_run, and write to disk.
+     */
+    private function _markSuccess(
+        string $projectPath,
+        array $tracking,
+        array $subjects,
+        string $detail = ''
+    ): void {
+        $now = date('c');
+
+        if (!isset($tracking['subjects']) || !is_array($tracking['subjects'])) {
+            $tracking['subjects'] = [];
+        }
+        foreach ($subjects as $subj) {
+            $tracking['subjects'][$subj] = [
+                'reidentified_at' => $now,
+                'run_timestamp'   => $this->runTimestamp,
+            ];
+        }
+
+        $tracking['last_run'] = [
+            'status'             => 'success',
+            'timestamp'          => $now,
+            'run_timestamp'      => $this->runTimestamp,
+            'subjects_processed' => count($subjects),
+            'subjects_total'     => count($tracking['subjects']),
+            'detail'             => $detail,
+        ];
+
+        $this->_saveTracking($projectPath, $tracking);
+        $this->_log("  Tracking updated: " . count($subjects)
+            . " subject(s) marked reidentified"
+            . " (total tracked: " . count($tracking['subjects']) . ")");
+    }
+
+    /**
+     * Record a failed run. Subject map is left intact — only last_run is
+     * updated so the operator can see what went wrong without losing the
+     * record of previously successful subjects.
+     */
+    private function _markFailed(
+        string $projectPath,
+        array $tracking,
+        string $detail
+    ): void {
+        $tracking['last_run'] = [
+            'status'             => 'failed',
+            'timestamp'          => date('c'),
+            'run_timestamp'      => $this->runTimestamp,
+            'subjects_processed' => 0,
+            'subjects_total'     => count($tracking['subjects'] ?? []),
+            'detail'             => $detail,
+        ];
+        $this->_saveTracking($projectPath, $tracking);
+    }
+
+    // =========================================================================
+    //  STAGING
+    //
+    //  When only some source sub-* folders are new, we stage just those
+    //  folders into a temp directory using symlinks, then point the
+    //  reidentifier at the temp dir. The script processes only the new
+    //  subjects and writes them to the actual target. Previously
+    //  reidentified subjects in the target remain untouched.
+    //
+    //  participants.tsv is symlinked too — the script reads it for
+    //  ID resolution. Other top-level files (dataset_description.json,
+    //  README, etc.) are also symlinked so the BIDS layout is intact.
+    //
+    //  Symlinks instead of copies: zero disk cost and the script reads
+    //  through them transparently. The output written to target is regular
+    //  files (the script copies content while renaming), so the symlinks
+    //  themselves never end up in target.
+    // =========================================================================
+
+    /**
+     * Build a temp BIDS tree containing only the requested sub-* folders.
+     * Returns the staging path on success, null on failure (logs the error
+     * and cleans up any partial directory).
+     *
+     * The created directory is recorded on $this->stagingDir so it gets
+     * cleaned up automatically by _closeLogs() on every exit path.
+     */
+    private function _stageNewSubjects(string $sourceDir, array $newSubjects): ?string
+    {
+        $sourceDir = rtrim($sourceDir, '/');
+        $stagePath = sys_get_temp_dir() . '/bids_reidentifier_stage_' . $this->runTimestamp;
+
+        if (is_dir($stagePath)) {
+            // Highly unlikely, but be defensive
+            exec('rm -rf ' . escapeshellarg($stagePath));
+        }
+        if (!@mkdir($stagePath, 0755, true)) {
+            $this->_error("STAGING", "Cannot create staging directory: {$stagePath}");
+            return null;
+        }
+
+        $this->stagingDir = $stagePath;
+
+        // Top-level files (participants.tsv, dataset_description.json, README, ...).
+        // The script needs participants.tsv for ID mapping; the rest keep the BIDS
+        // tree well-formed. Directories at top level are skipped except for sub-*
+        // folders, which are linked individually below.
+        foreach (glob("{$sourceDir}/*") as $item) {
+            $name = basename($item);
+            if (str_starts_with($name, 'sub-')) {
+                continue; // handled below, only the new ones
+            }
+            if (!is_file($item)) {
+                continue; // skip non-sub directories
+            }
+            if (!@symlink($item, "{$stagePath}/{$name}")) {
+                $this->_error("STAGING",
+                    "Failed to symlink top-level file: {$name}"
+                    . " — falling back to no-staging full run"
+                );
+                return null;
+            }
+        }
+
+        // Symlink each new sub-* directory.
+        foreach ($newSubjects as $subj) {
+            $src = "{$sourceDir}/{$subj}";
+            $dst = "{$stagePath}/{$subj}";
+            if (!is_dir($src)) {
+                $this->_error("STAGING", "New subject directory missing: {$src}");
+                return null;
+            }
+            if (!@symlink($src, $dst)) {
+                $this->_error("STAGING", "Failed to symlink subject: {$subj}");
+                return null;
+            }
+        }
+
+        $this->_log("  Staging directory: {$stagePath}");
+        $this->_log("    Staged " . count($newSubjects) . " new sub-* folder(s) via symlink");
+        return $stagePath;
+    }
+
+    /**
+     * Tear down the staging directory if one was created. Idempotent.
+     * Called from _closeLogs() so every exit path triggers cleanup.
+     */
+    private function _cleanupStaging(): void
+    {
+        if ($this->stagingDir === null) {
+            return;
+        }
+        if (is_dir($this->stagingDir)) {
+            exec('rm -rf ' . escapeshellarg($this->stagingDir));
+            $this->_log("  Staging directory removed: {$this->stagingDir}");
+        }
+        $this->stagingDir = null;
     }
 
     // =========================================================================
@@ -651,37 +779,59 @@ class BidsReidentifier
 
         $this->_log("  Project : {$projectName}");
 
-        // ── In-sync check ──────────────────────────────────────────────────
-        // Decide before any expensive work (auth, ID pattern parse, async
-        // launch) whether we actually need to run. --force always proceeds;
-        // --dry-run still proceeds so the user can see the parameters.
-        if (!$force && !$dryRun && is_dir($targetDir)) {
-            $sync = $this->_checkTargetInSync($sourceDir, $targetDir);
+        // ── Tracking + new-subject detection ──────────────────────────────
+        // Decide what work is needed before touching the API: glob source
+        // sub-* dirs, diff against tracked ones. Skip when nothing is new;
+        // otherwise either stage just the new subjects (default) or run
+        // the full source (--force).
+        $tracking         = $this->_loadTracking($projectPath);
+        $trackedSubjects  = array_keys($tracking['subjects'] ?? []);
+        $sourceSubjects   = array_map('basename',
+            glob(rtrim($sourceDir, '/') . '/sub-*', GLOB_ONLYDIR) ?: []
+        );
+        sort($sourceSubjects);
 
-            if ($sync['in_sync']) {
-                $this->_log("");
-                $this->_log("  ✓ Target is already in sync with source — skipping reidentification");
-                $this->_log("    {$sync['reason']}");
-                $this->_log("    Use --force to re-run anyway.");
-                // Treat all source subjects as accounted for — they're
-                // already reidentified in the target from a previous run.
-                $this->stats['subjects_mapped'] = $this->stats['subjects_found'];
-                $this->_printSummary();
-                $this->_closeLogs();
-                return $this->stats;
-            }
+        $newSubjects      = array_values(array_diff($sourceSubjects, $trackedSubjects));
+        $alreadyDone      = count($sourceSubjects) - count($newSubjects);
+        $orphanInTracking = array_values(array_diff($trackedSubjects, $sourceSubjects));
 
-            // Target exists but source has changed since last run. Don't
-            // overwrite silently — make the operator confirm with --force.
+        $lastRun = $tracking['last_run'] ?? null;
+        $this->_log("  Tracking: "
+            . ($lastRun
+                ? "last run {$lastRun['timestamp']} — {$lastRun['status']}"
+                . " (" . count($trackedSubjects) . " subject(s) on record)"
+                : "no previous run"));
+        $this->_log("  Source has " . count($sourceSubjects) . " sub-* dir(s):"
+            . " {$alreadyDone} already reidentified, " . count($newSubjects) . " new");
+
+        if (!empty($orphanInTracking)) {
+            $this->_log("  NOTE: " . count($orphanInTracking)
+                . " subject(s) in tracking are missing from source — orphans"
+                . " may remain in target. Use --force for clean rebuild.");
+        }
+
+        // No new subjects → skip entirely.
+        if (!$force && !$dryRun && empty($newSubjects)) {
             $this->_log("");
-            $this->_warn("CHANGES_DETECTED",
-                "File change found between source and target:"
-                . "\n    {$sync['reason']}"
-                . "\n    Run with --force to overwrite the existing target."
-            );
+            $this->_log("  ✓ All source subjects already reidentified — skipping");
+            $this->_log("    Use --force to re-run anyway.");
+            $this->stats['subjects_mapped'] = $this->stats['subjects_found'];
             $this->_printSummary();
             $this->_closeLogs();
             return $this->stats;
+        }
+
+        // Show which subjects will be processed (new ones).
+        if (!$force && !empty($newSubjects)) {
+            $preview = array_slice($newSubjects, 0, 10);
+            $suffix  = count($newSubjects) > 10
+                ? ' +' . (count($newSubjects) - 10) . ' more'
+                : '';
+            $this->_log("  New subjects to reidentify: "
+                . implode(', ', $preview) . $suffix);
+        }
+        if ($force) {
+            $this->_log("  --force: bypassing tracking — full source rebuild");
         }
 
         $idPattern = $this->_extractIdPattern($sourceDir);
@@ -703,6 +853,9 @@ class BidsReidentifier
             $this->_log("  id_pattern   : {$idPattern}");
             $this->_log("  mode         : INTERNAL (ExtStudyID → PSCID)");
             $this->_log("  project_list : {$projectList}");
+            $this->_log("  Would process: " . ($force
+                    ? "full source (" . count($sourceSubjects) . " subjects, --force)"
+                    : count($newSubjects) . " new subject(s), staged via symlinks"));
             $this->_printSummary();
             $this->_closeLogs();
             return $this->stats;
@@ -741,14 +894,39 @@ class BidsReidentifier
             $this->_log("  ✓ Target directory created (777)");
         }
 
+        // ── Decide effective source ───────────────────────────────────────
+        // --force: run on the original source (full rebuild).
+        // First run with no tracking and all subjects new: also run on
+        //   original source — staging would be a 1:1 mirror, no benefit.
+        // Otherwise: stage only the new subjects.
+        $effectiveSourceDir   = $sourceDir;
+        $subjectsToReidentify = $sourceSubjects; // recorded on success
+
+        if (!$force && count($newSubjects) < count($sourceSubjects)) {
+            $staged = $this->_stageNewSubjects($sourceDir, $newSubjects);
+            if ($staged === null) {
+                // _stageNewSubjects already logged the error and recorded it
+                // in stats; the staging dir (if partially created) is on
+                // $this->stagingDir and will be cleaned by _closeLogs.
+                $this->_markFailed($projectPath, $tracking,
+                    "staging failed for " . count($newSubjects) . " subject(s)");
+                $this->_printSummary();
+                $this->_closeLogs();
+                return $this->stats;
+            }
+            $effectiveSourceDir   = $staged;
+            $subjectsToReidentify = $newSubjects;
+        }
+
         if (!$this->_authenticate()) {
+            $this->_markFailed($projectPath, $tracking, "authentication failed");
             $this->_printSummary();
             $this->_closeLogs();
             return $this->stats;
         }
 
         // Launch async job
-        $launch = $this->_launchAsync($sourceDir, $targetDir, $idPattern, $projectList);
+        $launch = $this->_launchAsync($effectiveSourceDir, $targetDir, $idPattern, $projectList);
 
         $httpStatus = $launch['http_status'] ?? 0;
 
@@ -760,6 +938,7 @@ class BidsReidentifier
                 "Failed to launch bidsreidentifier (HTTP {$httpStatus}): {$errMsg}"
                 . " — check /cbigr_api/script/bidsreidentifier endpoint and Apache logs"
             );
+            $this->_markFailed($projectPath, $tracking, "launch HTTP {$httpStatus}");
             $this->_printSummary();
             $this->_closeLogs();
             return $this->stats;
@@ -770,6 +949,7 @@ class BidsReidentifier
 
         if (!$jobId) {
             $this->_error("LAUNCH", "No job_id returned from async launch");
+            $this->_markFailed($projectPath, $tracking, "no job_id from launch");
             $this->_printSummary();
             $this->_closeLogs();
             return $this->stats;
@@ -805,6 +985,8 @@ class BidsReidentifier
                 $this->_error("TIMEOUT",
                     "Job {$jobId} timed out after " . self::POLL_TIMEOUT_SECONDS . "s"
                 );
+                $this->_markFailed($projectPath, $tracking,
+                    "timeout after " . self::POLL_TIMEOUT_SECONDS . "s job_id={$jobId}");
                 $this->_printSummary();
                 $this->_closeLogs();
                 return $this->stats;
@@ -833,6 +1015,8 @@ class BidsReidentifier
                         . " consecutive times"
                         . " — check GET cbigr_api/script/job/{$jobId}"
                     );
+                    $this->_markFailed($projectPath, $tracking,
+                        "poll failed job_id={$jobId}");
                     $this->_printSummary();
                     $this->_closeLogs();
                     return $this->stats;
@@ -861,6 +1045,8 @@ class BidsReidentifier
                         . " after successful run) ({$elapsed}s)"
                     );
                     $this->stats['subjects_mapped'] = $this->stats['subjects_found'];
+                    $this->_markSuccess($projectPath, $tracking, $subjectsToReidentify,
+                        "job_id={$jobId} (UNKNOWN confirmed via wasRunning)");
                     $this->_printSummary();
                     $this->_closeLogs();
                     return $this->stats;
@@ -869,6 +1055,8 @@ class BidsReidentifier
                     "Job {$jobId} ended UNKNOWN without ever running"
                     . " — check server_processes id={$jobId} and Apache error log"
                 );
+                $this->_markFailed($projectPath, $tracking,
+                    "UNKNOWN without RUNNING job_id={$jobId}");
                 $this->_printSummary();
                 $this->_closeLogs();
                 return $this->stats;
@@ -878,6 +1066,8 @@ class BidsReidentifier
                 $this->_log("  ✓ SUCCESS ({$elapsed}s)");
                 $output = $status['progress'] ?? '';
                 $this->_parseScriptOutput($output);
+                $this->_markSuccess($projectPath, $tracking, $subjectsToReidentify,
+                    "job_id={$jobId}");
                 $this->_printSummary();
                 $this->_closeLogs();
                 return $this->stats;
@@ -894,11 +1084,12 @@ class BidsReidentifier
             // This ONLY applies when exit code is genuinely unknown (not when
             // SPM has a real non-zero exit code). Confirm by checking:
             //   1. Error detail says "exit code unknown" (SPM race condition marker)
-            //   2. Target has the same number of sub-* dirs as source (real work done)
+            //   2. Target has at least the expected number of sub-* dirs
             //
-            // A genuine failure (permission error, DB error, fatal exception)
-            // will either have a real non-zero exit code (not '?') or have
-            // zero/fewer target dirs than expected.
+            // For the staging case we only expect the new subjects to land in
+            // target *during this run* — but target may already contain prior
+            // reidentified subjects from earlier runs, so the count check stays
+            // against the source-total expectation.
             $isExitCodeUnknown = str_contains(strtolower($errorDetail), 'exit code unknown');
             $targetSubjects    = glob("{$targetDir}/sub-*", GLOB_ONLYDIR) ?: [];
             $targetCount       = count($targetSubjects);
@@ -914,6 +1105,8 @@ class BidsReidentifier
                     . " sub-* dirs) ({$elapsed}s)"
                 );
                 $this->stats['subjects_mapped'] = $sourceCount;
+                $this->_markSuccess($projectPath, $tracking, $subjectsToReidentify,
+                    "job_id={$jobId} (race condition recovery)");
                 $this->_printSummary();
                 $this->_closeLogs();
                 return $this->stats;
@@ -926,6 +1119,9 @@ class BidsReidentifier
                     . " {$targetCount}/{$sourceCount} sub-* dirs in target."
                     . " job_id={$jobId}. Check Apache error log."
                 );
+                $this->_markFailed($projectPath, $tracking,
+                    "exit unknown, partial target ({$targetCount}/{$sourceCount})"
+                    . " job_id={$jobId}");
                 $this->_printSummary();
                 $this->_closeLogs();
                 return $this->stats;
@@ -937,6 +1133,8 @@ class BidsReidentifier
                 . "\n    Output tail:\n    "
                 . str_replace("\n", "\n    ", substr($errorDetail, 0, 500))
             );
+            $this->_markFailed($projectPath, $tracking,
+                "exit {$exitCode} job_id={$jobId}");
             $this->_printSummary();
             $this->_closeLogs();
             return $this->stats;
