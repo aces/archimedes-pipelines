@@ -26,6 +26,15 @@ use LORIS\Utils\CleanLogFormatter;
  *   empty; unparseable values pass through unchanged so LORIS surfaces
  *   the validation error rather than the pipeline silently mangling it.
  *
+ * Candidate creation strategy:
+ *   1. Try CandidatesPlus endpoint first (POST /cbigr_api/candidatesPlus)
+ *      — accepts ProjectExternalName + ExtStudyID directly, server-side
+ *      handles candidate_project_extid_rel insert atomically.
+ *   2. Fall back to legacy two-step (/api/v0.0.4-dev/candidates →
+ *      candidate_parameters/ajax/formHandler.php) when CandidatesPlus
+ *      returns 404 or other transport errors. Kept until CandidatesPlus
+ *      ships everywhere.
+ *
  * @package LORIS\Pipelines
  */
 class BidsParticipantSync
@@ -45,11 +54,21 @@ class BidsParticipantSync
     /** @var resource|null */
     private $errorFh  = null;
 
+    /**
+     * Tracks whether CandidatesPlus has been confirmed available on this
+     * server during this run. Once it returns 404 we stop trying it for
+     * subsequent participants and fall through to the legacy path
+     * silently. Reset on each run() call.
+     */
+    private bool $candidatesPlusAvailable = true;
+
     private array $stats = [
         'total_participants'   => 0,
         'total_bids_dirs'      => 0,
         'already_exists'       => 0,
         'created'              => 0,
+        'created_via_plus'     => 0,
+        'created_via_legacy'   => 0,
         'external_id_linked'   => 0,
         'external_id_skipped'  => 0,
         'orphan_directories'   => [],
@@ -149,7 +168,6 @@ class BidsParticipantSync
         }
     }
 
-    /** Record error, open error log on first call, always continue. */
     private function _error(string $context, string $msg): void
     {
         $this->logger->error("[{$context}] {$msg}");
@@ -183,35 +201,15 @@ class BidsParticipantSync
 
     // =========================================================================
     //  DATE NORMALIZATION (DoB and DoD)
-    //
-    //  Coerce one date string to YYYY-MM-01 per ARCHIMEDES privacy policy.
-    //  Same rule for both DoB and DoD; either one passes through this helper
-    //  before being sent to LORIS.
-    //    YYYY-MM-DD  -> YYYY-MM-01  (day forced to 01)
-    //    YYYY-MM     -> YYYY-MM-01  (day missing -> 01)
-    //    YYYY        -> YYYY-01-01  (month + day missing -> 01)
-    //    empty       -> empty       (unchanged)
-    //    other       -> unchanged   (let LORIS surface validation errors
-    //                                rather than silently mangling input)
     // =========================================================================
 
     private function _normalizeDateValue(string $value): string
     {
         $value = trim($value);
-        if ($value === '') {
-            return $value;
-        }
-
-        if (preg_match('/^(\d{4})-(\d{2})-\d{2}$/', $value, $m)) {
-            return "{$m[1]}-{$m[2]}-01";
-        }
-        if (preg_match('/^(\d{4})-(\d{2})$/', $value, $m)) {
-            return "{$m[1]}-{$m[2]}-01";
-        }
-        if (preg_match('/^(\d{4})$/', $value, $m)) {
-            return "{$m[1]}-01-01";
-        }
-
+        if ($value === '') return $value;
+        if (preg_match('/^(\d{4})-(\d{2})-\d{2}$/', $value, $m)) return "{$m[1]}-{$m[2]}-01";
+        if (preg_match('/^(\d{4})-(\d{2})$/',      $value, $m)) return "{$m[1]}-{$m[2]}-01";
+        if (preg_match('/^(\d{4})$/',              $value, $m)) return "{$m[1]}-01-01";
         return $value;
     }
 
@@ -279,23 +277,35 @@ class BidsParticipantSync
         return null;
     }
 
+    /**
+     * Resolve the value to send to CandidatesPlus as ProjectExternalName.
+     *
+     * Single source: project.json → candidate_defaults.project. The same
+     * value is used for the LORIS Candidate.Project field; CandidatesPlus
+     * uses it for the external-project lookup too. Returns null if the
+     * field isn't set, and the caller falls back to the legacy path.
+     */
+    private function _getProjectExternalName(): ?string
+    {
+        $defaults = $this->projectDefaults['candidate_defaults'] ?? [];
+        if (!empty($defaults['project'])) {
+            return (string)$defaults['project'];
+        }
+        return null;
+    }
+
     private function _getProjectExternalID(string $projectName): ?string
     {
-        // Priority 1: candidate_defaults.project_external_id in project.json
-        // Best option when pipeline runs on a different server than LORIS DB
+        // Legacy resolver — used only on the legacy two-step candidate-creation
+        // path. CandidatesPlus does the lookup server-side and doesn't need this.
         $defaults = $this->projectDefaults['candidate_defaults'] ?? [];
         if (!empty($defaults['project_external_id'])) {
             return (string)$defaults['project_external_id'];
         }
 
-        // Priority 2: project_mappings in project.json (fuzzy match)
-        // Handles mismatches like 'FDG PET' vs 'FDG-PET'
         if (!empty($this->projectDefaults['project_mappings'])) {
             $mappings = $this->projectDefaults['project_mappings'];
-            if (isset($mappings[$projectName])) {
-                return (string)$mappings[$projectName];
-            }
-            // Normalise: spaces/underscores → hyphens, lowercase
+            if (isset($mappings[$projectName])) return (string)$mappings[$projectName];
             $normalise = fn($s) => str_replace([' ', '_'], '-', strtolower(trim($s)));
             foreach ($mappings as $key => $val) {
                 if ($normalise($key) === $normalise($projectName)) {
@@ -306,19 +316,14 @@ class BidsParticipantSync
             }
         }
 
-        // Priority 3: project_mappings in loris_client_config.json
         $configMappings = $this->config['project_mappings'] ?? [];
-        if (isset($configMappings[$projectName])) {
-            return (string)$configMappings[$projectName];
-        }
+        if (isset($configMappings[$projectName])) return (string)$configMappings[$projectName];
 
-        // Priority 4: config default
         $default = $this->config['loris']['project_external_id']
             ?? $this->config['api']['project_external_id']
             ?? null;
         if ($default) return (string)$default;
 
-        // Priority 5: database (last resort — may not be accessible from data server)
         try {
             $dbConfig = $this->config['database'] ?? null;
             if ($dbConfig && !empty($dbConfig['host']) && !empty($dbConfig['name'])) {
@@ -345,7 +350,6 @@ class BidsParticipantSync
                 . " to project.json instead."
             );
         }
-
         return null;
     }
 
@@ -353,15 +357,6 @@ class BidsParticipantSync
     //  LORIS PROJECT VALIDATION
     // =========================================================================
 
-    /**
-     * Fetch all project names from LORIS API.
-     * Returns array of project name strings, or null on API error.
-     *
-     * Endpoint: GET /api/{version}/projects
-     * Used to validate project name before attempting candidate creation.
-     *
-     * @return string[]|null
-     */
     private function _fetchLorisProjects(): ?array
     {
         $baseUrl = rtrim($this->config['loris']['base_url'], '/');
@@ -371,23 +366,17 @@ class BidsParticipantSync
             $response = $this->_http()->request('GET', "{$baseUrl}/api/{$version}/projects", [
                 'headers' => ['Authorization' => "Bearer {$this->token}"],
             ]);
-
             $data     = json_decode((string)$response->getBody(), true);
             $projects = $data['Projects'] ?? [];
-
             if (empty($projects)) {
                 $this->_error('LORIS_PROJECTS',
-                    'No projects returned from LORIS API.'
-                    . ' Response: ' . json_encode($data)
+                    'No projects returned from LORIS API. Response: ' . json_encode($data)
                 );
                 return null;
             }
-
-            // Projects response is keyed by project name
             $names = array_keys($projects);
             $this->_log('  LORIS projects: ' . implode(', ', $names));
             return $names;
-
         } catch (\Exception $e) {
             $this->_error('LORIS_PROJECTS',
                 'Failed to fetch projects from LORIS API: ' . $e->getMessage()
@@ -427,13 +416,9 @@ class BidsParticipantSync
             $lineNum++;
             $line = trim($line);
             if ($line === '') continue;
-
             $fields = array_map('trim', explode("\t", $line));
             $row    = [];
-            foreach ($headers as $i => $header) {
-                $row[$header] = $fields[$i] ?? '';
-            }
-
+            foreach ($headers as $i => $header) $row[$header] = $fields[$i] ?? '';
             if (empty($row['participant_id'])) {
                 $this->_error("PARTICIPANTS_TSV",
                     "Line {$lineNum}: missing participant_id — skipping row"
@@ -442,7 +427,6 @@ class BidsParticipantSync
             }
             $participants[] = $row;
         }
-
         fclose($handle);
         $this->_log("  Parsed " . count($participants) . " participants from participants.tsv");
         return $participants;
@@ -523,7 +507,106 @@ class BidsParticipantSync
     }
 
     // =========================================================================
-    //  CANDIDATE CREATION
+    //  CANDIDATE CREATION — STRATEGY 1: CandidatesPlus (preferred)
+    // =========================================================================
+
+    /**
+     * Try the CandidatesPlus endpoint, which atomically:
+     *   - creates the candidate via the standard /api/{ver}/candidates POST
+     *   - resolves ProjectExternalName → ProjectExternalID server-side
+     *   - inserts the candidate_project_extid_rel row
+     *
+     * Returns:
+     *   - CandID on success (string, numeric)
+     *   - null with ['plus_unavailable' => true] sentinel via the second
+     *     argument when the endpoint returns 404 — caller should fall
+     *     back to the legacy two-step path
+     *   - null with no sentinel for hard failures (bad project name,
+     *     duplicate PSCID, malformed payload) — those are real errors
+     *     the legacy path can't fix
+     */
+    private function _createCandidateViaPlus(
+        string  $pscid,
+        string  $sex,
+        string  $site,
+        string  $project,
+        string  $dob,
+        string  $extStudyID,
+        string  $projectExternalName,
+        array  &$flags
+    ): ?string {
+        $baseUrl = rtrim($this->config['loris']['base_url'], '/');
+        $url     = "{$baseUrl}/cbigr_api/candidatesPlus";
+
+        $body = ['Candidate' => [
+            'PSCID'               => $pscid,
+            'Project'             => $project,
+            'Site'                => $site,
+            'DoB'                 => $dob,
+            'Sex'                 => $sex,
+            'ExtStudyID'          => $extStudyID,
+            'ProjectExternalName' => $projectExternalName,
+        ]];
+
+        try {
+            $response   = $this->_http()->request('POST', $url, [
+                'headers'     => [
+                    'Authorization' => "Bearer {$this->token}",
+                    'Content-Type'  => 'application/json',
+                ],
+                'json'        => $body,
+                'http_errors' => false,
+            ]);
+            $statusCode = $response->getStatusCode();
+            $rawBody    = (string)$response->getBody();
+            $data       = json_decode($rawBody, true);
+
+            if ($statusCode === 404) {
+                // Endpoint not deployed on this LORIS — fall back silently.
+                $flags['plus_unavailable'] = true;
+                return null;
+            }
+
+            if ($statusCode === 201 || $statusCode === 200) {
+                $candID = $data['CandID'] ?? $data['Meta']['CandID'] ?? null;
+                if ($candID) {
+                    $this->_log("  ✓ Created via CandidatesPlus: CandID={$candID} PSCID={$pscid}"
+                        . " ExtStudyID={$extStudyID} (relation linked atomically)"
+                    );
+                    return (string)$candID;
+                }
+                $this->_error("CREATE_CANDIDATE_PLUS",
+                    "CandID missing in CandidatesPlus response for PSCID={$pscid}."
+                    . " HTTP {$statusCode}. Body: " . json_encode($data)
+                );
+                return null;
+            }
+
+            // Real error (400, 409, 500, etc) — surface and DON'T fall back.
+            // The legacy path would hit the same problem (bad project name,
+            // duplicate PSCID, etc), so trying it would just produce two
+            // identical errors in the log.
+            $this->_error("CREATE_CANDIDATE_PLUS",
+                "HTTP {$statusCode} for PSCID={$pscid} ExtStudyID={$extStudyID}."
+                . " Body: " . substr($rawBody, 0, 500)
+            );
+            return null;
+
+        } catch (\Exception $e) {
+            // Transport-level error (connection refused, timeout, DNS).
+            // Treat as endpoint-unavailable so we fall back rather than
+            // double-error.
+            $flags['plus_unavailable'] = true;
+            $this->_warn("CREATE_CANDIDATE_PLUS",
+                "Transport error contacting CandidatesPlus: " . $e->getMessage()
+                . " — falling back to legacy path"
+            );
+            return null;
+        }
+    }
+
+    // =========================================================================
+    //  CANDIDATE CREATION — STRATEGY 2: legacy two-step (fallback)
     // =========================================================================
 
     private function _createCandidate(
@@ -536,8 +619,6 @@ class BidsParticipantSync
         $baseUrl = rtrim($this->config['loris']['base_url'], '/');
         $version = $this->config['loris']['api_version'] ?? 'v0.0.4-dev';
 
-        // LORIS candidate creation API required fields:
-        // PSCID, Project, Site, DoB, Sex
         $body = ['Candidate' => [
             'PSCID'   => $pscid,
             'Project' => $project,
@@ -560,7 +641,7 @@ class BidsParticipantSync
             if ($statusCode === 201 || $statusCode === 200) {
                 $candID = $data['Meta']['CandID'] ?? $data['CandID'] ?? null;
                 if ($candID) {
-                    $this->_log("  ✓ Created: CandID={$candID} PSCID={$pscid}");
+                    $this->_log("  ✓ Created via legacy: CandID={$candID} PSCID={$pscid}");
                     return (string)$candID;
                 }
                 $this->_error("CREATE_CANDIDATE",
@@ -569,12 +650,10 @@ class BidsParticipantSync
                 );
                 return null;
             }
-
             $this->_error("CREATE_CANDIDATE",
                 "HTTP {$statusCode} for PSCID={$pscid}. Body: " . json_encode($data)
             );
             return null;
-
         } catch (\Exception $e) {
             $errorBody = '';
             if (method_exists($e, 'getResponse') && $e->getResponse()) {
@@ -618,10 +697,6 @@ class BidsParticipantSync
             return null;
         }
     }
-
-    // =========================================================================
-    //  EXTERNAL ID APPEND
-    // =========================================================================
 
     private function _appendExternalID(
         string $candID,
@@ -674,11 +749,10 @@ class BidsParticipantSync
 
     public function run(string $bidsDir, bool $dryRun = false, string $projectPath = ''): array
     {
-        if (!$projectPath) {
-            $projectPath = dirname(dirname(rtrim($bidsDir, '/')));
-        }
+        if (!$projectPath) $projectPath = dirname(dirname(rtrim($bidsDir, '/')));
 
         $this->_openLogs($projectPath);
+        $this->candidatesPlusAvailable = true; // reset per run
 
         $this->_log("═══════════════════════════════════════════════════════════");
         $this->_log("  BIDS Participant Sync");
@@ -703,11 +777,10 @@ class BidsParticipantSync
             return $this->stats;
         }
 
-        // ── Validate project exists in LORIS before processing any participants ─
+        // ── Validate project exists in LORIS ──────────────────────────────────
         $projectNameForLoris = null;
         if ($this->projectDefaults) {
             $defaults = $this->projectDefaults['candidate_defaults'] ?? [];
-            // candidate_defaults.project is the exact LORIS Project.Name
             if (!empty($defaults['project'])) {
                 $projectNameForLoris = trim($defaults['project']);
             } elseif (!empty($this->projectDefaults['loris_project_name'])) {
@@ -819,20 +892,8 @@ class BidsParticipantSync
             $dob        = trim($row['dob']     ?? $row['DoB']     ?? $row['date_of_birth'] ?? '');
             $cohort     = trim($row['cohort']  ?? $row['Cohort']  ?? $row['group']         ?? '');
 
-            // ── Defaults from project.json → candidate_defaults ───────────────
-            // Allows participants.tsv to have only participant_id when all
-            // subjects share the same sex/dob/cohort/project/site.
-            // Add to project.json:
-            //   "candidate_defaults": {
-            //     "sex":     "Other",
-            //     "dob":     "1970-01-01",
-            //     "cohort":  "Control",
-            //     "site":    "UOHI",
-            //     "project": "FDG-PET"
-            //   }
             $defaults = $this->projectDefaults['candidate_defaults'] ?? [];
 
-            // Sex: TSV → candidate_defaults.sex → (no further fallback, sex is required)
             if (!$sex && !empty($defaults['sex'])) {
                 $sex = $this->_extractSex(['sex' => $defaults['sex']]);
                 if ($sex) $this->_warn('SEX_DEFAULT',
@@ -840,8 +901,6 @@ class BidsParticipantSync
                     . " Using candidate_defaults.sex from project.json: '{$sex}'."
                 );
             }
-
-            // DoB: TSV → candidate_defaults.dob → (optional in some LORIS configs)
             if (!$dob && !empty($defaults['dob'])) {
                 $dob = trim($defaults['dob']);
                 $this->_warn('DOB_DEFAULT',
@@ -849,8 +908,6 @@ class BidsParticipantSync
                     . " Using candidate_defaults.dob from project.json: '{$dob}'."
                 );
             }
-
-            // Cohort: TSV → candidate_defaults.cohort → cohorts[0] from project.json
             if (!$cohort && !empty($defaults['cohort'])) {
                 $cohort = trim($defaults['cohort']);
                 $this->_log("  Cohort: {$cohort} (from project.json → candidate_defaults.cohort)");
@@ -859,8 +916,6 @@ class BidsParticipantSync
                 $cohort = trim($this->projectDefaults['cohorts'][0]);
                 $this->_log("  Cohort: {$cohort} (from project.json → cohorts[0])");
             }
-
-            // Site: TSV → candidate_defaults.site → sites[0] from project.json
             if (!$site && !empty($defaults['site'])) {
                 $site = trim($defaults['site']);
                 $this->_warn('SITE_DEFAULT',
@@ -875,14 +930,6 @@ class BidsParticipantSync
                     . " Using sites[0] from project.json: '{$site}'."
                 );
             }
-
-            // Project resolution — must match LORIS Project.Name exactly:
-            // 1. participants.tsv column
-            // 2. --project CLI flag
-            // 3. project.json → candidate_defaults.project  ← exact LORIS name
-            // 4. project.json → loris_project_name          ← dedicated override field
-            // 5. project.json → project_common_name         ← may differ from LORIS name
-            // 6. project.json → project_full_name           ← usually NOT the LORIS name
             if (!$project && !empty($this->config['cli_overrides']['project'])) {
                 $project = trim($this->config['cli_overrides']['project']);
                 $this->_log("  Project: {$project} (from --project flag)");
@@ -904,58 +951,39 @@ class BidsParticipantSync
                 $this->_warn('PROJECT_FULL_NAME',
                     "{$subjectId} — using project_full_name '{$project}' for LORIS candidate creation."
                     . " This may not match LORIS Project.Name exactly."
-                    . " Add 'candidate_defaults.project' or 'loris_project_name' to project.json"
-                    . " with the exact LORIS project name."
                 );
             }
 
-            // ── Validate — log ALL missing fields, then skip participant ────
+            // ── Validate required fields ─────────────────────────────────────
             $missingFields = [];
-
             if (!$externalID) {
-                $missingFields[] = 'external_id'
-                    . ' (add external_id column to participants.tsv,'
+                $missingFields[] = 'external_id (add column to participants.tsv,'
                     . ' or ensure participant_id has sub-XX format)';
             }
-
-            // Sex: if still empty after all fallbacks, default to Other and warn
             if (!$sex) {
                 $rawSex = strtolower(trim($row['sex'] ?? $row['Sex'] ?? $row['gender'] ?? ''));
                 if ($rawSex === '') {
                     $sex = 'Other';
                     $this->_warn('SEX_UNKNOWN',
-                        "{$subjectId} — no sex in participants.tsv or candidate_defaults."
-                        . " Defaulting to 'Other'."
-                        . " Add 'sex' to participants.tsv or candidate_defaults.sex in project.json."
+                        "{$subjectId} — no sex; defaulting to 'Other'."
                     );
                 } else {
-                    $missingFields[] = 'sex'
-                        . " (found: '{$rawSex}' — unrecognised value."
-                        . ' Accepted: Male/Female/Other/male/female/other/m/f/o/nb/non-binary/unknown/n/a)';
+                    $missingFields[] = "sex (found: '{$rawSex}' — unrecognised value)";
                 }
             }
-
             if (!$site) {
-                $missingFields[] = 'site'
-                    . ' (add site column to participants.tsv,'
-                    . ' or add candidate_defaults.site / sites[] to project.json)';
+                $missingFields[] = 'site (add column to participants.tsv,'
+                    . ' or candidate_defaults.site / sites[] to project.json)';
             }
-
-            // dob: warn if missing but do not block — some LORIS configs allow null DoB
             if (!$dob) {
                 $this->_warn('DOB_MISSING',
-                    "{$subjectId} — no dob in participants.tsv or candidate_defaults."
-                    . " LORIS may reject candidate creation without DoB."
-                    . " Add 'dob' to participants.tsv (YYYY-MM-DD) or candidate_defaults.dob in project.json."
+                    "{$subjectId} — no dob; LORIS may reject candidate creation."
                 );
                 $dob = null;
             }
-
             if (!$project) {
-                $missingFields[] = 'project'
-                    . ' (add project column to participants.tsv,'
-                    . ' use --project flag,'
-                    . ' or add candidate_defaults.project / loris_project_name to project.json)';
+                $missingFields[] = 'project (add column to participants.tsv,'
+                    . ' use --project flag, or candidate_defaults.project to project.json)';
             }
 
             if (!empty($missingFields)) {
@@ -965,30 +993,12 @@ class BidsParticipantSync
                     . "\n    Skipping this participant."
                 );
                 $this->stats['external_id_skipped']++;
-                continue; // Always continue to next participant
-            }
-
-            $projectExternalID = $this->_getProjectExternalID($project);
-            if (!$projectExternalID) {
-                $this->_error("PROJECT_EXTID",
-                    "{$subjectId} — cannot determine ProjectExternalID for project '{$project}'."
-                    . " Add to project_external table in LORIS,"
-                    . " or add to project_mappings in loris_client_config.json."
-                    . " Skipping."
-                );
-                $this->stats['external_id_skipped']++;
                 continue;
             }
 
             $pscid = $externalID;
 
-            // ── Date normalization (DoB and DoD) ──────────────────────────────
-            // Apply ARCHIMEDES YYYY-MM-01 jitter immediately before LORIS
-            // sees the value. DoB is the only date sent at candidate creation
-            // time; DoD support, if added later, can call _normalizeDateValue
-            // on its way through too. Empty/missing DoB is left as null so
-            // the existing "DoB optional in some LORIS configs" path keeps
-            // working unchanged.
+            // Date normalization
             if ($dob !== null && $dob !== '') {
                 $dobOriginal = $dob;
                 $dob         = $this->_normalizeDateValue($dob);
@@ -998,24 +1008,22 @@ class BidsParticipantSync
             }
 
             $this->_log("  ExtStudyID : {$externalID}");
-            $this->_log("  Project    : {$project} (ExtID={$projectExternalID})");
+            $this->_log("  Project    : {$project}");
             $this->_log("  Sex / Site : {$sex} / {$site}");
-            if ($cohort)  $this->_log("  Cohort     : {$cohort}");
+            if ($cohort) $this->_log("  Cohort     : {$cohort}");
 
             // Step 1: Already mapped in CBIGR?
             if (!$dryRun) {
                 $cbigrResult = $this->_lookupExternalIDViaCBIGR($externalID);
                 if ($cbigrResult) {
-                    $this->_log(
-                        "  ✓ Already mapped: {$externalID} → PSCID={$cbigrResult['PSCID']}"
-                    );
+                    $this->_log("  ✓ Already mapped: {$externalID} → PSCID={$cbigrResult['PSCID']}");
                     $this->stats['already_exists']++;
                     $this->stats['external_id_skipped']++;
                     continue;
                 }
             }
 
-            // Step 2: Create candidate
+            // Step 2: Create candidate (CandidatesPlus first, legacy fallback)
             $candID = $existingCandidates[$pscid] ?? null;
 
             if ($candID) {
@@ -1030,29 +1038,72 @@ class BidsParticipantSync
                     continue;
                 }
 
-                $candID = $this->_createCandidate($pscid, $sex, $site, $project, $dob);
+                $createdViaPlus = false;
 
-                if (!$candID) {
-                    // Error already logged — continue to next participant
+                // STRATEGY 1 — CandidatesPlus
+                if ($this->candidatesPlusAvailable) {
+                    $projectExternalName = $this->_getProjectExternalName();
+                    if ($projectExternalName) {
+                        $flags = [];
+                        $candID = $this->_createCandidateViaPlus(
+                            $pscid, $sex, $site, $project, $dob ?? '',
+                            $externalID, $projectExternalName, $flags
+                        );
+                        if (!empty($flags['plus_unavailable'])) {
+                            $this->_warn("CANDIDATES_PLUS",
+                                "CandidatesPlus endpoint unavailable on this LORIS server"
+                                . " — falling back to legacy candidate-creation path"
+                                . " for the rest of this run"
+                            );
+                            $this->candidatesPlusAvailable = false;
+                            $candID = null;
+                        } elseif ($candID) {
+                            $createdViaPlus = true;
+                            $this->stats['created_via_plus']++;
+                            $this->stats['created']++;
+                            $this->stats['external_id_linked']++; // atomic with creation
+                            $existingCandidates[$pscid] = $candID;
+                            continue; // CandidatesPlus done — no _appendExternalID needed
+                        } else {
+                            // Hard failure (bad project name, duplicate PSCID, etc).
+                            // Don't fall through — legacy will fail the same way.
+                            $this->stats['external_id_skipped']++;
+                            continue;
+                        }
+                    } else {
+                        $this->_warn("CANDIDATES_PLUS",
+                            "{$subjectId} — candidate_defaults.project not set in project.json,"
+                            . " cannot use CandidatesPlus path;"
+                            . " falling back to legacy"
+                        );
+                    }
+                }
+
+                // STRATEGY 2 — legacy two-step
+                $candID = $this->_createCandidate($pscid, $sex, $site, $project, $dob ?? '');
+                if (!$candID) continue;
+
+                $this->stats['created_via_legacy']++;
+                $this->stats['created']++;
+                $existingCandidates[$pscid] = $candID;
+
+                // Step 3 (legacy only): Link ExternalID via formHandler
+                $projectExternalID = $this->_getProjectExternalID($project);
+                if (!$projectExternalID) {
+                    $this->_error("PROJECT_EXTID",
+                        "{$subjectId} — cannot determine ProjectExternalID for project '{$project}'"
+                        . " on legacy path. Candidate created (CandID={$candID})"
+                        . " but external-ID relation NOT linked."
+                        . " Add candidate_defaults.project_external_id to project.json,"
+                        . " or upgrade LORIS server to one with CandidatesPlus."
+                    );
                     continue;
                 }
 
-                $this->stats['created']++;
-                $existingCandidates[$pscid] = $candID;
+                if ($this->_appendExternalID($candID, $externalID, $projectExternalID)) {
+                    $this->stats['external_id_linked']++;
+                }
             }
-
-            // Step 3: Link ExternalID
-            if ($dryRun) {
-                $this->_log("  [DRY-RUN] Would link ExtStudyID: {$externalID} → CandID {$candID}");
-                $this->stats['external_id_linked']++;
-                continue;
-            }
-
-            $success = $this->_appendExternalID($candID, $externalID, $projectExternalID);
-            if ($success) {
-                $this->stats['external_id_linked']++;
-            }
-            // Error logged inside _appendExternalID — always continue
         }
 
         $this->_printSummary();
@@ -1078,7 +1129,10 @@ class BidsParticipantSync
         $this->_log("  participants.tsv   : {$this->stats['total_participants']}");
         $this->_log("───────────────────────────────────────────────────────────");
         $this->_log("  Already mapped     : {$this->stats['already_exists']}");
-        $this->_log("  Newly created      : {$this->stats['created']}");
+        $this->_log("  Newly created      : {$this->stats['created']}"
+            . "  (CandidatesPlus: {$this->stats['created_via_plus']},"
+            . " legacy: {$this->stats['created_via_legacy']})"
+        );
         $this->_log("  ExternalIDs linked : {$this->stats['external_id_linked']}");
         $this->_log("  ExternalIDs skipped: {$this->stats['external_id_skipped']}");
         $this->_log("───────────────────────────────────────────────────────────");
