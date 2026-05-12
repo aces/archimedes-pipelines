@@ -41,7 +41,36 @@
     "mount_enabled": true,
     "mount_path": "/data/projects/Example-Study"
   },
-
+  "participant_metadata": {
+     "enabled": true,
+     "defaults": {
+       "bids": {
+         "identifier_field": "participant_id",
+         "identifier_type": "ExtStudyID",
+         "identifier_strip_prefix": "sub-",
+         "fields": {
+           "DoD": ["date_of_death", "dod"]
+         }
+       },
+       "clinical": {
+         "identifier_field": "external_id",
+         "identifier_type": "ExtStudyID",
+         "fields": {
+           "DoD": ["DoD", "DateOfDeath", "date_of_death"]
+         }
+       }
+     },
+     "sources": [
+       {
+         "path": "deidentified-raw/registry/weekly_deaths.json",
+         "identifier_field": "external_id"",
+         "identifier_type": "ExtStudyID",
+         "fields": {
+           "DoD": ["dod"]
+         }
+       }
+     ]
+   },
   "notification_emails": {
     "clinical": {
       "enabled": true,
@@ -57,7 +86,12 @@
       "enabled": true,
       "on_success": ["imaging_team@example.org"],
       "on_error": ["imaging_team@example.org"]
-    }
+    },
+     "participant_metadata": {
+          "enabled": true,
+          "on_success": ["imaging_team@example.org"],
+          "on_error": ["clinical_team@example.org", "admin@example.com"]
+        }
   },
 
   "logging": {
