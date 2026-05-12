@@ -1135,7 +1135,7 @@ class ParticipantMetadataPipeline
         }
 
         $status  = $hasErrors ? 'ERROR' : 'SUCCESS';
-        $subject = "[ARCHIMEDES] ParticipantMetadata $status: $collectionName / $projectName";
+        $subject = "{$status}: {$projectName} Participant Metadata Pipeline";
 
         $body  = "ParticipantMetadataPipeline run for $collectionName / $projectName\n";
         $body .= "Status: $status\n\n";
