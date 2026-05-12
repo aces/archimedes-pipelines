@@ -17,6 +17,12 @@ declare(strict_types=1);
  *   - --force / --retry   → --update --overwrite (known to be in DB from prior run)
  *   - --force-study=NAME  → --update --overwrite (explicit safe reinsertion)
  *
+ * Tracking:
+ *   Per-project tracking file is stored at
+ *     <projectDir>/processed/imaging/.dicom_import_processed.json
+ *   so pipeline state lives with other processed outputs, not inside the raw
+ *   deidentified-raw input dir. The directory is created on first run.
+ *
  * @package LORIS\Pipelines
  */
 
@@ -49,7 +55,8 @@ class DicomImportPipeline
 
     private ?string $logDir = null;
 
-    private const TRACK_FILE = '.dicom_import_processed.json';
+    private const TRACK_FILE   = '.dicom_import_processed.json';
+    private const TRACK_SUBDIR = 'processed/imaging';
 
     /** Seconds between SPM job status poll requests */
     private const POLL_INTERVAL_SECONDS = 30;
@@ -135,6 +142,10 @@ class DicomImportPipeline
         $this->logDir = rtrim($projectDir, '/') . '/logs/dicom';
         $this->openRunLog();
 
+        // Ensure tracking directory exists up front so it's visible and any
+        // permission issues surface before we start hitting the API.
+        $this->_ensureTrackingDir($projectDir);
+
         $this->log("=== DICOM IMPORT PIPELINE ===");
         $this->log("Project: {$projectDir}");
         $this->log("Run: {$this->runTimestamp}");
@@ -210,8 +221,7 @@ class DicomImportPipeline
             . ($this->stats['studies_found'] === 1 ? 'y' : 'ies'));
         $this->log("");
 
-        $dicomRoot = rtrim($projectDir, '/') . '/deidentified-raw/imaging/dicoms';
-        $processed = $this->loadProcessed($dicomRoot);
+        $processed = $this->loadProcessed($projectDir);
 
         $this->log("──── STEP 2: IMPORT STUDIES ────");
         $this->log("");
@@ -265,7 +275,7 @@ class DicomImportPipeline
             $effectiveFlags = $this->_resolveFlags($flags, $force, $isForced, $prevStatus);
 
             $this->importOneStudy(
-                $name, $studyPath, $dicomRoot, $processed, $effectiveFlags, $profile
+                $name, $studyPath, $projectDir, $processed, $effectiveFlags, $profile
             );
         }
     }
@@ -342,7 +352,7 @@ class DicomImportPipeline
     private function importOneStudy(
         string  $name,
         string  $studyPath,
-        string  $dicomRoot,
+        string  $projectDir,
         array  &$processed,
         array   $flags,
         string  $profile,
@@ -358,7 +368,7 @@ class DicomImportPipeline
                 $this->log("    FAILED to launch ({$elapsed}s): {$errMsg}");
                 $this->writeError($name, "Launch failed: {$errMsg}");
                 $this->writeErrorDetail("HTTP status: " . ($launch['http_status'] ?? 0));
-                $this->markProcessed($dicomRoot, $processed, $name, 'failed', $errMsg);
+                $this->markProcessed($projectDir, $processed, $name, 'failed', $errMsg);
                 $this->importResults[$name] = ['status' => 'failed', 'reason' => $errMsg, 'elapsed' => $elapsed];
                 $this->stats['studies_failed']++;
                 return;
@@ -371,7 +381,7 @@ class DicomImportPipeline
                 $errMsg  = "No job_id returned from async launch";
                 $this->log("    FAILED ({$elapsed}s): {$errMsg}");
                 $this->writeError($name, $errMsg);
-                $this->markProcessed($dicomRoot, $processed, $name, 'failed', $errMsg);
+                $this->markProcessed($projectDir, $processed, $name, 'failed', $errMsg);
                 $this->importResults[$name] = ['status' => 'failed', 'reason' => $errMsg, 'elapsed' => $elapsed];
                 $this->stats['studies_failed']++;
                 return;
@@ -397,7 +407,7 @@ class DicomImportPipeline
                         . "check server_processes id={$jobId}";
                     $this->log("    TIMEOUT ({$elapsed}s)");
                     $this->writeError($name, $errMsg);
-                    $this->markProcessed($dicomRoot, $processed, $name, 'failed', $errMsg);
+                    $this->markProcessed($projectDir, $processed, $name, 'failed', $errMsg);
                     $this->importResults[$name] = [
                         'status'  => 'failed',
                         'reason'  => $errMsg,
@@ -419,7 +429,7 @@ class DicomImportPipeline
                             . " — check GET cbigr_api/script/job/{$jobId}";
                         $this->log("    FAILED ({$elapsed}s): {$errMsg}");
                         $this->writeError($name, $errMsg);
-                        $this->markProcessed($dicomRoot, $processed, $name, 'failed', $errMsg);
+                        $this->markProcessed($projectDir, $processed, $name, 'failed', $errMsg);
                         $this->importResults[$name] = [
                             'status'  => 'failed',
                             'reason'  => $errMsg,
@@ -450,7 +460,7 @@ class DicomImportPipeline
                     if ($wasRunning) {
                         $this->log("    SUCCESS (exit code file cleaned up after successful run)"
                             . " ({$elapsed}s)");
-                        $this->markProcessed($dicomRoot, $processed, $name, 'success');
+                        $this->markProcessed($projectDir, $processed, $name, 'success');
                         $this->importResults[$name] = [
                             'status'  => 'success',
                             'elapsed' => $elapsed,
@@ -464,7 +474,7 @@ class DicomImportPipeline
                         . " — check server_processes id={$jobId}";
                     $this->log("    FAILED ({$elapsed}s): {$errMsg}");
                     $this->writeError($name, $errMsg);
-                    $this->markProcessed($dicomRoot, $processed, $name, 'failed', $errMsg);
+                    $this->markProcessed($projectDir, $processed, $name, 'failed', $errMsg);
                     $this->importResults[$name] = [
                         'status'  => 'failed',
                         'reason'  => $errMsg,
@@ -480,7 +490,7 @@ class DicomImportPipeline
 
                 if ($state === 'SUCCESS') {
                     $this->log("    SUCCESS ({$elapsed}s)");
-                    $this->markProcessed($dicomRoot, $processed, $name, 'success');
+                    $this->markProcessed($projectDir, $processed, $name, 'success');
                     $this->importResults[$name] = [
                         'status'  => 'success',
                         'elapsed' => $elapsed,
@@ -500,7 +510,7 @@ class DicomImportPipeline
                     $this->log("    Already inserted — retrying with --update --overwrite ({$elapsed}s)");
                     $retryFlags = $this->_buildRetryFlags($flags);
                     $this->importOneStudy(
-                        $name, $studyPath, $dicomRoot, $processed, $retryFlags, $profile, true
+                        $name, $studyPath, $projectDir, $processed, $retryFlags, $profile, true
                     );
                     return;
                 }
@@ -508,7 +518,7 @@ class DicomImportPipeline
                 // On retry ALREADY_EXISTS means a genuine conflict — mark as already_exists
                 if ($isRetry && preg_match(self::ALREADY_INSERTED_PATTERN, $errorDetail)) {
                     $this->log("    Already inserted (confirmed) — marking done ({$elapsed}s)");
-                    $this->markProcessed($dicomRoot, $processed, $name, 'already_exists');
+                    $this->markProcessed($projectDir, $processed, $name, 'already_exists');
                     $this->importResults[$name] = [
                         'status'  => 'already_exists',
                         'elapsed' => $elapsed,
@@ -525,7 +535,7 @@ class DicomImportPipeline
                     . $this->_truncateForLog($errorDetail, 300));
                 $this->writeErrorDetail("job_id: {$jobId}");
                 $this->writeErrorDetail("Full error:\n{$errorDetail}");
-                $this->markProcessed($dicomRoot, $processed, $name, 'failed', $errorDetail);
+                $this->markProcessed($projectDir, $processed, $name, 'failed', $errorDetail);
                 $this->importResults[$name] = [
                     'status'    => 'failed',
                     'reason'    => $errorDetail,
@@ -646,21 +656,65 @@ class DicomImportPipeline
     }
 
     // ──────────────────────────────────────────────────────────────────
-    // Tracking file
+    // Tracking file — stored under {projectDir}/processed/imaging/
     // ──────────────────────────────────────────────────────────────────
 
-    private function loadProcessed(string $dicomRoot): array
+    /**
+     * Return the absolute path to the tracking JSON for this project.
+     * Does NOT create the directory by default (used for read-only checks).
+     */
+    private function _trackingFilePath(string $projectDir): string
     {
-        $path = rtrim($dicomRoot, '/') . '/' . self::TRACK_FILE;
+        return rtrim($projectDir, '/') . '/' . self::TRACK_SUBDIR . '/' . self::TRACK_FILE;
+    }
+
+    /**
+     * Ensure the tracking directory exists. Idempotent and race-safe
+     * (handles the case where another concurrent run created it first).
+     */
+    private function _ensureTrackingDir(string $projectDir): bool
+    {
+        $dir = rtrim($projectDir, '/') . '/' . self::TRACK_SUBDIR;
+        if (is_dir($dir)) {
+            return true;
+        }
+        // The is_dir() recheck handles the race where another process created
+        // the dir between our is_dir() check above and mkdir() below.
+        if (!@mkdir($dir, 0755, true) && !is_dir($dir)) {
+            $this->writeError('TRACKING', "Cannot create tracking directory: {$dir}");
+            return false;
+        }
+        $this->log("Tracking directory: {$dir}");
+        return true;
+    }
+
+    private function loadProcessed(string $projectDir): array
+    {
+        $path = $this->_trackingFilePath($projectDir);
         if (!file_exists($path)) {
             return [];
         }
-        return json_decode(file_get_contents($path), true) ?? [];
+        $contents = @file_get_contents($path);
+        if ($contents === false) {
+            $this->writeError('TRACKING', "Cannot read: {$path}");
+            return [];
+        }
+        $decoded = json_decode($contents, true);
+        if (!is_array($decoded)) {
+            $this->writeError('TRACKING', "Malformed tracking file (not JSON object): {$path}");
+            return [];
+        }
+        return $decoded;
     }
 
-    private function saveProcessed(string $dicomRoot, array $processed): void
+    private function saveProcessed(string $projectDir, array $processed): void
     {
-        $path = rtrim($dicomRoot, '/') . '/' . self::TRACK_FILE;
+        // Guarantee directory exists every save (covers the case where it was
+        // deleted out from under us mid-run).
+        if (!$this->_ensureTrackingDir($projectDir)) {
+            return;
+        }
+        $path = $this->_trackingFilePath($projectDir);
         $json = json_encode($processed, JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES);
         if (@file_put_contents($path, $json) === false) {
             $this->writeError('TRACKING', "Cannot write: {$path}");
@@ -668,7 +722,7 @@ class DicomImportPipeline
     }
 
     private function markProcessed(
-        string  $dicomRoot,
+        string  $projectDir,
         array  &$processed,
         string  $studyName,
         string  $status,
@@ -679,7 +733,7 @@ class DicomImportPipeline
             'detail'    => $detail,
             'timestamp' => date('c'),
         ];
-        $this->saveProcessed($dicomRoot, $processed);
+        $this->saveProcessed($projectDir, $processed);
     }
 
     // ──────────────────────────────────────────────────────────────────
