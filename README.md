@@ -18,6 +18,7 @@ The pipelines are expected to be installed on the predefined data mount for the 
 - **Dry Run Mode** - Test without making actual changes
 - **Imaging Data Ingestion** - BIDS dataset ingestion
 - **DICOM Import** - Archive and insert DICOM studies into LORIS tarchive tables
+- **Participant Metadata Sync** - Update candidate demographic fields (Date of Death, Sex, DoB, etc.) in LORIS
 - **Multi-Project Support** - Handle multiple projects and collections
 
 ---
@@ -464,6 +465,143 @@ php scripts/run_dicom_import.php --collection=archimedes --project=FDG-PET --con
 
 ---
 
+## Participant Metadata Workflow
+
+The participant metadata pipeline updates candidate demographic fields in LORIS (Date of Death today; extensible to Sex, DoB, and other fields) from BIDS, clinical, and custom-configured source files. Each source's MD5 is tracked so unchanged files are skipped on subsequent runs.
+
+```
+1. Load Collections from Config
+   └── Read collections array from loris_client_config.json
+       ├── Collection A
+       │   ├── Project 1 (enabled)
+       │   └── Project 2 (disabled)
+       └── Collection B
+           └── Project 1 (enabled)
+
+2. For each enabled Collection:
+   └── For each enabled Project:
+       ├── Load project.json configuration
+       ├── Check if participant_metadata is enabled
+       ├── Load tracking file (.participant_metadata_tracking.json)
+       └── Continue to source processing
+
+3. Build Candidate Index (one GET per project):
+   ├── GET /cbigr_api/candidatesPlus
+   ├── Index candidates by PSCID
+   └── Index candidates by every registered ExtStudyID
+
+4. Per-Source Processing:
+   ├── Default: deidentified-raw/bids/participants.tsv
+   ├── Default: every *.csv under deidentified-raw/clinical/
+   ├── Custom: each entry in participant_metadata.sources
+   ├── Hash check (md5_file) - skip if unchanged (unless --force)
+   ├── For each row:
+   │   ├── Resolve identifier to CandID via lookup index
+   │   ├── Extract configured fields (DoD today, etc.)
+   │   ├── Skip duplicates and idempotent values
+   │   └── PUT /cbigr_api/candidatesPlus?CandID=X with changed fields
+   └── Update tracking on clean source runs
+
+5. Post-Processing:
+   ├── Write project summary to run log
+   ├── Persist tracking file with new hashes
+   ├── Send email notification (if enabled)
+   └── Return exit code (0 = success, 1 = any unresolved or failures)
+```
+
+### project.json Configuration
+
+Each source declares which LORIS fields to update via a `fields` map (LORIS field name → list of source column names; first non-empty wins):
+
+```json
+"participant_metadata": {
+  "enabled": true,
+  "defaults": {
+    "bids": {
+      "identifier_field": "participant_id",
+      "identifier_type": "PSCID",
+      "identifier_strip_prefix": "sub-",
+      "fields": { "DoD": ["date_of_death", "dod"] }
+    },
+    "clinical": {
+      "identifier_field": "external_id",
+      "identifier_type": "ExtStudyID",
+      "fields": { "DoD": ["DoD", "DateOfDeath", "date_of_death"] }
+    }
+  },
+  "sources": [
+    {
+      "path": "deidentified-raw/registry/weekly_deaths.csv",
+      "identifier_field": "external_id",
+      "identifier_type": "ExtStudyID",
+      "fields": { "DoD": ["dod"] }
+    }
+  ]
+}
+```
+
+Future fields (Sex, DoB, etc.) are added by extending the endpoint and adding keys to `fields` - no pipeline code change required.
+
+### Tracking File
+
+The pipeline maintains a `.participant_metadata_tracking.json` file under `processed/participant_metadata/` to track source-file hashes. Sources unchanged since the last run are skipped. Use `--force` to override and reprocess all sources.
+
+---
+
+## Running the Participant Metadata Pipeline
+
+### Dry Run Mode (Recommended First)
+
+```bash
+# All enabled projects
+php scripts/run_participant_metadata_pipeline.php --all --dry-run --verbose
+
+# All projects in a collection
+php scripts/run_participant_metadata_pipeline.php --collection=archimedes --dry-run --verbose
+
+# Single project
+php scripts/run_participant_metadata_pipeline.php --collection=archimedes --project=FDG-PET --dry-run --verbose
+```
+
+### Execute (Live Run)
+
+```bash
+# All projects
+php scripts/run_participant_metadata_pipeline.php --all
+
+# Single collection
+php scripts/run_participant_metadata_pipeline.php --collection=archimedes
+
+# Single project
+php scripts/run_participant_metadata_pipeline.php --collection=archimedes --project=FDG-PET
+```
+
+### Force Reprocess
+
+```bash
+# Reprocess all sources (ignore hash tracking)
+php scripts/run_participant_metadata_pipeline.php --collection=archimedes --project=FDG-PET --force
+
+# Force across all projects
+php scripts/run_participant_metadata_pipeline.php --all --force
+```
+
+---
+
+## Command-Line Options (Participant Metadata)
+
+| Option | Description |
+|--------|-------------|
+| `--all` | Process all enabled collections & projects |
+| `--collection=NAME` | Process all enabled projects in a collection |
+| `--project=NAME` | Process a specific project (requires `--collection`) |
+| `--dry-run` | Test without making PUT calls |
+| `--force` | Bypass hash check - reprocess every source file |
+| `--verbose` | Per-row diagnostics |
+| `--help` | Show help |
+
+---
+
 ## Directory Structure
 
 ```
@@ -502,11 +640,13 @@ php scripts/run_dicom_import.php --collection=archimedes --project=FDG-PET --con
 │   ├── imaging/
 │   ├── bids/         
 │   │   └── derivatives/
+│   ├── participant_metadata/             # Participant metadata hash tracking
 │   └── freesurfer-output/                # Converted & cleaned data (NIfTI, MINC)
 │
 ├── logs/                                 # Execution logs
 │   ├── clinical/                         # Clinical pipeline logs
-│   └── dicom/                            # DICOM import pipeline logs
+│   ├── dicom/                            # DICOM import pipeline logs
+│   └── participant_metadata/             # Participant metadata pipeline logs
 │
 └── documentation/
     ├── data_dictionary/                  # Instrument Data Dictionary (.linst, REDCap CSV)
@@ -531,6 +671,9 @@ cat PROJECT/logs/dicom/dicom_errors_*.log
 
 # View today's imaging log
 tail -f PROJECT/logs/imaging_$(date +%Y-%m-%d).log
+
+# View today's participant metadata log
+tail -f PROJECT/logs/participant_metadata/participant_metadata_run_*.log
 
 # Search for errors across all logs
 grep "ERROR" PROJECT/logs/**/*.log
@@ -558,6 +701,11 @@ Per-project in `project.json`:
         "bids": {
             "enabled": true,
             "on_success": ["imaging@example.com"],
+            "on_error": ["admin@example.com"]
+        },
+        "participant_metadata": {
+            "enabled": true,
+            "on_success": ["team@example.com"],
             "on_error": ["admin@example.com"]
         }
     }
