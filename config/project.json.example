@@ -1,105 +1,107 @@
 {
   "project_full_name": "Example Multisite Clinical-Imaging Study",
   "project_common_name": "Example-Study",
-  "project_alias_4_characters": "EMCIS",
-
-  "modalities": ["Clinical", "Imaging"],
-
-  "principal_investigators": ["Dr. Jane Doe", "Dr. John Smith"],
-
+  "pi": "Dr. Jane Doe & Dr. John Smith",
   "tier": "Registered",
-  "number_of_sites": 2,
-
+  "number_of_sites": "2",
   "sites": [
     "Example University Hospital (EUH)",
     "Example Mental Health Centre (EMHC)"
   ],
-  "site_alias": ["SITE1", "SITE2"],
-
-  "visits": ["V1", "V2"],
-  "cohorts": ["CohortA", "CohortB"],
-
-  "clinical_instruments": [
-    "example_clinical_form",
-    "example_scan_parameter_form"
+  "site_alias": [
+    "SITE1",
+    "SITE2"
   ],
-
+  "visits": [
+    "V1",
+    "V2"
+  ],
+  "cohorts": [
+    "CohortA",
+    "CohortB"
+  ],
+  "guids": "No",
+  "pi_storage": "",
+  "project_alias_4_characters": "EMCIS",
+  "number_of_participants": "10",
+  "modalities": ["Imaging", "Clinical"],
+  "number_of_instruments": "2",
   "imaging_modalities": [
     "Example-MR",
     "Example-PET"
   ],
-
-  "candidate_defaults": {
-    "sex":     "Other",
-    "dob":     "1970-01-01",
-    "cohort":  "Control",
-    "site":    "University of Ottawa Heart Institute (UOHI)",
-    "project": "FDG-PET"
-  },
-
+  "biosample_tissue_types": "",
+  "protocol_link": "",
+  "clinical_instruments": [
+    "example_clinical_form",
+    "example_scan_parameter_form"
+  ],
   "data_access": {
     "mount_enabled": true,
     "mount_path": "/data/projects/Example-Study"
   },
+  "candidate_defaults": {
+    "sex":        "Other",
+    "dob":        "1970-01-01",
+    "cohort":     "Control",
+    "site":       "Example University Hospital",
+    "project":    "Example-Study",
+    "site_alias": "SITE1"
+  },
   "participant_metadata": {
-     "enabled": true,
-     "defaults": {
-       "bids": {
-         "identifier_field": "participant_id",
-         "identifier_type": "ExtStudyID",
-         "identifier_strip_prefix": "sub-",
-         "fields": {
-           "DoD": ["date_of_death", "dod"]
-         }
-       },
-       "clinical": {
-         "identifier_field": "external_id",
-         "identifier_type": "ExtStudyID",
-         "fields": {
-           "DoD": ["DoD", "DateOfDeath", "date_of_death"]
-         }
-       }
-     },
-     "sources": [
-       {
-         "path": "deidentified-raw/registry/weekly_deaths.json",
-         "identifier_field": "external_id"",
-         "identifier_type": "ExtStudyID",
-         "fields": {
-           "DoD": ["dod"]
-         }
-       }
-     ]
-   },
+    "enabled": true,
+    "defaults": {
+      "bids": {
+        "identifier_field": "participant_id",
+        "identifier_type": "ExtStudyID",
+        "identifier_strip_prefix": "sub-",
+        "fields": {
+          "DoD": ["date_of_death", "dod"]
+        }
+      },
+      "clinical": {
+        "identifier_field": "external_id",
+        "identifier_type": "ExtStudyID",
+        "fields": {
+          "DoD": ["DoD", "DateOfDeath", "date_of_death"]
+        }
+      }
+    },
+    "sources": [
+      {
+        "path": "deidentified-raw/registry/weekly_deaths.csv",
+        "identifier_field": "external_id",
+        "identifier_type": "ExtStudyID",
+        "fields": {
+          "DoD": ["dod"]
+        }
+      }
+    ]
+  },
   "notification_emails": {
     "clinical": {
       "enabled": true,
       "on_success": ["clinical_team@example.org"],
-      "on_error": ["clinical_team@example.org"]
+      "on_error":   ["clinical_team@example.org"]
     },
     "dicom": {
       "enabled": true,
-      "on_success": ["team@example.com"],
-      "on_error": ["admin@example.com"]
+      "on_success": ["imaging_team@example.org"],
+      "on_error":   ["admin@example.com"]
     },
     "bids": {
       "enabled": true,
       "on_success": ["imaging_team@example.org"],
-      "on_error": ["imaging_team@example.org"]
+      "on_error":   ["imaging_team@example.org"]
     },
-     "participant_metadata": {
-          "enabled": true,
-          "on_success": ["imaging_team@example.org"],
-          "on_error": ["clinical_team@example.org", "admin@example.com"]
-        }
+    "participant_metadata": {
+      "enabled": true,
+      "on_success": ["imaging_team@example.org"],
+      "on_error":   ["clinical_team@example.org", "admin@example.com"]
+    }
   },
-
   "logging": {
     "level": "INFO",
     "log_path": "/data/projects/Example-Study/logs"
-  },
-
-  "project_mappings": {
-    "PROJECT": "1"
   }
 }
