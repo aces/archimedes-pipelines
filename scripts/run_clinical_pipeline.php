@@ -44,6 +44,19 @@ Reingestion behaviour:
   To reset a single file's tracking entry (force it to re-upload next run):
     Delete its key from processed/clinical/.clinical_tracking.json
 
+EviData privacy gate:
+  When config/evidata_config.json exists AND its "enabled" field is true,
+  every project run starts with a privacy check against the configured
+  EviData service. Failures abort that project entirely (no LORIS write,
+  no tracking update) and send a notification to the project's evidata
+  recipients with the report ZIPs attached.
+
+  When the file is missing OR enabled=false, the gate is bypassed silently
+  and the pipeline behaves exactly as it did before EviData was added.
+
+  Test the connection independently with:
+    php scripts/test_evidata_connection.php
+
 Examples:
   # Process all projects
   php scripts/run_clinical_pipeline.php --all
@@ -83,7 +96,7 @@ HELP;
 }
 
 try {
-    // Load configuration
+    // ── Load LORIS client config ────────────────────────────────────
     $configFile = __DIR__ . '/../config/loris_client_config.json';
 
     if (!file_exists($configFile)) {
@@ -93,10 +106,32 @@ try {
     $config = json_decode(file_get_contents($configFile), true);
 
     if (json_last_error() !== JSON_ERROR_NONE) {
-        throw new Exception("Invalid JSON in config file: " . json_last_error_msg());
+        throw new Exception("Invalid JSON in {$configFile}: " . json_last_error_msg());
     }
 
-    // Parse filters
+    // ── Optionally merge EviData config ─────────────────────────────
+    // EviData lives in its own file so its settings can be edited
+    // independently of LORIS API config. The pipeline still sees
+    // $config['evidata'] exactly as if the block were inline — the
+    // merge happens here at load time.
+    //
+    // Missing file = EviData is not configured for this run;
+    // the preflight is bypassed (same as enabled=false). Bad JSON is
+    // a hard fail so a typo doesn't silently disable the privacy gate.
+    $evidataFile = __DIR__ . '/../config/evidata_config.json';
+    if (file_exists($evidataFile)) {
+        $evidataRaw     = file_get_contents($evidataFile);
+        $evidataDecoded = json_decode($evidataRaw, true);
+
+        if (json_last_error() !== JSON_ERROR_NONE) {
+            throw new Exception(
+                "Invalid JSON in {$evidataFile}: " . json_last_error_msg()
+            );
+        }
+        $config['evidata'] = $evidataDecoded;
+    }
+
+    // ── Parse filters ───────────────────────────────────────────────
     $filters = [];
 
     if (isset($opts['collection'])) {
@@ -123,14 +158,14 @@ try {
         exit(1);
     }
 
-    // Initialize pipeline
+    // ── Initialize pipeline ─────────────────────────────────────────
     $dryRun  = isset($opts['dry-run']);
     $verbose = isset($opts['verbose']);
     $force   = isset($opts['force']);
 
     $pipeline = new ClinicalPipeline($config, $dryRun, $verbose, $force);
 
-    // Run pipeline
+    // ── Run pipeline ────────────────────────────────────────────────
     $exitCode = $pipeline->run($filters);
 
     exit($exitCode);

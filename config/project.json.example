@@ -98,6 +98,13 @@
       "enabled": true,
       "on_success": ["imaging_team@example.org"],
       "on_error":   ["clinical_team@example.org", "admin@example.com"]
+    },
+    "evidata": {
+          "enabled": true,
+          "on_check_failed": [
+            "fdg-pet-privacy@example.com",
+            "fdg-pet-pi@example.com"
+          ]
     }
   },
   "logging": {

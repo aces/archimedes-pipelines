@@ -35,6 +35,12 @@
       }
     },
 
+    "notification_defaults": {
+        "default_on_success": ["sruthy.mcin@gmail.com"],
+        "default_on_error":   ["sruthy.mcin@gmail.com"],
+        "default_on_evidata_failed": ["sruthy.mcin@gmail.com"]
+      },
+
   "collections": [
     {
       "name": "example_collection_1",
