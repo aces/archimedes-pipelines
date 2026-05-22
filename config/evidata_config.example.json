@@ -1,0 +1,36 @@
+{
+  "_comment": "TEMPLATE — copy to evidata_config.json and fill in. This .example file is safe to commit; the real evidata_config.json should NOT be committed if it ever contains environment-specific values. No secrets live in either file — only env-var names.",
+
+  "_comment_enabled": "Master switch. false (or this whole file absent) => preflight skipped silently, pipeline behaves as if EviData never existed. true => preflight runs and a failure aborts the whole project.",
+  "enabled": false,
+
+  "_comment_endpoints": "Replace <evidata-host> with the FQDN of the EviData VM. Same host for both ports: 8000 = EviData API, 3000 = Keycloak. Use https:// if the deployment terminates TLS.",
+  "api_base_url": "http://<evidata-host>:8000/api",
+  "token_url":    "http://<evidata-host>:3000/auth/realms/<keycloak-realm>/protocol/openid-connect/token",
+
+  "_comment_client_id": "Keycloak client id. 'evidata-api' is the install-doc default; confirm with whoever deployed the stack.",
+  "client_id": "evidata-api",
+
+  "_comment_secrets": "These are env-var NAMES, not values. Set the actual values as environment variables on the host that runs the pipeline. Required by EviDataClient::authenticate() — pipeline throws if any of the three env vars is empty.",
+  "client_secret_env": "EVIDATA_CLIENT_SECRET",
+  "username_env":      "EVIDATA_USERNAME",
+  "password_env":      "EVIDATA_PASSWORD",
+
+  "_comment_polling": "Async report generation tuning. poll_interval_seconds = gap between status checks; poll_timeout_seconds = give-up deadline. Both optional (EviDataClient defaults: 10 / 600).",
+  "poll_interval_seconds": 10,
+  "poll_timeout_seconds":  600,
+
+  "_comment_report_metadata": "Static labels stamped on every report. analysis_type also sent with the dataset upload. All optional (EviDataClient supplies defaults).",
+  "analysis_type":  "de-identified",
+  "client_name":    "<your-org>",
+  "recipient_name": "<your-pipeline-name>",
+
+  "_comment_qis": "REQUIRED when enabled=true. Quasi-identifier column names — must EXACTLY match the clinical CSV/TSV headers (case-sensitive). resolveEvidataConfig() throws if this is missing or not an array.",
+  "qis": ["age", "sex", "zip_code"],
+
+  "_comment_population_size": "Reference population size. Must be >= (CSV rows + 1). Optional (default 50000).",
+  "population_size": 50000,
+
+  "_comment_from_address": "Optional. From: address on the privacy-failure email. Omit to fall back to archimedes-pipeline@<hostname>.",
+  "from_address": "archimedes-pipeline@<your-domain>"
+}
