@@ -1,32 +1,38 @@
 {
-  "_comment": "TEMPLATE — copy to evidata_config.json and fill in. This .example file is safe to commit; the real evidata_config.json should NOT be committed if it ever contains environment-specific values. No secrets live in either file — only env-var names.",
+  "_comment": "TEMPLATE — copy to evidata_config.json and fill in. This .example file is safe to commit. The real evidata_config.json should NOT be committed (add it to .gitignore) since it carries environment-specific endpoint values. No secrets live in either file — only env-var NAMES; the secret values stay in the separate env_file (see below).",
 
-  "_comment_enabled": "Master switch. false (or this whole file absent) => preflight skipped silently, pipeline behaves as if EviData never existed. true => preflight runs and a failure aborts the whole project.",
+  "_comment_enabled": "Master switch. false (or this whole file absent) => preflight skipped silently, pipeline behaves as if EviData never existed. true => preflight runs and a failure aborts the whole project. The flag is GLOBAL — there is no per-project enable/disable.",
   "enabled": false,
 
-  "_comment_endpoints": "Replace <evidata-host> with the FQDN of the EviData VM. Same host for both ports: 8000 = EviData API, 3000 = Keycloak. Use https:// if the deployment terminates TLS.",
-  "api_base_url": "http://<evidata-host>:8000/api",
-  "token_url":    "http://<evidata-host>:3000/auth/realms/<keycloak-realm>/protocol/openid-connect/token",
+  "_comment_endpoints": "Both URLs point at the EviData deployment. If EviData is fronted by a TLS reverse proxy (recommended), use https:// with no port — the proxy routes /api to the EviData API and /auth to Keycloak. If you must hit the containers directly, the API is on :8000 and Keycloak on :3000. Replace <evidata-host> and <keycloak-realm> accordingly.",
+  "api_base_url": "https://<evidata-host>/api",
+  "token_url":    "https://<evidata-host>/auth/realms/<keycloak-realm>/protocol/openid-connect/token",
 
-  "_comment_client_id": "Keycloak client id. 'evidata-api' is the install-doc default; confirm with whoever deployed the stack.",
+  "_comment_client_id": "Keycloak PROGRAMMATIC client id (not the browser/UI client). 'evidata-api' is the install-doc default; confirm with whoever deployed the stack.",
   "client_id": "evidata-api",
 
-  "_comment_secrets": "These are env-var NAMES, not values. Set the actual values as environment variables on the host that runs the pipeline. Required by EviDataClient::authenticate() — pipeline throws if any of the three env vars is empty.",
+  "_comment_scope": "OAuth2 scope requested in the token grant. MUST include 'openid' — the EviData API rejects bearer tokens issued without it (HTTP 401 'Failed to authenticate user') even though Keycloak returns the token with 200. Optional key; EviDataClient defaults to this same value if omitted.",
+  "scope": "openid profile email",
+
+  "_comment_secrets": "These are env-var NAMES, not values. EviDataClient::authenticate() reads the actual values via getenv() and throws if any of the three is empty. Set them in the env_file below (auto-loaded by the pipeline runner) or export them in the shell.",
   "client_secret_env": "EVIDATA_CLIENT_SECRET",
   "username_env":      "EVIDATA_USERNAME",
   "password_env":      "EVIDATA_PASSWORD",
+
+  "_comment_env_file": "Path to the file holding the three credential env vars (EVIDATA_CLIENT_SECRET / EVIDATA_USERNAME / EVIDATA_PASSWORD as `export KEY=value` lines). run_clinical_pipeline.php and test_evidata_connection.php auto-load it, so a forgotten `source` does not break a run. The file MUST be chmod 600 and gitignored — it holds secrets. Resolution order: EVIDATA_ENV_FILE env var > this key > hardcoded default. A real environment variable, if already set, always wins over the file.",
+  "env_file": "/home/<user>/evidata/evidata.env",
 
   "_comment_polling": "Async report generation tuning. poll_interval_seconds = gap between status checks; poll_timeout_seconds = give-up deadline. Both optional (EviDataClient defaults: 10 / 600).",
   "poll_interval_seconds": 10,
   "poll_timeout_seconds":  600,
 
-  "_comment_report_metadata": "Static labels stamped on every report. analysis_type also sent with the dataset upload. All optional (EviDataClient supplies defaults).",
+  "_comment_report_metadata": "Static labels stamped on every report. analysis_type is also sent with the dataset upload. All optional (EviDataClient supplies defaults).",
   "analysis_type":  "de-identified",
   "client_name":    "<your-org>",
   "recipient_name": "<your-pipeline-name>",
 
-  "_comment_qis": "REQUIRED when enabled=true. Quasi-identifier column names — must EXACTLY match the clinical CSV/TSV headers (case-sensitive). resolveEvidataConfig() throws if this is missing or not an array.",
-  "qis": ["age", "sex", "zip_code"],
+  "_comment_qis": "GLOBAL BASELINE quasi-identifier list. QI lists are resolved at TWO levels: (1) project.json -> evidata.qis is the per-project override — when a project defines it, that project fully owns its QI policy; (2) this global qis is the fallback, used ONLY by projects that do NOT define their own. Keep this global value a simple FLAT ARRAY — a per-filename map here would wrongly apply the same filename rule to every project that falls back to it. Per-project / per-file granularity belongs in each project.json. EviData's server-side QI validation is CASE-SENSITIVE: every QI name must match the CSV header casing exactly. REQUIRED when enabled=true — resolveEvidataConfig() throws if missing or malformed. This baseline is intentionally minimal; projects with age/DOB/postal data MUST set their own evidata.qis in project.json.",
+  "qis": ["Sex"],
 
   "_comment_population_size": "Reference population size. Must be >= (CSV rows + 1). Optional (default 50000).",
   "population_size": 50000,
