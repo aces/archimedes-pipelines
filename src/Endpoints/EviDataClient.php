@@ -19,6 +19,8 @@ use RuntimeException;
  *   - Single POST to token_url returns a bearer token
  *   - Token is cached on the instance; checkBatch() authenticates once
  *     even when processing N files
+ *   - The 'openid' scope is required: the EviData API rejects tokens
+ *     issued without it (HTTP 401), even though Keycloak returns 200.
  *
  * Report lifecycle per file:
  *   1. POST /datasets/upload          -> dataset_id      (multipart)
@@ -26,6 +28,14 @@ use RuntimeException;
  *   3. GET  /reports/{report_id}      -> poll status until completed
  *   4. GET  /reports/{report_id}/results       -> JSON pass/fail payload
  *   5. GET  /reports/{report_id}/download-zip  -> bundled PDF artifact
+ *
+ * Per-file quasi-identifiers:
+ *   EviData's server-side QI validation is CASE-SENSITIVE and matches
+ *   the QI names sent in /reports/generate against the uploaded CSV's
+ *   columns exactly. Different source files may use different column
+ *   names or casing (e.g. 'Sex' vs 'sex'), so the QI list is resolved
+ *   PER FILE by the caller (ClinicalPipeline) and passed in alongside
+ *   each path — see checkBatch(). There is no single global QI list.
  *
  * Failure semantics:
  *   - overall_passed=false        -> file failed the privacy check
@@ -39,7 +49,7 @@ use RuntimeException;
  */
 class EviDataClient
 {
-    /** Merged config from loris_client_config.json -> 'evidata' block. */
+    /** EviData config block, sourced from config/evidata_config.json. */
     private array $cfg;
 
     /** Bearer token from Keycloak; populated by authenticate(). */
@@ -54,6 +64,15 @@ class EviDataClient
     /** cURL timeout for non-poll HTTP calls (seconds). */
     private const HTTP_TIMEOUT = 120;
 
+    /**
+     * OAuth2 scope requested in the token grant. The EviData API
+     * requires the 'openid' scope on the bearer token; a token issued
+     * without it is rejected with HTTP 401 "Failed to authenticate
+     * user" even though Keycloak itself returns the token with 200.
+     * Overridable via the optional 'scope' config key.
+     */
+    private const DEFAULT_SCOPE = 'openid profile email';
+
     // ──────────────────────────────────────────────────────────────────
     //  Construction
     // ──────────────────────────────────────────────────────────────────
@@ -62,10 +81,13 @@ class EviDataClient
      * Build a client from the resolved EviData config block.
      *
      * Required keys: api_base_url, token_url, client_id,
-     *                client_secret_env, username_env, password_env, qis.
+     *                client_secret_env, username_env, password_env.
      * Optional:      analysis_type, client_name, recipient_name,
      *                population_size, poll_interval_seconds,
-     *                poll_timeout_seconds.
+     *                poll_timeout_seconds, scope.
+     *
+     * NOTE: 'qis' is NOT read from config here. QI lists are resolved
+     * per file by the caller and passed into checkBatch() / check().
      */
     public function __construct(array $evidataConfig)
     {
@@ -86,24 +108,29 @@ class EviDataClient
     // ══════════════════════════════════════════════════════════════════
 
     /**
-     * Check one CSV/TSV. Returns true if EviData reports
-     * overall_passed=true.
+     * Check one CSV/TSV against the given quasi-identifier list.
+     * Returns true if EviData reports overall_passed=true.
      *
      * Throws on transport / auth / timeout failure. For batch use
      * with fail-as-result semantics, prefer checkBatch().
+     *
+     * @param string        $csvPath Absolute path to the CSV/TSV.
+     * @param array<string> $qis     QI column names for THIS file
+     *                               (case must match the file's headers).
      */
-    public function check(string $csvPath): bool
+    public function check(string $csvPath, array $qis): bool
     {
         $this->authenticate();
         $datasetId = $this->uploadDataset($csvPath);
-        $reportId  = $this->generateReport($datasetId);
+        $reportId  = $this->generateReport($datasetId, $qis);
         $this->waitForCompletion($reportId);
         $results = $this->http('GET', "/reports/{$reportId}/results");
         return (bool)($results['overall_passed'] ?? false);
     }
 
     /**
-     * Check multiple CSV/TSV files in one batch.
+     * Check multiple CSV/TSV files in one batch, each against its own
+     * quasi-identifier list.
      *
      * Authenticates ONCE, then for each file runs the full lifecycle
      * (upload -> generate -> poll -> results -> download-zip). Per-file
@@ -111,7 +138,11 @@ class EviDataClient
      * the caller sees a complete view even if some files errored
      * mid-way.
      *
-     * @param array<string> $csvPaths Absolute paths to CSV/TSV files.
+     * @param array<string, array<string>> $filesWithQis
+     *        Map of absolute CSV/TSV path => QI column list for that
+     *        file. The QI names must match that file's header casing —
+     *        EviData's server-side QI validation is case-sensitive.
+     *
      * @return array<string, array{
      *     passed:     bool,
      *     error:      ?string,
@@ -120,16 +151,22 @@ class EviDataClient
      *     report_zip: ?string,  // raw bytes of /download-zip, null on failure
      * }> Keyed by basename.
      */
-    public function checkBatch(array $csvPaths): array
+    public function checkBatch(array $filesWithQis): array
     {
         $this->authenticate();
 
         $results = [];
-        foreach ($csvPaths as $csvPath) {
+        foreach ($filesWithQis as $csvPath => $qis) {
             $name = basename($csvPath);
             try {
+                if (!is_array($qis) || empty($qis)) {
+                    throw new RuntimeException(
+                        "No quasi-identifier list supplied for " . $name
+                    );
+                }
+
                 $datasetId      = $this->uploadDataset($csvPath);
-                $reportId       = $this->generateReport($datasetId);
+                $reportId       = $this->generateReport($datasetId, $qis);
                 $this->waitForCompletion($reportId);
                 $resultsPayload = $this->http('GET', "/reports/{$reportId}/results");
 
@@ -174,6 +211,10 @@ class EviDataClient
      * Credentials are read from environment variables whose NAMES live
      * in config (client_secret_env, username_env, password_env). The
      * values themselves never appear in JSON or logs.
+     *
+     * The 'openid' scope MUST be requested — without it the EviData
+     * API rejects every call with HTTP 401, even though Keycloak
+     * issues the token successfully. See DEFAULT_SCOPE.
      */
     private function authenticate(): void
     {
@@ -200,6 +241,10 @@ class EviDataClient
             'client_secret' => $clientSecret,
             'username'      => $username,
             'password'      => $password,
+            // Required: the EviData API rejects tokens issued without
+            // the openid scope (401 "Failed to authenticate user"),
+            // even though Keycloak returns 200. Config-overridable.
+            'scope'         => $this->cfg['scope'] ?? self::DEFAULT_SCOPE,
         ]);
 
         $resp = $this->raw(
@@ -252,20 +297,36 @@ class EviDataClient
     /**
      * Kick off async report generation for an uploaded dataset.
      *
-     * QIs are pulled from the shared config and used for both
-     * p2s_qis (population-to-sample) and s2p_qis (sample-to-population)
-     * — the pre-flight check is symmetric.
+     * The QI list is supplied PER CALL (not read from config) and used
+     * for both p2s_qis (population-to-sample) and s2p_qis
+     * (sample-to-population) — the pre-flight check is symmetric.
+     *
+     * EviData validates these QI names against the uploaded dataset's
+     * columns CASE-SENSITIVELY; the caller is responsible for passing
+     * names that match the specific file's header casing.
+     *
+     * @param string        $datasetId Dataset id from uploadDataset().
+     * @param array<string> $qis       QI column names for this dataset.
      */
-    private function generateReport(string $datasetId): string
+    private function generateReport(string $datasetId, array $qis): string
     {
+        if (empty($qis)) {
+            throw new RuntimeException(
+                "generateReport called with an empty QI list (dataset {$datasetId})"
+            );
+        }
+
+        // Re-index so the JSON encodes as an array, not an object.
+        $qis = array_values($qis);
+
         $resp = $this->http('POST', '/reports/generate', [
             'data_type'               => 'De-identified',
             'client_name'             => $this->cfg['client_name']     ?? 'Archimedes',
             'recipient_name'          => $this->cfg['recipient_name']  ?? 'Archimedes Pipeline',
             'population_size'         => $this->cfg['population_size'] ?? 50000,
             'deidentified_dataset_id' => $datasetId,
-            'p2s_qis'                 => $this->cfg['qis'],
-            's2p_qis'                 => $this->cfg['qis'],
+            'p2s_qis'                 => $qis,
+            's2p_qis'                 => $qis,
         ]);
 
         $reportId = $resp['report_id'] ?? null;

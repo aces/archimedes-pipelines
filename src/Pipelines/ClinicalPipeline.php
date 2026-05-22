@@ -14,62 +14,27 @@ use Psr\Log\LoggerInterface;
  *
  * Read-only contract:
  *   The user-shared input subdirectories are treated as READ-ONLY. The
- *   pipeline NEVER writes to:
- *     - deidentified-raw/clinical/      (clinical data files)
- *     - documentation/data_dictionary/  (DD files)
- *   The backing storage is irrelevant (local mount, S3, file transfer drop,
- *   etc.); the contract is the same. Transient work (date normalization)
- *   uses sys_get_temp_dir() and the temp copy is unlinked after upload.
- *   The pipeline only writes to its own controlled subdirectories:
- *     - processed/clinical/  (tracking JSON, daily snapshots)
- *     - logs/clinical/       (run log, error log)
- *     - logs/evidata/        (EviData artifacts — see EviData section below)
+ *   pipeline NEVER writes to deidentified-raw/clinical/ or
+ *   documentation/data_dictionary/. It only writes to its own
+ *   subdirectories: processed/clinical/, logs/clinical/, logs/evidata/.
  *
- * Logging:
- *   1. Console        -> stdout (always)
- *   2. Run log        -> logs/clinical/clinical_run_{timestamp}.log    (per run, all detail)
- *   3. Error log      -> logs/clinical/clinical_errors_{timestamp}.log (per run, only if errors)
- *   4. Email          -> success or failure notification with full summary
- *   Run log and error log share the same timestamp so they pair up.
+ * EviData privacy pre-flight gate — TWO-LEVEL quasi-identifier (qis) model:
+ *   QI lists are resolved from two levels because the ~100 projects that
+ *   run this pipeline have project-specific QI policy:
+ *     1. project.json -> evidata.qis  (per-project override; the project
+ *        fully owns its QI policy when this is present).
+ *     2. config/evidata_config.json -> qis  (global flat-array baseline,
+ *        used only when a project does not define evidata.qis).
+ *   Each level accepts a flat array OR a map ('_default' + per-filename).
+ *   resolveQisForFile() does the lookup. A file the chosen config does
+ *   not cover (no key, no '_default') fails loudly — never silently
+ *   skipped. EviData's server-side QI validation is case-sensitive.
  *
- * EviData privacy pre-flight gate:
- *   When evidata.enabled=true in loris_client_config.json, every project
- *   starts with a privacy check against every CSV/TSV in deidentified-raw/
- *   clinical/. Files are uploaded to the EviData service, scored, and the
- *   structured results + bundled report ZIP are saved to logs/evidata/.
- *   If ANY file fails or errors, the project aborts entirely — no DD
- *   install, no data upload, no tracking update. A dedicated failure
- *   email goes to the project's evidata recipients with the failed
- *   reports attached.
- *
- *   When evidata.enabled=false (or the block is absent), the gate is
- *   bypassed silently and the pipeline behaves exactly as it did before
- *   EviData was added.
- *
- *   See: scripts/test_mail_attachment.php   (host-level mail-attachment test)
- *        loris_client_config.json -> evidata block
- *        project.json -> notification_emails.evidata
- *
- * Reingestion tracking:
- *   processed/clinical/.clinical_tracking.json stores an MD5 hash per file.
- *   On each run the current file hash is compared to the stored hash:
- *     - No entry         -> first insertion, upload everything
- *     - Hash matches     -> skip (no changes)
- *     - Hash differs     -> re-ingestion, upload full file (LORIS skips already-existing rows)
- *   Use --force to bypass the hash check and always re-upload.
- *
- * Date normalization (DoB and DoD):
- *   Before upload, the DoB and DoD columns are rewritten to YYYY-MM-01
- *   per ARCHIMEDES privacy policy (day jittered to 01, missing parts
- *   default to 01). The rewrite goes into a temp file in
- *   sys_get_temp_dir(); the original source file is never modified.
- *   Hash tracking and snapshot archiving continue to use the original
- *   source file; only the upload step sees the normalized copy.
+ * Reingestion tracking, date normalization, logging: unchanged — see
+ * the per-method docblocks below.
  */
 class ClinicalPipeline
 {
-    // -- Dependencies and flags ------------------------------------------
-
     private array $config;
     private LoggerInterface $logger;
     private ClinicalClient $client;
@@ -79,47 +44,27 @@ class ClinicalPipeline
     private bool $verbose;
     private bool $force;
 
-    /** Timestamp for this pipeline run, shared across all log files. */
     private string $runTimestamp;
 
-    // -- Log file handles ------------------------------------------------
-
-    /** @var resource|null Error log handle, opened lazily on first error. */
+    /** @var resource|null */
     private $errorFh = null;
     private ?string $errorLogPath = null;
 
-    /** @var resource|null Run log handle, opened per project. */
+    /** @var resource|null */
     private $runLogFh = null;
     private ?string $runLogPath = null;
 
     private ?string $logDir = null;
 
-    // -- Reingestion tracking --------------------------------------------
-
-    /** Loaded from .clinical_tracking.json, written back after each project. */
     private array $trackingData = [];
     private ?string $trackingFilePath = null;
 
-    // -- EviData state ---------------------------------------------------
-
-    /**
-     * Per-run directory for EviData artifacts: results JSON, report ZIPs,
-     * and run_summary.json. Set when the preflight starts; null otherwise.
-     */
     private ?string $evidataLogDir = null;
-
-    /** Once-per-project guard against duplicate failure notifications. */
     private bool $evidataNotificationSent = false;
 
-    // -- Per-run results -------------------------------------------------
-
-    /** filename -> {status, type, time, error} */
     private array $installResults = [];
-
-    /** filename -> {status, reason, instruments, rows, ...} */
     private array $dataResults = [];
 
-    /** Aggregate stats across all projects in this run. */
     private array $stats = [
         'dd_files_found'        => 0,
         'dd_installed'          => 0,
@@ -129,67 +74,40 @@ class ClinicalPipeline
         'data_uploaded'         => 0,
         'data_failed'           => 0,
         'data_skipped'          => 0,
-        'rows_inserted'         => 0,  // net-new rows saved by LORIS
-        'rows_existed'          => 0,  // rows already in LORIS, skipped
-        'pairs_processed'       => 0,  // candidate-session pairs touched
-        // EviData stats (populated by preflight; zero on disabled runs)
+        'rows_inserted'         => 0,
+        'rows_existed'          => 0,
+        'pairs_processed'       => 0,
         'evidata_files_checked' => 0,
         'evidata_files_passed'  => 0,
         'evidata_files_failed'  => 0,
         'evidata_results'       => [],
     ];
 
-    /**
-     * CandIDs that exist in LORIS BEFORE this project's uploads begin.
-     * Captured once per project in loadExistingCandidatesForProject().
-     */
     private array $existingCandIdsAtProjectStart = [];
-
-    /**
-     * True only when the pre-run snapshot call succeeded. When false,
-     * the email reports "classification unavailable" instead of guessing.
-     */
     private bool $candidateClassificationAvailable = false;
 
-    // -- Constants -------------------------------------------------------
-
-    /** DD file extension -> instrument_type recognized by LORIS. */
     private const DD_EXTENSIONS = [
         'csv'   => 'redcap',
         'linst' => 'linst',
         'json'  => 'bids',
     ];
 
-    /** Data file extension -> upload format expected by LORIS. */
     private const DATA_EXTENSIONS = [
         'csv' => 'LORIS_CSV',
         'tsv' => 'BIDS_TSV',
     ];
 
-    /** Admin forms excluded from header-based instrument detection. */
     private const DEFAULT_EXCLUDE_FORMS = ['nip_connector', 'project_request_form'];
 
-    /**
-     * Date columns that get YYYY-MM-01 normalization (case-insensitive).
-     * Both DoB and DoD are jittered to the first of the month per
-     * ARCHIMEDES privacy policy.
-     */
+    /** Key in a qis map supplying the QI list for files with no exact match. */
+    private const QIS_DEFAULT_KEY = '_default';
+
     private const DATE_COLUMN_NAMES = [
         'dob', 'date_of_birth', 'birth_date',
         'dod', 'date_of_death', 'death_date',
     ];
 
-    /**
-     * Maximum total bytes of EviData attachments before the notification
-     * falls back to link-only mode. Conservative — most upstream SMTP
-     * relays cap at 20-25 MB after base64 inflation; 15 MB raw leaves
-     * headroom.
-     */
     private const EVIDATA_MAX_ATTACH_BYTES = 15 * 1024 * 1024;
-
-    // ──────────────────────────────────────────────────────────────────
-    // Constructor
-    // ──────────────────────────────────────────────────────────────────
 
     public function __construct(
         array $config,
@@ -222,20 +140,11 @@ class ClinicalPipeline
         $this->notification = new Notification();
     }
 
-    // ──────────────────────────────────────────────────────────────────
-    // Main entry
-    // ──────────────────────────────────────────────────────────────────
-
     public function run(array $filters = []): int
     {
         $this->logger->info("=== CLINICAL DATA INGESTION PIPELINE ===");
         $this->logger->info("Run: {$this->runTimestamp}");
         if ($this->dryRun) {
-            // Loud, unmissable banner so even a glance at the first
-            // screen of output makes it obvious nothing will be
-            // written. Mount-failure alerts are explicitly called out
-            // because they DO still fire (different audience, different
-            // urgency — see MountHealthCheck::guardOrReport).
             $this->logger->info("╔══════════════════════════════════════════════════════════╗");
             $this->logger->info("║  MODE: DRY RUN                                           ║");
             $this->logger->info("║  - No data will be ingested into LORIS                   ║");
@@ -276,39 +185,11 @@ class ClinicalPipeline
         }
     }
 
-    // ──────────────────────────────────────────────────────────────────
-    // Project orchestration
-    // ──────────────────────────────────────────────────────────────────
-
-    /**
-     * Run the full ingestion flow for one project.
-     *
-     * EviData pre-flight runs FIRST. If it fails, the project aborts
-     * entirely with no LORIS writes and no clinical-channel email.
-     * If it passes (or is disabled), normal ingestion proceeds.
-     */
     private function processProject(array $project): void
     {
         $name      = $project['project_common_name'] ?? basename($project['_projectPath']);
         $mountPath = $project['data_access']['mount_path'] ?? $project['_projectPath'];
 
-        // ══════════════════════════════════════════════════════════════
-        //  GATE 0: Mount sanity check
-        //
-        //  Bounded stat against the project root BEFORE any other
-        //  filesystem call. If the mount is hung (NFS server down,
-        //  stale handle, network glitch), filesystem syscalls block
-        //  uninterruptibly at the kernel level — PHP timeouts cannot
-        //  escape them.
-        //
-        //  guardOrReport() handles everything: bounded stat with
-        //  10s SIGKILL, standardized log message, email to recipients
-        //  from notification_defaults.default_on_error, and dedup so
-        //  one hung mount doesn't spam N emails.
-        //
-        //  All values used by the email (recipients, From: address)
-        //  come from the config — no hardcoded addresses in code.
-        // ══════════════════════════════════════════════════════════════
         if (!MountHealthCheck::guardOrReport(
             $mountPath,
             $this->config,
@@ -333,21 +214,11 @@ class ClinicalPipeline
         $this->log("========================================");
         $this->log("  ✓ Data accessible: {$mountPath}");
 
-        // Reset per-project state
         $this->installResults          = [];
         $this->dataResults             = [];
         $this->evidataLogDir           = null;
         $this->evidataNotificationSent = false;
 
-        // ══════════════════════════════════════════════════════════════
-        //  GATE 1: EviData privacy pre-flight
-        //
-        //  Runs against every CSV/TSV in deidentified-raw/clinical/
-        //  BEFORE any LORIS write. Fail-closed: any failure aborts
-        //  the entire project run. Returns a three-state outcome so
-        //  the caller can tell "skipped" (don't announce a PASS) apart
-        //  from "actually passed".
-        // ══════════════════════════════════════════════════════════════
         $evidataOutcome = $this->runEvidataPreflight($project, $mountPath, $dataDir);
 
         if ($evidataOutcome === 'failed') {
@@ -359,11 +230,6 @@ class ClinicalPipeline
             return;
         }
 
-        // Only announce a "passed" outcome when we actually ran the
-        // check. Skipped runs (disabled / no CSV files) already logged
-        // their own reason inside runEvidataPreflight() — adding a
-        // misleading "PASSED" line on top would imply something ran
-        // and cleared, which it didn't.
         if ($evidataOutcome === 'passed') {
             $this->log("");
             $this->log("✓ EviData check PASSED — proceeding with ingestion");
@@ -410,41 +276,11 @@ class ClinicalPipeline
 
     // ══════════════════════════════════════════════════════════════════
     //  EviData pre-flight
-    //
-    //  Three-step flow:
-    //    A. resolveEvidataConfig() — pull merged config, or null if
-    //       disabled at the global level (silent skip).
-    //    B. validateEvidataQiHeaders() — local check that every CSV has
-    //       the configured QI columns, BEFORE any network call.
-    //    C. EviDataClient::checkBatch() — upload, score, fetch results
-    //       and report ZIPs.
-    //
-    //  After each step, artifacts are persisted under
-    //  {mount_path}/logs/evidata/{timestamp}/, regardless of run outcome.
-    //  Failure triggers a dedicated email (with ZIPs attached, when size
-    //  allows) to the project's evidata recipients.
     // ══════════════════════════════════════════════════════════════════
 
     /**
      * Run the EviData pre-flight against every CSV/TSV in $clinicalDir.
-     *
-     * Three-state return so the caller can distinguish "we skipped this"
-     * from "we ran and everything cleared". Both used to be `true`, which
-     * led to a misleading "✓ EviData check PASSED" message on disabled
-     * runs. Now:
-     *
-     *   'skipped' — EviData is disabled / no clinical dir / no CSV files
-     *               Caller should proceed silently with no PASS message.
-     *   'passed'  — Every file passed the check.
-     *               Caller may announce the PASS to the run log.
-     *   'failed'  — One or more files failed, or a client-setup error.
-     *               Caller MUST abort downstream ingestion.
-     *
-     * Side effects on failure:
-     *   - stats['evidata_*'] populated for the run-log summary
-     *   - per-file artifacts written to logs/evidata/{timestamp}/
-     *   - run_summary.json written
-     *   - failure email sent to project's evidata recipients
+     * Returns 'skipped' | 'passed' | 'failed'.
      */
     private function runEvidataPreflight(array $project, string $mountPath, string $clinicalDir): string
     {
@@ -475,22 +311,64 @@ class ClinicalPipeline
         $this->log("  Checking " . count($csvFiles) . " file(s) against EviData");
         $this->log("  API endpoint: {$evi['api_base_url']}");
 
-        // Open the per-run artifact directory before any check runs.
+        // ── Choose the QI source for this project (project override
+        //    or global fallback), and validate its shape. ─────────────
+        try {
+            [$qisConfig, $qisSource] = $this->resolveProjectQisConfig($project, $evi);
+        } catch (\RuntimeException $e) {
+            $this->log("  !! EviData QI config error: " . $e->getMessage());
+            $this->writeError('evidata', "QI config error: " . $e->getMessage());
+            $this->openEvidataLogDir($mountPath);
+            $this->stats['evidata_results']['__config_error__'] = [
+                'passed'     => false,
+                'error'      => $e->getMessage(),
+                'report_id'  => null,
+                'results'    => null,
+                'report_zip' => null,
+            ];
+            $this->writeEvidataRunSummary($project, false);
+            $this->sendEvidataFailureNotification(
+                $project,
+                "EviData QI configuration error — preflight could not run:\n" . $e->getMessage()
+            );
+            return 'failed';
+        }
+        $this->log("  QI policy source: {$qisSource}");
+
         $artifactDir = $this->openEvidataLogDir($mountPath);
         $this->log("  Artifact dir: {$artifactDir}");
 
-        // ── Step A: local QI presence check ─────────────────────────
-        // Cheap (no network) and catches config drift before paying
-        // for upload + report. A mismatch here means either the CSV
-        // is missing a column or evidata.qis in config is wrong.
-        $qiErrors = $this->validateEvidataQiHeaders($csvFiles, $evi['qis']);
+        // ── Resolve the QI list per file up front ───────────────────
+        $qisByPath    = [];
+        $qiResolveErr = [];
+        foreach ($csvFiles as $path) {
+            try {
+                $qisByPath[$path] = $this->resolveQisForFile($qisConfig, basename($path));
+            } catch (\RuntimeException $e) {
+                $qiResolveErr[basename($path)] = $e->getMessage();
+            }
+        }
+
+        // ── Local QI presence check (no network) ────────────────────
+        $qiErrors = $this->validateEvidataQiHeaders($qisByPath);
+        foreach ($qiResolveErr as $name => $msg) {
+            $qiErrors[$name] = ['__resolve_error__' => $msg];
+        }
+
         if (!empty($qiErrors)) {
             foreach ($qiErrors as $name => $missing) {
                 $this->stats['evidata_files_checked']++;
                 $this->stats['evidata_files_failed']++;
-                $errMsg = ($missing === ['__unreadable__'])
-                    ? 'CSV unreadable'
-                    : 'Configured QI columns missing in CSV: ' . implode(', ', $missing);
+
+                if (isset($missing['__resolve_error__'])) {
+                    $errMsg = $missing['__resolve_error__'];
+                } elseif ($missing === ['__unreadable__']) {
+                    $errMsg = 'CSV unreadable';
+                } else {
+                    $errMsg = 'Configured QI columns missing in CSV: '
+                        . implode(', ', $missing);
+                }
+
                 $result = [
                     'passed'     => false,
                     'error'      => $errMsg,
@@ -508,14 +386,10 @@ class ClinicalPipeline
             return 'failed';
         }
 
-        // ── Step B: remote check via EviData API ────────────────────
-        // checkBatch() captures per-file exceptions internally. The
-        // try/catch here is only for client setup errors (constructor,
-        // missing env vars, etc) — anything that prevents the batch
-        // from running at all.
+        // ── Remote check via EviData API ────────────────────────────
         try {
             $client  = new EviDataClient($evi);
-            $results = $client->checkBatch($csvFiles);
+            $results = $client->checkBatch($qisByPath);
         } catch (\Throwable $e) {
             $this->log("  !! EviData client setup error: " . $e->getMessage());
             $this->writeError('evidata', "Client setup error: " . $e->getMessage());
@@ -534,7 +408,7 @@ class ClinicalPipeline
             return 'failed';
         }
 
-        // ── Step C: process each file's result, persist artifacts ──
+        // ── Process each file's result, persist artifacts ───────────
         $allPassed = true;
         foreach ($results as $name => $r) {
             $this->stats['evidata_files_checked']++;
@@ -558,7 +432,6 @@ class ClinicalPipeline
             }
         }
 
-        // Roll-up summary regardless of outcome.
         $this->writeEvidataRunSummary($project, $allPassed);
 
         if (!$allPassed) {
@@ -577,13 +450,10 @@ class ClinicalPipeline
     }
 
     /**
-     * Resolve the global EviData config from loris_client_config.json.
-     * Returns null when disabled / missing — caller treats null as
-     * "skip pre-flight" and ingestion proceeds normally.
-     *
-     * Throws if EviData is enabled but 'qis' is missing — that's almost
-     * certainly a misconfiguration, and silently passing every file
-     * would give privacy theatre instead of a real check.
+     * Resolve the global EviData service config (merged into
+     * $config['evidata'] by the runner). Returns null when disabled.
+     * Throws if enabled but the GLOBAL 'qis' baseline is missing or
+     * structurally invalid.
      */
     private function resolveEvidataConfig(): ?array
     {
@@ -592,29 +462,145 @@ class ClinicalPipeline
         if (empty($evi['enabled'])) {
             return null;
         }
-        if (empty($evi['qis']) || !is_array($evi['qis'])) {
+
+        $qis = $evi['qis'] ?? null;
+        if ($qis === null) {
             throw new \RuntimeException(
-                "evidata.qis missing from loris_client_config.json — "
-                . "list the QI columns shared by all clinical CSVs, "
-                . "or set evidata.enabled=false to disable the privacy check."
+                "evidata.qis missing from config/evidata_config.json — "
+                . "supply a global baseline QI list (a flat array, or a map "
+                . "with a '" . self::QIS_DEFAULT_KEY . "' key). Per-project "
+                . "overrides go in each project.json under evidata.qis. "
+                . "Or set evidata.enabled=false."
             );
         }
+        $this->validateQisShape($qis, 'evidata_config.json -> qis');
+
         return $evi;
     }
 
     /**
-     * Local pre-check: verify every configured QI column exists in
-     * every CSV/TSV's header row before any network call.
+     * Decide which QI configuration applies to one project.
      *
-     * Returns a map of {basename -> [missing columns]} for failing
-     * files. Empty array = all files are good to send to EviData.
-     * An unreadable file is reported as ['__unreadable__'] for a
-     * clean error message.
+     * If project.json defines evidata.qis, the project OWNS its QI
+     * policy and the global is ignored for it. Otherwise the global
+     * evidata.qis baseline is used.
+     *
+     * @return array{0: array, 1: string} [qisConfig, sourceLabel]
+     * @throws \RuntimeException if project.json's evidata.qis is malformed.
      */
-    private function validateEvidataQiHeaders(array $csvFiles, array $qis): array
+    private function resolveProjectQisConfig(array $project, array $evi): array
+    {
+        $projectQis = $project['evidata']['qis'] ?? null;
+
+        if ($projectQis !== null) {
+            $this->validateQisShape($projectQis, 'project.json -> evidata.qis');
+            return [$projectQis, 'project.json (per-project override)'];
+        }
+
+        return [$evi['qis'], 'evidata_config.json (global default)'];
+    }
+
+    /**
+     * Validate that a qis value is well-formed: either a flat list of
+     * non-empty strings, or a map whose every value is a non-empty
+     * list of non-empty strings.
+     *
+     * @throws \RuntimeException on any structural problem.
+     */
+    private function validateQisShape($qis, string $where): void
+    {
+        if (!is_array($qis) || empty($qis)) {
+            throw new \RuntimeException(
+                "{$where} must be a non-empty array (a flat list of QI "
+                . "column names, or a map with a '" . self::QIS_DEFAULT_KEY
+                . "' key plus optional per-filename overrides)."
+            );
+        }
+
+        $isFlatList = array_keys($qis) === range(0, count($qis) - 1);
+
+        if ($isFlatList) {
+            foreach ($qis as $q) {
+                if (!is_string($q) || $q === '') {
+                    throw new \RuntimeException(
+                        "{$where} flat array must contain only non-empty "
+                        . "column-name strings."
+                    );
+                }
+            }
+            return;
+        }
+
+        foreach ($qis as $key => $list) {
+            if (!is_array($list) || empty($list)) {
+                throw new \RuntimeException(
+                    "{$where}['{$key}'] must be a non-empty array of QI "
+                    . "column-name strings."
+                );
+            }
+            foreach ($list as $q) {
+                if (!is_string($q) || $q === '') {
+                    throw new \RuntimeException(
+                        "{$where}['{$key}'] must contain only non-empty "
+                        . "column-name strings."
+                    );
+                }
+            }
+        }
+    }
+
+    /**
+     * Resolve the QI list for ONE file from the already-chosen
+     * project/global qis config.
+     *
+     * Flat array  -> applies to every file.
+     * Map         -> exact-filename key wins; else '_default'; else
+     *                a hard error (no silent skip, no fallback to the
+     *                other config level — the chosen source is
+     *                authoritative).
+     *
+     * @throws \RuntimeException when a file matches no key and there
+     *         is no '_default'.
+     */
+    private function resolveQisForFile(array $qisConfig, string $basename): array
+    {
+        $isFlatList = array_keys($qisConfig) === range(0, count($qisConfig) - 1);
+
+        if ($isFlatList) {
+            return array_values($qisConfig);
+        }
+
+        if (isset($qisConfig[$basename])) {
+            return array_values($qisConfig[$basename]);
+        }
+
+        if (isset($qisConfig[self::QIS_DEFAULT_KEY])) {
+            return array_values($qisConfig[self::QIS_DEFAULT_KEY]);
+        }
+
+        throw new \RuntimeException(
+            "No QI list for '{$basename}' — the chosen qis config has no "
+            . "entry for this file and no '" . self::QIS_DEFAULT_KEY . "' "
+            . "fallback. Add an entry for this file, or a '"
+            . self::QIS_DEFAULT_KEY . "' key, in the project's project.json "
+            . "evidata.qis (or the global evidata_config.json)."
+        );
+    }
+
+    /**
+     * Local pre-check: verify each file's resolved QI columns exist in
+     * that file's header row. Case-INSENSITIVE here (a courtesy for
+     * clear errors) — but EviData's server-side validation is
+     * case-sensitive, so config 'qis' values must still match each
+     * file's header casing exactly.
+     *
+     * @param array<string, array<string>> $qisByPath  path => QI list.
+     * @return array<string, array<string>>  {basename -> missing cols}.
+     */
+    private function validateEvidataQiHeaders(array $qisByPath): array
     {
         $bad = [];
-        foreach ($csvFiles as $path) {
+        foreach ($qisByPath as $path => $qis) {
             $delim   = str_ends_with(strtolower($path), '.tsv') ? "\t" : ',';
             $fh      = @fopen($path, 'r');
             if ($fh === false) {
@@ -627,30 +613,31 @@ class ClinicalPipeline
                 $bad[basename($path)] = ['__unreadable__'];
                 continue;
             }
-            $headers = array_map('trim', $headers);
-            $missing = array_values(array_diff($qis, $headers));
+
+            $headersLower = array_map(
+                fn($h) => strtolower(trim((string)$h)),
+                $headers
+            );
+
+            $missing = [];
+            foreach ($qis as $qi) {
+                $qiLower = strtolower(trim((string)$qi));
+                if (!in_array($qiLower, $headersLower, true)) {
+                    $missing[] = $qi;
+                }
+            }
             if (!empty($missing)) {
-                $bad[basename($path)] = $missing;
+                $bad[basename($path)] = array_values($missing);
             }
         }
         return $bad;
     }
 
-    // ══════════════════════════════════════════════════════════════════
-    //  EviData artifact persistence + notification
-    //
-    //  Per-run audit trail under {mount_path}/logs/evidata/{timestamp}/.
-    //  Independent of run outcome — pass or fail, the artifacts persist.
-    //  Passing runs leave evidence the gate ran cleanly; failing runs
-    //  leave the reports compliance needs to remediate.
-    // ══════════════════════════════════════════════════════════════════
-
-    /**
-     * Open the per-run artifact directory and remember it for the rest
-     * of the project's preflight.
-     */
     private function openEvidataLogDir(string $mountPath): string
     {
+        if ($this->evidataLogDir !== null) {
+            return $this->evidataLogDir;
+        }
         $dir = rtrim($mountPath, '/') . "/logs/evidata/{$this->runTimestamp}";
         if (!is_dir($dir)) {
             mkdir($dir, 0755, true);
@@ -659,24 +646,14 @@ class ClinicalPipeline
         return $dir;
     }
 
-    /**
-     * Persist one file's artifacts to disk. Writes whatever subset is
-     * available: results.json (when EviData returned a payload),
-     * report.zip (when EviData returned the bundle), error.json (when
-     * the file errored).
-     *
-     * Returns the absolute paths of files actually written so the
-     * caller can log them.
-     */
     private function persistEvidataArtifacts(string $sourceName, array $result): array
     {
         if ($this->evidataLogDir === null) {
             return [];
         }
 
-        // Strip extension so we don't end up with names like
-        // "redcap_data.csv.results.json".
         $stem    = pathinfo($sourceName, PATHINFO_FILENAME);
+        $stem    = preg_replace('/[^A-Za-z0-9._-]/', '_', $stem) ?: 'artifact';
         $written = [];
 
         if (!empty($result['results']) && is_array($result['results'])) {
@@ -707,11 +684,6 @@ class ClinicalPipeline
         return $written;
     }
 
-    /**
-     * Write the top-level run_summary.json roll-up. Called once at the
-     * end of every preflight run (pass or fail). Operators read this
-     * first when triaging "what happened with EviData this run".
-     */
     private function writeEvidataRunSummary(array $project, bool $allPassed): void
     {
         if ($this->evidataLogDir === null) {
@@ -746,17 +718,6 @@ class ClinicalPipeline
         );
     }
 
-    /**
-     * Send the EviData failure notification.
-     *
-     * Bypasses LORIS\Utils\Notification (which is text-only) and uses
-     * PHP mail() directly so we can attach the report ZIPs for failed
-     * files. Confirmed working on this host via
-     * scripts/test_mail_attachment.php.
-     *
-     * Recipient lookup: project's evidata.on_check_failed list first,
-     * then the global default_on_evidata_failed fallback.
-     */
     private function sendEvidataFailureNotification(
         array $project,
         ?string $clientErrorOverride = null
@@ -769,6 +730,8 @@ class ClinicalPipeline
             ?? $this->config['notification_defaults']['default_on_evidata_failed']
             ?? [];
 
+        $recipients = array_values(array_unique($recipients));
+
         if (empty($recipients)) {
             $this->log("  No EviData failure recipients configured — not emailing");
             return;
@@ -779,9 +742,6 @@ class ClinicalPipeline
         $subject     = "PRIVACY CHECK FAILED: {$projectName} Clinical Pipeline";
         $body        = $this->buildEvidataFailureBody($projectName, $clientErrorOverride);
 
-        // ── Collect ZIPs for failed files only ──────────────────────
-        // Compliance opens the failed report, not all of them. Passing
-        // files already have artifacts on disk and don't need email.
         $attachments = [];
         $totalBytes  = 0;
         if ($clientErrorOverride === null && $this->evidataLogDir !== null) {
@@ -790,6 +750,7 @@ class ClinicalPipeline
                     continue;
                 }
                 $stem = pathinfo($name, PATHINFO_FILENAME);
+                $stem = preg_replace('/[^A-Za-z0-9._-]/', '_', $stem) ?: 'artifact';
                 $zip  = "{$this->evidataLogDir}/{$stem}.report.zip";
                 if (is_file($zip)) {
                     $attachments[] = [
@@ -801,9 +762,6 @@ class ClinicalPipeline
             }
         }
 
-        // ── Size guard ─────────────────────────────────────────────
-        // Fall back to a link-only body when total payload exceeds the
-        // ceiling. Better than letting the MTA reject the message.
         if ($totalBytes > self::EVIDATA_MAX_ATTACH_BYTES) {
             $mb = round($totalBytes / 1024 / 1024, 1);
             $this->log("  EviData attachments total {$mb}MB — over "
@@ -821,7 +779,6 @@ class ClinicalPipeline
             $body .= "\n\nAudit artifacts at:\n  {$this->evidataLogDir}\n";
         }
 
-        // ── Dry-run preview ─────────────────────────────────────────
         if ($this->dryRun) {
             $this->log("");
             $this->log("  ── EviData notification [DRY RUN — not sent] ──");
@@ -838,7 +795,6 @@ class ClinicalPipeline
             return;
         }
 
-        // ── Send ───────────────────────────────────────────────────
         $attachLabel = empty($attachments)
             ? ''
             : ' (with ' . count($attachments) . ' attachment(s), '
@@ -855,26 +811,12 @@ class ClinicalPipeline
         $this->evidataNotificationSent = true;
     }
 
-    /**
-     * Send mail with optional multipart attachments via PHP mail().
-     *
-     * Why direct mail():
-     *   LORIS\Utils\Notification is text-only. We can't modify it
-     *   (LORIS upstream). Rather than fork, this one notification
-     *   uses mail() directly for the attachment path. All other
-     *   pipeline notifications continue to use Notification::send().
-     *
-     * Returns true if mail() accepted the message for delivery.
-     * False means the local MTA refused — not that the recipient
-     * didn't receive it. Caller logs either way.
-     */
     private function sendEvidataMailWithAttachments(
         string $to,
         string $subject,
         string $body,
         array $attachments
     ): bool {
-        // No attachments → simple text email shape.
         if (empty($attachments)) {
             $headers = "From: " . $this->evidataFromAddress() . "\r\n"
                 . "Content-Type: text/plain; charset=UTF-8\r\n";
@@ -886,13 +828,11 @@ class ClinicalPipeline
             . "MIME-Version: 1.0\r\n"
             . "Content-Type: multipart/mixed; boundary=\"{$boundary}\"\r\n";
 
-        // Part 1: plain-text body
         $message  = "--{$boundary}\r\n"
             . "Content-Type: text/plain; charset=UTF-8\r\n"
             . "Content-Transfer-Encoding: 8bit\r\n\r\n"
             . $body . "\r\n";
 
-        // Part 2..N: attachments
         foreach ($attachments as $att) {
             $path = $att['path'] ?? null;
             if (empty($path) || !is_readable($path)) {
@@ -917,21 +857,12 @@ class ClinicalPipeline
         return mail($to, $subject, $message, $headers);
     }
 
-    /**
-     * Resolve From: address. Prefers an explicit config value so
-     * deployments can set a real domain for better deliverability;
-     * falls back to a hostname-based default.
-     */
     private function evidataFromAddress(): string
     {
         return $this->config['evidata']['from_address']
             ?? ('archimedes-pipeline@' . (gethostname() ?: 'localhost'));
     }
 
-    /**
-     * Lightweight extension-to-MIME mapping. Avoids the fileinfo
-     * extension dependency that mime_content_type() needs.
-     */
     private function mimeForPath(string $path): string
     {
         return match (strtolower(pathinfo($path, PATHINFO_EXTENSION))) {
@@ -944,10 +875,6 @@ class ClinicalPipeline
         };
     }
 
-    /**
-     * Construct the email body for the EviData failure notification.
-     * Used by both the live send path and the dry-run preview.
-     */
     private function buildEvidataFailureBody(
         string $projectName,
         ?string $clientErrorOverride
@@ -963,8 +890,16 @@ class ClinicalPipeline
 
         if ($clientErrorOverride !== null) {
             $body .= "Client error:\n{$clientErrorOverride}\n\n";
-            $body .= $this->evidataActionFooter();
+            $body .= $this->evidataActionFooter(false);
             return $body;
+        }
+
+        $hasAnyReport = false;
+        foreach (($this->stats['evidata_results'] ?? []) as $r) {
+            if (!empty($r['report_id'])) {
+                $hasAnyReport = true;
+                break;
+            }
         }
 
         $body .= "Per-file results:\n" . str_repeat('-', 50) . "\n";
@@ -979,7 +914,7 @@ class ClinicalPipeline
             }
             $body .= "  {$mark} {$name}  {$detail}\n";
         }
-        $body .= "\n" . $this->evidataActionFooter();
+        $body .= "\n" . $this->evidataActionFooter($hasAnyReport);
 
         if ($this->runLogPath) {
             $body .= "\nClinical run log: {$this->runLogPath}\n";
@@ -988,11 +923,21 @@ class ClinicalPipeline
         return $body;
     }
 
-    private function evidataActionFooter(): string
+    private function evidataActionFooter(bool $hasReport = true): string
     {
-        return "Action required: review the failed report(s) in the EviData UI\n"
-            . "and re-export the dataset with adequate de-identification before\n"
-            . "re-running the clinical pipeline.\n";
+        if ($hasReport) {
+            return "Action required: review the failed report(s) in the EviData UI\n"
+                . "and re-export the dataset with adequate de-identification before\n"
+                . "re-running the clinical pipeline.\n";
+        }
+
+        return "Action required: the failure occurred before an EviData report\n"
+            . "was produced, so there is no report to review. The configured QI\n"
+            . "columns were not found in the CSV header, the qis config did not\n"
+            . "cover the file, or the file was unreadable. Fix the CSV column\n"
+            . "names, or correct the 'qis' list (project.json evidata.qis, or\n"
+            . "the global config/evidata_config.json) to match the actual\n"
+            . "headers, then re-run the clinical pipeline.\n";
     }
 
     // ══════════════════════════════════════════════════════════════════
@@ -1585,10 +1530,6 @@ class ClinicalPipeline
 
     private function log(string $msg): void
     {
-        // Prefix every log line in dry-run mode so partial log snippets
-        // are unambiguous AND the on-disk run-log file is marked too.
-        // A line viewed in isolation should always be self-identifying
-        // about which mode it came from.
         $prefixed = $this->dryRun ? "[DRY RUN] {$msg}" : $msg;
 
         $this->logger->info($prefixed);
@@ -1684,7 +1625,6 @@ class ClinicalPipeline
         $this->log("");
         $this->log("──── PROJECT SUMMARY: {$projectName} ────");
 
-        // EviData summary (if the gate ran)
         if (($this->stats['evidata_files_checked'] ?? 0) > 0) {
             $this->log("");
             $this->log("  EVIDATA PRE-FLIGHT:");
@@ -1696,7 +1636,6 @@ class ClinicalPipeline
             }
         }
 
-        // Install summary
         $this->log("");
         $this->log("  INSTRUMENT INSTALLATION:");
 
@@ -1734,7 +1673,6 @@ class ClinicalPipeline
             }
         }
 
-        // Data upload summary
         $this->log("");
         $this->log("  DATA INGESTION:");
 
@@ -1791,7 +1729,6 @@ class ClinicalPipeline
             }
         }
 
-        // Candidate breakdown
         $nc = $this->computeNewCandidates();
         if (!empty($nc['total_candids'])) {
             $this->log("");
@@ -1906,15 +1843,6 @@ class ClinicalPipeline
 
     // ══════════════════════════════════════════════════════════════════
     //  Clinical-channel email notification
-    //
-    //  Sent at the end of every project run, on success or failure.
-    //  EviData failures bypass this — they have their own notification
-    //  via sendEvidataFailureNotification().
-    //
-    //  Mount-failure emails are handled separately by
-    //  LORIS\Utils\MountHealthCheck::guardOrReport() — they fire from
-    //  inside the utility before this method is reached, using the
-    //  same notification_defaults.default_on_error recipient list.
     // ══════════════════════════════════════════════════════════════════
 
     private function sendNotification(array $project): void
@@ -1926,6 +1854,8 @@ class ClinicalPipeline
         $successEmails = $project['notification_emails']['clinical']['on_success'] ?? [];
         $errorEmails   = $project['notification_emails']['clinical']['on_error']   ?? [];
         $emailsToSend  = $hasFailures ? $errorEmails : $successEmails;
+
+        $emailsToSend = array_values(array_unique($emailsToSend));
 
         if (empty($emailsToSend)) {
             $this->log("  No notification emails configured for clinical");
@@ -1944,7 +1874,6 @@ class ClinicalPipeline
         }
         $body .= "\n";
 
-        // EviData section (only when the gate ran)
         if (($s['evidata_files_checked'] ?? 0) > 0) {
             $body .= "EviData Pre-flight:\n";
             $body .= "  Files checked: {$s['evidata_files_checked']}, "
@@ -1956,7 +1885,6 @@ class ClinicalPipeline
             $body .= "\n";
         }
 
-        // Instrument Installation
         $body .= "Instrument Installation:\n";
 
         $installByStatus = ['installed' => [], 'exists' => [], 'failed' => [], 'dry_run' => []];
@@ -1992,7 +1920,6 @@ class ClinicalPipeline
 
         $body .= "\n";
 
-        // Data Ingestion
         $body .= "Data Ingestion:\n";
 
         $firstUpload = $reingested = $failed = $skipped = [];
@@ -2055,7 +1982,6 @@ class ClinicalPipeline
 
         $body .= "\n";
 
-        // Totals
         $body .= str_repeat('-', 50) . "\n";
         $body .= "Totals:\n";
         $body .= "  DD files: {$s['dd_files_found']} found, {$s['dd_installed']} installed, "
@@ -2072,7 +1998,6 @@ class ClinicalPipeline
 
         $body .= "\n";
 
-        // Candidates breakdown
         $nc = $this->computeNewCandidates();
         if (!empty($nc['total_candids'])) {
             $body .= "Candidates:\n";
@@ -2088,7 +2013,6 @@ class ClinicalPipeline
             $body .= "\n";
         }
 
-        // Status message
         if ($hasFailures) {
             $body .= "⚠ Some instruments failed to install or ingest.\n";
             $body .= "Check logs for details.\n";
@@ -2100,7 +2024,6 @@ class ClinicalPipeline
             $body .= "✔ Ingestion completed. No data files to process.\n";
         }
 
-        // Log paths
         $body .= "\n";
         if ($this->runLogPath) {
             $body .= "Run log: {$this->runLogPath}\n";
@@ -2109,16 +2032,8 @@ class ClinicalPipeline
             $body .= "Error log: {$this->errorLogPath}\n";
         }
 
-        // Send
         $this->log("  Sending notification to: " . implode(', ', $emailsToSend));
 
-        // In dry-run mode, log what WOULD be sent and bail. Subject is
-        // enough to confirm "right project, right outcome label" — the
-        // full body is already in the run log via the earlier $this->log()
-        // calls that built up the summary. Mount-failure alerts (from
-        // MountHealthCheck) are NOT suppressed in dry-run, because those
-        // are infrastructure alerts that go to the tech team regardless
-        // of pipeline mode.
         if ($this->dryRun) {
             $this->log("  [no email sent — dry run]");
             $this->log("  Subject would be: {$subject}");
@@ -2155,7 +2070,7 @@ class ClinicalPipeline
     {
         $count = 0;
         $fh    = fopen($file, 'r');
-        fgetcsv($fh); // skip header
+        fgetcsv($fh);
         while (fgetcsv($fh) !== false) {
             $count++;
         }
@@ -2252,13 +2167,6 @@ class ClinicalPipeline
 
     // ══════════════════════════════════════════════════════════════════
     //  Project discovery
-    //
-    //  Walks the configured collections, reads each project.json,
-    //  returns a list of project descriptors. Mount-checks every
-    //  collection's base_path FIRST so a hung NFS mount can't wedge
-    //  the discovery phase — without this, file_exists() on the
-    //  project.json hangs uninterruptibly when the mount is dead,
-    //  before processProject() (and its own mount check) ever runs.
     // ══════════════════════════════════════════════════════════════════
 
     private function discoverProjects(array $filters): array
@@ -2273,10 +2181,6 @@ class ClinicalPipeline
                 continue;
             }
 
-            // Mount-check the collection's base_path BEFORE any
-            // filesystem call against its children. If the mount is
-            // hung, guardOrReport() logs + emails + dedups, and we
-            // skip the entire collection.
             if (!MountHealthCheck::guardOrReport(
                 $coll['base_path'],
                 $this->config,

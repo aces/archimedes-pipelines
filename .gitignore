@@ -2,5 +2,6 @@
 /logs/*.log
 composer.lock
 config/loris_client_config.json
-.env
+config/evidata_config.json
+*.env
 .DS_Store

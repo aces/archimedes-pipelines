@@ -10,6 +10,61 @@ require __DIR__ . '/../vendor/autoload.php';
 
 use LORIS\Pipelines\ClinicalPipeline;
 
+// ── Auto-load EviData credentials from the env file ─────────────────
+// EviDataClient reads EVIDATA_CLIENT_SECRET / EVIDATA_USERNAME /
+// EVIDATA_PASSWORD via getenv(). Rather than relying on a human (or
+// cron) remembering to `source` the env file, load it here so a
+// forgotten `source` can't cause a confusing mid-run auth failure.
+//
+// Path resolution order (most specific wins):
+//   1. EVIDATA_ENV_FILE environment variable
+//   2. "env_file" key in config/evidata_config.json
+//   3. hardcoded default
+//
+// SECURITY: the env file holds secrets and must stay chmod 600 and
+// gitignored. Only the PATH is in config/code — never the values.
+// Real environment variables always win (the file never overrides
+// them), so an explicit `source` or cron-set var still takes
+// precedence.
+(function (): void {
+    $path = getenv('EVIDATA_ENV_FILE') ?: null;
+
+    // Fall back to the env_file key in evidata_config.json.
+    if ($path === null) {
+        $cfgFile = __DIR__ . '/../config/evidata_config.json';
+        if (is_readable($cfgFile)) {
+            $cfg  = json_decode(file_get_contents($cfgFile), true);
+            $path = (is_array($cfg) && !empty($cfg['env_file']))
+                ? $cfg['env_file']
+                : null;
+        }
+    }
+
+    // Final fallback.
+    $path = $path ?: '/home/lorisadmin/evidata/evidata.env';
+
+    if (!is_readable($path)) {
+        return;   // no env file — fall back to whatever is in the shell env
+    }
+
+    foreach (file($path, FILE_IGNORE_NEW_LINES | FILE_SKIP_EMPTY_LINES) as $line) {
+        $line = trim($line);
+        if ($line === '' || $line[0] === '#') {
+            continue;                       // skip blanks and comments
+        }
+        $line = preg_replace('/^export\s+/', '', $line);   // allow `export KEY=val`
+        if (!str_contains($line, '=')) {
+            continue;
+        }
+        [$k, $v] = explode('=', $line, 2);
+        $k = trim($k);
+        $v = trim($v, " \t\n\r\0\x0B\"'");  // strip whitespace + surrounding quotes
+        if ($k !== '' && getenv($k) === false) {   // never override a real env var
+            putenv("{$k}={$v}");
+        }
+    }
+})();
+
 // Parse CLI options
 $opts = getopt('', ['collection::', 'project::', 'instrument::', 'all::', 'dry-run::', 'verbose::', 'force::', 'help::']);
 
@@ -53,6 +108,15 @@ EviData privacy gate:
 
   When the file is missing OR enabled=false, the gate is bypassed silently
   and the pipeline behaves exactly as it did before EviData was added.
+
+  EviData credentials (client secret / username / password) are read from
+  environment variables. This script auto-loads them from the EviData env
+  file so a forgotten `source` will not break a run. The env file path is
+  resolved in this order:
+    1. EVIDATA_ENV_FILE environment variable
+    2. "env_file" key in config/evidata_config.json
+    3. hardcoded default (/home/lorisadmin/evidata/evidata.env)
+  A real environment variable, if already set, always wins over the file.
 
   Test the connection independently with:
     php scripts/test_evidata_connection.php

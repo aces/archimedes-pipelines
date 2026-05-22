@@ -6,9 +6,9 @@ declare(strict_types=1);
  * EviData connection smoke test.
  *
  * Runs the full auth + API handshake without uploading any CSV or
- * generating a report. Useful after Andy provisions the VM and you've
- * updated config/evidata_config.json + env vars — confirms each leg
- * of the connection independently so a failure points at exactly
+ * generating a report. Useful after the EviData VM is provisioned and
+ * you've updated config/evidata_config.json + env vars — confirms each
+ * leg of the connection independently so a failure points at exactly
  * which piece is wrong.
  *
  * Reads ONLY config/evidata_config.json. The LORIS API config in
@@ -18,11 +18,20 @@ declare(strict_types=1);
  * Tests, in order:
  *   1. Config loaded and required fields present
  *   2. Required env vars are set
- *   3. TCP reachability to api_base_url   (port 8000)
- *   4. TCP reachability to token_url       (port 3000)
+ *   3. TCP reachability to api_base_url host
+ *   4. TCP reachability to token_url host
  *   5. /api/health endpoint responds       (no auth)
- *   6. Keycloak token endpoint issues a bearer token
- *   7. /api/auth/me works with that token  (auth round-trip)
+ *   6. Keycloak token endpoint issues a bearer token (with openid scope)
+ *   7. /api/datasets works with that token  (authenticated round-trip)
+ *
+ * Note on the token scope: the EviData API rejects bearer tokens
+ * issued without the 'openid' scope (HTTP 401 "Failed to authenticate
+ * user"), even though Keycloak itself returns the token with HTTP 200.
+ * Both this script and EviDataClient request 'openid profile email'.
+ *
+ * Credentials: this script auto-loads the EviData env file (same as
+ * run_clinical_pipeline.php) so a forgotten `source` will not cause a
+ * spurious failure. Real environment variables, if already set, win.
  *
  * Usage:
  *   php scripts/test_evidata_connection.php
@@ -43,10 +52,58 @@ foreach ($argv as $i => $arg) {
     }
 }
 
+// ── Auto-load EviData credentials from the env file ─────────────────
+// Path resolution order (most specific wins):
+//   1. EVIDATA_ENV_FILE environment variable
+//   2. "env_file" key in the evidata config file ($configPath)
+//   3. hardcoded default
+// SECURITY: the env file holds secrets and must stay chmod 600 and
+// gitignored. Only the PATH is in config/code. Real env vars always
+// win — the file never overrides an already-set variable.
+$evidataEnvFile = (function (string $configPath): string {
+    $path = getenv('EVIDATA_ENV_FILE') ?: null;
+
+    if ($path === null && is_readable($configPath)) {
+        $cfg  = json_decode(file_get_contents($configPath), true);
+        $path = (is_array($cfg) && !empty($cfg['env_file']))
+            ? $cfg['env_file']
+            : null;
+    }
+
+    $path = $path ?: '/home/lorisadmin/evidata/evidata.env';
+
+    if (is_readable($path)) {
+        foreach (file($path, FILE_IGNORE_NEW_LINES | FILE_SKIP_EMPTY_LINES) as $line) {
+            $line = trim($line);
+            if ($line === '' || $line[0] === '#') {
+                continue;
+            }
+            $line = preg_replace('/^export\s+/', '', $line);
+            if (!str_contains($line, '=')) {
+                continue;
+            }
+            [$k, $v] = explode('=', $line, 2);
+            $k = trim($k);
+            $v = trim($v, " \t\n\r\0\x0B\"'");
+            if ($k !== '' && getenv($k) === false) {
+                putenv("{$k}={$v}");
+            }
+        }
+    }
+
+    return $path;
+})($configPath);
+
+// OAuth2 scope requested in the token grant. Must include 'openid' —
+// see the note in the file header. Overridable via the optional
+// 'scope' key in evidata_config.json.
+$defaultScope = 'openid profile email';
+
 echo "── EviData connection test ──\n";
 echo "Time         : " . date('Y-m-d H:i:s T') . "\n";
 echo "Host         : " . gethostname() . "\n";
 echo "Config file  : {$configPath}\n";
+echo "Env file     : " . (is_readable($evidataEnvFile) ? $evidataEnvFile : "(not found — using shell env)") . "\n";
 echo str_repeat('─', 64) . "\n";
 
 $passCount = 0;
@@ -99,10 +156,13 @@ if (!empty($missing)) {
 }
 $check('required config keys present', true);
 
+$scope = $evi['scope'] ?? $defaultScope;
+
 echo "     api_base_url : {$evi['api_base_url']}\n";
 echo "     token_url    : {$evi['token_url']}\n";
 echo "     client_id    : {$evi['client_id']}\n";
 echo "     qis          : [" . implode(', ', $evi['qis']) . "]\n";
+echo "     scope        : {$scope}\n";
 
 // ── Test 2: env vars ─────────────────────────────────────────────────
 echo "\n[2] Environment variables\n";
@@ -116,14 +176,15 @@ $user   = getenv($userEnv);
 $pass   = getenv($passEnv);
 
 $check("{$secretEnv} is set", !empty($secret),
-    !empty($secret) ? "len=" . strlen($secret) : "missing — `export {$secretEnv}=...`");
+    !empty($secret) ? "len=" . strlen($secret) : "missing — set it in {$evidataEnvFile} or `export {$secretEnv}=...`");
 $check("{$userEnv} is set",   !empty($user),
-    !empty($user)   ? "value={$user}"          : "missing — `export {$userEnv}=...`");
+    !empty($user)   ? "value={$user}"          : "missing — set it in {$evidataEnvFile} or `export {$userEnv}=...`");
 $check("{$passEnv} is set",   !empty($pass),
-    !empty($pass)   ? "len=" . strlen($pass)   : "missing — `export {$passEnv}=...`");
+    !empty($pass)   ? "len=" . strlen($pass)   : "missing — set it in {$evidataEnvFile} or `export {$passEnv}=...`");
 
 if (empty($secret) || empty($user) || empty($pass)) {
-    echo "\nCannot continue without credentials. Set the missing env vars and re-run.\n";
+    echo "\nCannot continue without credentials. Set the missing values in\n";
+    echo "{$evidataEnvFile} (or export them) and re-run.\n";
     exit(1);
 }
 
@@ -214,6 +275,9 @@ curl_setopt_array($ch, [
         'client_secret' => $secret,
         'username'      => $user,
         'password'      => $pass,
+        // Required: without the openid scope the issued token is
+        // rejected by the EviData API with HTTP 401.
+        'scope'         => $scope,
     ]),
     CURLOPT_HTTPHEADER     => ['Content-Type: application/x-www-form-urlencoded'],
     CURLOPT_TIMEOUT        => 30,
@@ -232,7 +296,7 @@ if ($tokCode !== 200) {
     $excerpt = strlen($tokBody) > 300 ? substr($tokBody, 0, 300) . '…' : $tokBody;
     $check('token request HTTP 200', false, "HTTP {$tokCode}: {$excerpt}");
     echo "\nCommon causes:\n";
-    echo "  - Wrong client_secret (check APP_KEYCLOAK_CLIENT_SECRET on EviData server)\n";
+    echo "  - Wrong client_secret (check APP_API_CLIENT_ID_SECRET on EviData server)\n";
     echo "  - Wrong username/password\n";
     echo "  - User not yet created in Keycloak (ask Jefferson to add you)\n";
     echo "  - client_id mismatch (config says '{$evi['client_id']}')\n";
@@ -259,37 +323,44 @@ if (count($jwtParts) === 3) {
     if (is_array($payload)) {
         $exp = isset($payload['exp']) ? date('H:i:s', $payload['exp']) : '?';
         echo "     token user   : " . ($payload['preferred_username'] ?? '?') . "\n";
+        echo "     token scope  : " . ($payload['scope'] ?? '?') . "\n";
         echo "     token expires: {$exp}\n";
     }
 }
 
-// ── Test 7: /api/auth/me (authenticated round-trip) ─────────────────
-echo "\n[6] /api/auth/me (authenticated)\n";
+// ── Test 7: /api/datasets (authenticated round-trip) ─────────────────
+// /api/datasets is a real programmatic endpoint that accepts the
+// bearer token — unlike /api/auth/me, which is a browser/cookie helper
+// and rejects bearer tokens. This is the honest "can I make an
+// authenticated API call" check.
+echo "\n[6] /api/datasets (authenticated)\n";
 
-$ch = curl_init("{$apiBase}/auth/me");
+$ch = curl_init("{$apiBase}/datasets");
 curl_setopt_array($ch, [
     CURLOPT_RETURNTRANSFER => true,
     CURLOPT_HTTPHEADER     => ["Authorization: Bearer {$token}"],
     CURLOPT_TIMEOUT        => 15,
 ]);
-$meBody = curl_exec($ch);
-$meCode = curl_getinfo($ch, CURLINFO_HTTP_CODE);
-$meErr  = curl_error($ch);
+$dsBody = curl_exec($ch);
+$dsCode = curl_getinfo($ch, CURLINFO_HTTP_CODE);
+$dsErr  = curl_error($ch);
 curl_close($ch);
 
-if ($meBody === false) {
-    $check('GET /api/auth/me responds', false, "cURL error: {$meErr}");
+if ($dsBody === false) {
+    $check('GET /api/datasets responds', false, "cURL error: {$dsErr}");
     exit(1);
 }
 
-$check('GET /api/auth/me HTTP 200', $meCode === 200, "HTTP {$meCode}");
-if ($meCode === 200) {
-    $me = json_decode($meBody, true);
-    if (is_array($me)) {
-        echo "     authenticated as : " . ($me['username']       ?? '?') . "\n";
-        echo "     email            : " . ($me['email']          ?? '?') . "\n";
-        echo "     email_verified   : " . (($me['email_verified'] ?? false) ? 'yes' : 'no') . "\n";
+$check('GET /api/datasets HTTP 200', $dsCode === 200, "HTTP {$dsCode}");
+if ($dsCode === 200) {
+    $ds = json_decode($dsBody, true);
+    if (is_array($ds)) {
+        $total = $ds['total'] ?? (isset($ds['datasets']) ? count($ds['datasets']) : '?');
+        echo "     datasets visible : {$total}\n";
     }
+} else {
+    $excerpt = strlen($dsBody) > 300 ? substr($dsBody, 0, 300) . '…' : $dsBody;
+    echo "     response: {$excerpt}\n";
 }
 
 // ── Summary ─────────────────────────────────────────────────────────
