@@ -21,11 +21,6 @@ use LORIS\Pipelines\ClinicalPipeline;
 //   2. "env_file" key in config/evidata_config.json
 //   3. hardcoded default
 //
-// SECURITY: the env file holds secrets and must stay chmod 600 and
-// gitignored. Only the PATH is in config/code — never the values.
-// Real environment variables always win (the file never overrides
-// them), so an explicit `source` or cron-set var still takes
-// precedence.
 (function (): void {
     $path = getenv('EVIDATA_ENV_FILE') ?: null;
 

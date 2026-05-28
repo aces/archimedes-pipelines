@@ -18,20 +18,25 @@ use Psr\Log\LoggerInterface;
  *   documentation/data_dictionary/. It only writes to its own
  *   subdirectories: processed/clinical/, logs/clinical/, logs/evidata/.
  *
- * EviData privacy pre-flight gate — TWO-LEVEL quasi-identifier (qis) model:
- *   QI lists are resolved from two levels because the ~100 projects that
- *   run this pipeline have project-specific QI policy:
- *     1. project.json -> evidata.qis  (per-project override; the project
- *        fully owns its QI policy when this is present).
- *     2. config/evidata_config.json -> qis  (global flat-array baseline,
- *        used only when a project does not define evidata.qis).
- *   Each level accepts a flat array OR a map ('_default' + per-filename).
- *   resolveQisForFile() does the lookup. A file the chosen config does
- *   not cover (no key, no '_default') fails loudly — never silently
- *   skipped. EviData's server-side QI validation is case-sensitive.
+ * EviData privacy pre-flight gate — quasi-identifier (qis) resolution:
+ *   QI lists are resolved with the following precedence:
+ *     1. project.json -> evidata.qis  (per-project override, non-empty;
+ *        the project fully owns its QI policy when present).
+ *     2. config/evidata_config.json -> qis  (global baseline, non-empty;
+ *        used only when a project does not define its own).
+ *     3. ALL-HEADERS DEFAULT (privacy-policy approved): when qis is
+ *        empty/absent at BOTH levels, every CSV column header is used as
+ *        a QI, per file, MINUS:
+ *          - columns listed in evidata.exclude_qis (two-level,
+ *            case-insensitive), and
+ *          - columns whose every value is unique-per-row (identifiers /
+ *            pseudonyms / timestamps), removed automatically because
+ *            EviData treats them as QIs and they force maximum risk.
+ *   Levels 1 and 2 each accept a flat array OR a map ('_default' +
+ *   per-filename). EviData's server-side QI validation is case-sensitive.
+ *   The per-file log records which columns were used and which excluded.
  *
- * Reingestion tracking, date normalization, logging: unchanged — see
- * the per-method docblocks below.
+ * Reingestion tracking, date normalization, logging: see per-method docs.
  */
 class ClinicalPipeline
 {
@@ -61,6 +66,14 @@ class ClinicalPipeline
 
     private ?string $evidataLogDir = null;
     private bool $evidataNotificationSent = false;
+
+    /**
+     * Basenames of files that did NOT pass EviData this project (failed
+     * verdict or errored). Populated by runEvidataPreflight(); consumed
+     * by uploadFromDirectory() to skip them. Passed files ingest; these
+     * are skipped and retried next run.
+     */
+    private array $evidataFailedFiles = [];
 
     private array $installResults = [];
     private array $dataResults = [];
@@ -175,7 +188,9 @@ class ClinicalPipeline
             $this->writeFinalSummary();
             $this->closeAllLogs();
 
-            return ($this->stats['data_failed'] > 0 || $this->stats['dd_failed'] > 0) ? 1 : 0;
+            return ($this->stats['data_failed'] > 0
+                || $this->stats['dd_failed'] > 0
+                || ($this->stats['evidata_files_failed'] ?? 0) > 0) ? 1 : 0;
 
         } catch (\Exception $e) {
             $this->writeError("FATAL", $e->getMessage());
@@ -218,23 +233,31 @@ class ClinicalPipeline
         $this->dataResults             = [];
         $this->evidataLogDir           = null;
         $this->evidataNotificationSent = false;
+        $this->evidataFailedFiles      = [];
 
+        // Per-file privacy gate: each file is checked individually.
+        // Files that pass are ingested; files that fail (bad verdict)
+        // or error (no verdict) are skipped and retried next run. The
+        // project is NOT aborted as a whole — passing files proceed.
         $evidataOutcome = $this->runEvidataPreflight($project, $mountPath, $dataDir);
 
-        if ($evidataOutcome === 'failed') {
+        if ($evidataOutcome === 'all_passed') {
             $this->log("");
-            $this->log("!! EviData check FAILED — clinical ingestion ABORTED for {$name}");
-            $this->log("!! No DD install, no data upload, no tracking update");
-            $this->stats['data_failed']++;
-            $this->closeAllLogs();
-            return;
+            $this->log("✓ EviData check PASSED for all files — proceeding with ingestion");
+            $this->log("");
+        } elseif ($evidataOutcome === 'partial') {
+            $this->log("");
+            $this->log("⚠ EviData: some files failed — ingesting only the files that passed");
+            $this->log("  Skipped (failed/errored EviData): "
+                . implode(', ', $this->evidataFailedFiles));
+            $this->log("");
+        } elseif ($evidataOutcome === 'all_failed') {
+            $this->log("");
+            $this->log("✗ EviData: all files failed — nothing will be ingested");
+            $this->log("");
         }
-
-        if ($evidataOutcome === 'passed') {
-            $this->log("");
-            $this->log("✓ EviData check PASSED — proceeding with ingestion");
-            $this->log("");
-        }
+        // 'skipped' (gate disabled / no files) falls through to normal
+        // ingestion with no EviData restriction.
 
         $this->loadExistingCandidatesForProject();
         $this->loadTrackingFile($project);
@@ -279,8 +302,15 @@ class ClinicalPipeline
     // ══════════════════════════════════════════════════════════════════
 
     /**
-     * Run the EviData pre-flight against every CSV/TSV in $clinicalDir.
-     * Returns 'skipped' | 'passed' | 'failed'.
+     * Run the EviData pre-flight against every CSV/TSV in $clinicalDir,
+     * PER FILE. Records the basenames that did NOT pass in
+     * $this->evidataFailedFiles so ingestion can skip them.
+     *
+     * Returns one of:
+     *   'skipped'    — gate disabled / no clinical dir / no CSV files
+     *   'all_passed' — every file passed
+     *   'partial'    — some passed, some failed/errored
+     *   'all_failed' — no file passed
      */
     private function runEvidataPreflight(array $project, string $mountPath, string $clinicalDir): string
     {
@@ -311,11 +341,14 @@ class ClinicalPipeline
         $this->log("  Checking " . count($csvFiles) . " file(s) against EviData");
         $this->log("  API endpoint: {$evi['api_base_url']}");
 
-        // ── Choose the QI source for this project (project override
-        //    or global fallback), and validate its shape. ─────────────
+        // ── Choose the QI source for this project ───────────────────
+        // Returns a config (array) for explicit qis, or null to signal
+        // ALL-HEADERS mode (no qis defined at project or global level).
         try {
             [$qisConfig, $qisSource] = $this->resolveProjectQisConfig($project, $evi);
         } catch (\RuntimeException $e) {
+            // QI policy is broken for the whole project — no file can be
+            // assessed, so every file fails (nothing ingests).
             $this->log("  !! EviData QI config error: " . $e->getMessage());
             $this->writeError('evidata', "QI config error: " . $e->getMessage());
             $this->openEvidataLogDir($mountPath);
@@ -326,35 +359,56 @@ class ClinicalPipeline
                 'results'    => null,
                 'report_zip' => null,
             ];
+            foreach ($csvFiles as $p) {
+                $this->evidataFailedFiles[] = basename($p);
+            }
             $this->writeEvidataRunSummary($project, false);
             $this->sendEvidataFailureNotification(
                 $project,
                 "EviData QI configuration error — preflight could not run:\n" . $e->getMessage()
             );
-            return 'failed';
+            return 'all_failed';
         }
         $this->log("  QI policy source: {$qisSource}");
 
         $artifactDir = $this->openEvidataLogDir($mountPath);
-        $this->log("  Artifact dir: {$artifactDir}");
+        $this->log("  Log dir: {$artifactDir}");
 
         // ── Resolve the QI list per file up front ───────────────────
+        // In all-headers mode ($qisConfig === null) each file's headers
+        // are read and pruned; otherwise the explicit config is used.
+        $excludeSet   = $this->resolveExcludeQis($project, $evi);
         $qisByPath    = [];
         $qiResolveErr = [];
         foreach ($csvFiles as $path) {
             try {
-                $qisByPath[$path] = $this->resolveQisForFile($qisConfig, basename($path));
+                if ($qisConfig === null) {
+                    // ALL-HEADERS mode (privacy-policy approved default)
+                    $qisByPath[$path] = $this->resolveAllHeaderQis(
+                        $path, $excludeSet, basename($path)
+                    );
+                } else {
+                    $qisByPath[$path] = $this->resolveQisForFile(
+                        $qisConfig, basename($path)
+                    );
+                }
             } catch (\RuntimeException $e) {
                 $qiResolveErr[basename($path)] = $e->getMessage();
             }
         }
 
         // ── Local QI presence check (no network) ────────────────────
+        // In all-headers mode the QIs ARE the file's headers, so the
+        // check trivially passes; it still catches unreadable files.
         $qiErrors = $this->validateEvidataQiHeaders($qisByPath);
         foreach ($qiResolveErr as $name => $msg) {
             $qiErrors[$name] = ['__resolve_error__' => $msg];
         }
 
+        // Files that failed LOCAL QI validation (unreadable, missing
+        // configured QI columns, or resolve error) are recorded as
+        // failed now and removed from the remote check. Files that
+        // passed local validation still go on to EviData.
         if (!empty($qiErrors)) {
             foreach ($qiErrors as $name => $missing) {
                 $this->stats['evidata_files_checked']++;
@@ -377,13 +431,28 @@ class ClinicalPipeline
                     'report_zip' => null,
                 ];
                 $this->stats['evidata_results'][$name] = $result;
+                $this->evidataFailedFiles[] = $name;   // skip in ingestion
                 $this->log("  ✗ {$name} — {$errMsg}");
                 $this->writeError('evidata', "{$name}: {$errMsg}");
                 $this->persistEvidataArtifacts($name, $result);
+
+                // Drop this file from the remote-check set by basename.
+                foreach (array_keys($qisByPath) as $p) {
+                    if (basename($p) === $name) {
+                        unset($qisByPath[$p]);
+                    }
+                }
             }
+        }
+
+        // If local validation knocked out every file, there is nothing
+        // to send remotely — all files failed.
+        if (empty($qisByPath)) {
             $this->writeEvidataRunSummary($project, false);
             $this->sendEvidataFailureNotification($project);
-            return 'failed';
+            $this->log("");
+            $this->log("  ✗ EviData: no files passed local QI validation — none ingested");
+            return 'all_failed';
         }
 
         // ── Remote check via EviData API ────────────────────────────
@@ -391,6 +460,8 @@ class ClinicalPipeline
             $client  = new EviDataClient($evi);
             $results = $client->checkBatch($qisByPath);
         } catch (\Throwable $e) {
+            // Client setup failed before any remote check — the files
+            // that reached this stage cannot be verified, so they fail.
             $this->log("  !! EviData client setup error: " . $e->getMessage());
             $this->writeError('evidata', "Client setup error: " . $e->getMessage());
             $this->stats['evidata_results']['__client_error__'] = [
@@ -400,16 +471,20 @@ class ClinicalPipeline
                 'results'    => null,
                 'report_zip' => null,
             ];
+            foreach (array_keys($qisByPath) as $p) {
+                $this->evidataFailedFiles[] = basename($p);
+            }
             $this->writeEvidataRunSummary($project, false);
             $this->sendEvidataFailureNotification(
                 $project,
                 "EviData client error before any file could be checked:\n" . $e->getMessage()
             );
-            return 'failed';
+            return $this->evidataOutcomeFromCounts();
         }
 
         // ── Process each file's result, persist artifacts ───────────
-        $allPassed = true;
+        // A file is INGESTED only if overall_passed=true. A false
+        // verdict OR an error (no verdict) marks it failed -> skipped.
         foreach ($results as $name => $r) {
             $this->stats['evidata_files_checked']++;
             if ($r['passed']) {
@@ -417,7 +492,7 @@ class ClinicalPipeline
                 $this->log("  ✓ {$name} (report_id={$r['report_id']})");
             } else {
                 $this->stats['evidata_files_failed']++;
-                $allPassed = false;
+                $this->evidataFailedFiles[] = $name;   // skip in ingestion
                 $detail = $r['error'] !== null
                     ? "ERROR: {$r['error']}"
                     : "overall_passed=false (report_id={$r['report_id']})";
@@ -432,28 +507,51 @@ class ClinicalPipeline
             }
         }
 
+        $this->evidataFailedFiles = array_values(array_unique($this->evidataFailedFiles));
+        $allPassed = empty($this->evidataFailedFiles);
         $this->writeEvidataRunSummary($project, $allPassed);
 
         if (!$allPassed) {
             $this->log("");
-            $this->log("  !! EviData pre-flight FAILED "
-                . "({$this->stats['evidata_files_failed']} of "
-                . "{$this->stats['evidata_files_checked']} file(s))");
-            $this->log("  !! Artifacts: {$this->evidataLogDir}");
+            $this->log("  ⚠ EviData pre-flight: "
+                . "{$this->stats['evidata_files_failed']} of "
+                . "{$this->stats['evidata_files_checked']} file(s) failed/errored "
+                . "— those files will be skipped, passing files will ingest");
+            $this->log("  Artifacts: {$this->evidataLogDir}");
             $this->sendEvidataFailureNotification($project);
-            return 'failed';
+            return $this->evidataOutcomeFromCounts();
         }
 
         $this->log("  ✓ All " . count($csvFiles) . " file(s) passed EviData");
         $this->log("  ✓ Audit artifacts: {$this->evidataLogDir}");
-        return 'passed';
+        return 'all_passed';
     }
 
     /**
-     * Resolve the global EviData service config (merged into
-     * $config['evidata'] by the runner). Returns null when disabled.
-     * Throws if enabled but the GLOBAL 'qis' baseline is missing or
-     * structurally invalid.
+     * Map the per-file pass/fail tallies to an outcome label:
+     *   'all_passed' | 'partial' | 'all_failed'.
+     * Used after the remote check to tell processProject() and the
+     * notification heading what happened.
+     */
+    private function evidataOutcomeFromCounts(): string
+    {
+        $passed = $this->stats['evidata_files_passed'] ?? 0;
+        $failed = $this->stats['evidata_files_failed'] ?? 0;
+
+        if ($failed === 0) {
+            return 'all_passed';
+        }
+        if ($passed === 0) {
+            return 'all_failed';
+        }
+        return 'partial';
+    }
+
+    /**
+     * Resolve the global EviData service config. Returns null when
+     * disabled. A non-empty global qis is validated; an empty/absent
+     * qis is allowed and signals (with an empty/absent project qis)
+     * the all-headers default.
      */
     private function resolveEvidataConfig(): ?array
     {
@@ -464,16 +562,9 @@ class ClinicalPipeline
         }
 
         $qis = $evi['qis'] ?? null;
-        if ($qis === null) {
-            throw new \RuntimeException(
-                "evidata.qis missing from config/evidata_config.json — "
-                . "supply a global baseline QI list (a flat array, or a map "
-                . "with a '" . self::QIS_DEFAULT_KEY . "' key). Per-project "
-                . "overrides go in each project.json under evidata.qis. "
-                . "Or set evidata.enabled=false."
-            );
+        if ($qis !== null && $qis !== []) {
+            $this->validateQisShape($qis, 'evidata_config.json -> qis');
         }
-        $this->validateQisShape($qis, 'evidata_config.json -> qis');
 
         return $evi;
     }
@@ -481,29 +572,178 @@ class ClinicalPipeline
     /**
      * Decide which QI configuration applies to one project.
      *
-     * If project.json defines evidata.qis, the project OWNS its QI
-     * policy and the global is ignored for it. Otherwise the global
-     * evidata.qis baseline is used.
+     *   project.json evidata.qis (non-empty) -> per-project override
+     *   else global evidata.qis (non-empty)  -> global baseline
+     *   else                                 -> ALL-HEADERS mode (null)
      *
-     * @return array{0: array, 1: string} [qisConfig, sourceLabel]
-     * @throws \RuntimeException if project.json's evidata.qis is malformed.
+     * @return array{0: array|null, 1: string} [qisConfig|null, sourceLabel]
+     *         A null config signals all-headers mode to the caller.
+     * @throws \RuntimeException if a defined qis is structurally invalid.
      */
     private function resolveProjectQisConfig(array $project, array $evi): array
     {
         $projectQis = $project['evidata']['qis'] ?? null;
-
-        if ($projectQis !== null) {
+        if ($projectQis !== null && $projectQis !== []) {
             $this->validateQisShape($projectQis, 'project.json -> evidata.qis');
             return [$projectQis, 'project.json (per-project override)'];
         }
 
-        return [$evi['qis'], 'evidata_config.json (global default)'];
+        $globalQis = $evi['qis'] ?? null;
+        if ($globalQis !== null && $globalQis !== []) {
+            return [$globalQis, 'evidata_config.json (global default)'];
+        }
+
+        // Privacy-policy approved default: no qis defined anywhere ->
+        // use every CSV header as a QI, minus exclude_qis and minus
+        // unique-per-row identifier columns.
+        return [null, 'ALL HEADERS (no qis defined)'];
     }
 
     /**
-     * Validate that a qis value is well-formed: either a flat list of
-     * non-empty strings, or a map whose every value is a non-empty
-     * list of non-empty strings.
+     * Resolve the exclude_qis list (column names to drop in all-headers
+     * mode). Two-level like qis: project.json overrides global. Returned
+     * as a lowercased set for CASE-INSENSITIVE matching — exclusion is
+     * deliberately liberal.
+     *
+     * @return array<string,true>  lowercased-name => true
+     */
+    private function resolveExcludeQis(array $project, array $evi): array
+    {
+        $list = $project['evidata']['exclude_qis']
+            ?? $evi['exclude_qis']
+            ?? [];
+
+        $set = [];
+        foreach ((array)$list as $name) {
+            if (is_string($name) && $name !== '') {
+                $set[strtolower(trim($name))] = true;
+            }
+        }
+        return $set;
+    }
+
+    /**
+     * Resolve QIs for ONE file in ALL-HEADERS mode: every column header,
+     * minus the configured exclude_qis, minus unique-per-row columns
+     * (identifiers / pseudonyms / timestamps). EviData's own report
+     * recommends unselecting unique-per-row columns, as they force
+     * maximum re-identification risk. Logs exactly what was used and
+     * excluded so every all-headers run is auditable.
+     *
+     * @param array<string,true> $excludeSet  lowercased exclude set.
+     * @return array  QI column names (original casing) to send.
+     * @throws \RuntimeException if unreadable or nothing remains.
+     */
+    private function resolveAllHeaderQis(string $path, array $excludeSet, string $basename): array
+    {
+        $delim   = str_ends_with(strtolower($path), '.tsv') ? "\t" : ',';
+        $fh      = @fopen($path, 'r');
+        if ($fh === false) {
+            throw new \RuntimeException("CSV unreadable: {$basename}");
+        }
+        $headers = fgetcsv($fh, 0, $delim);
+        fclose($fh);
+        if (!is_array($headers) || $headers === []) {
+            throw new \RuntimeException("CSV unreadable: {$basename}");
+        }
+        $headers = array_map(fn($h) => (string)$h, $headers);
+
+        $uniqueCols = $this->detectUniquePerRowColumns($path);
+
+        $kept = [];
+        $excludedByConfig = [];
+        $excludedAsUnique = [];
+        foreach ($headers as $h) {
+            $key = strtolower(trim($h));
+            if ($key === '') {
+                continue;
+            }
+            if (isset($excludeSet[$key])) {
+                $excludedByConfig[] = $h;
+            } elseif (isset($uniqueCols[$key])) {
+                $excludedAsUnique[] = $h;
+            } else {
+                $kept[] = $h;
+            }
+        }
+
+        $this->log(sprintf(
+            "    %s — ALL HEADERS: %d of %d columns used"
+            . " (excluded %d by config, %d unique-per-row)",
+            $basename, count($kept), count($headers),
+            count($excludedByConfig), count($excludedAsUnique)
+        ));
+        if ($excludedByConfig) {
+            $this->log("      excluded (config): " . implode(', ', $excludedByConfig));
+        }
+        if ($excludedAsUnique) {
+            $this->log("      excluded (unique-per-row): " . implode(', ', $excludedAsUnique));
+        }
+
+        if ($kept === []) {
+            throw new \RuntimeException(
+                "All headers excluded for {$basename} — nothing left to "
+                . "assess. Loosen exclude_qis or define an explicit qis list."
+            );
+        }
+        return array_values($kept);
+    }
+
+    /**
+     * Identify columns whose every populated value is distinct across
+     * all rows (unique-per-row) — almost always identifiers/pseudonyms/
+     * timestamps. Returns a lowercased set of such column names. Needs
+     * at least 2 rows for the notion to be meaningful.
+     *
+     * @return array<string,true>
+     */
+    private function detectUniquePerRowColumns(string $path): array
+    {
+        $delim = str_ends_with(strtolower($path), '.tsv') ? "\t" : ',';
+        $fh    = @fopen($path, 'r');
+        if ($fh === false) {
+            return [];
+        }
+        $headers = fgetcsv($fh, 0, $delim);
+        if (!is_array($headers)) {
+            fclose($fh);
+            return [];
+        }
+
+        $n        = count($headers);
+        $seen     = array_fill(0, $n, []);
+        $nonEmpty = array_fill(0, $n, 0);
+        $rowCount = 0;
+
+        while (($row = fgetcsv($fh, 0, $delim)) !== false) {
+            $rowCount++;
+            for ($i = 0; $i < $n; $i++) {
+                $v = isset($row[$i]) ? trim((string)$row[$i]) : '';
+                if ($v === '') {
+                    continue;
+                }
+                $nonEmpty[$i]++;
+                $seen[$i][$v] = true;
+            }
+        }
+        fclose($fh);
+
+        if ($rowCount < 2) {
+            return [];
+        }
+
+        $unique = [];
+        for ($i = 0; $i < $n; $i++) {
+            if ($nonEmpty[$i] === $rowCount && count($seen[$i]) === $rowCount) {
+                $unique[strtolower(trim((string)$headers[$i]))] = true;
+            }
+        }
+        return $unique;
+    }
+
+    /**
+     * Decide which QI configuration applies — see resolveProjectQisConfig.
+     * (Validation helper retained for both config levels.)
      *
      * @throws \RuntimeException on any structural problem.
      */
@@ -550,17 +790,16 @@ class ClinicalPipeline
     }
 
     /**
-     * Resolve the QI list for ONE file from the already-chosen
+     * Resolve the QI list for ONE file from an explicit (non-null)
      * project/global qis config.
      *
-     * Flat array  -> applies to every file.
-     * Map         -> exact-filename key wins; else '_default'; else
-     *                a hard error (no silent skip, no fallback to the
-     *                other config level — the chosen source is
-     *                authoritative).
+     * Flat array -> applies to every file.
+     * Map        -> exact-filename key wins; else '_default'; else a
+     *               hard error (no silent skip; the chosen source is
+     *               authoritative).
      *
-     * @throws \RuntimeException when a file matches no key and there
-     *         is no '_default'.
+     * @throws \RuntimeException when a file matches no key and there is
+     *         no '_default'.
      */
     private function resolveQisForFile(array $qisConfig, string $basename): array
     {
@@ -589,10 +828,9 @@ class ClinicalPipeline
 
     /**
      * Local pre-check: verify each file's resolved QI columns exist in
-     * that file's header row. Case-INSENSITIVE here (a courtesy for
-     * clear errors) — but EviData's server-side validation is
-     * case-sensitive, so config 'qis' values must still match each
-     * file's header casing exactly.
+     * that file's header row. Case-INSENSITIVE (courtesy). In all-headers
+     * mode the QIs are the headers, so this trivially passes; it still
+     * catches unreadable files.
      *
      * @param array<string, array<string>> $qisByPath  path => QI list.
      * @return array<string, array<string>>  {basename -> missing cols}.
@@ -684,6 +922,171 @@ class ClinicalPipeline
         return $written;
     }
 
+    /**
+     * Extract a named PDF entry from a file's report ZIP into the log
+     * dir and return its path, or null if the zip or entry is missing.
+     *
+     * Used to attach the human-readable summary PDF to the failure
+     * email instead of the whole (multi-MB) ZIP. EviData's report.zip
+     * bundles report.pdf (full report) and summary_letter.pdf (short
+     * summary); the summary is smaller and is what a reviewer reads
+     * first.
+     *
+     * @param string $stem      Sanitised file stem (matches the .report.zip).
+     * @param string $entryName Name of the PDF inside the zip.
+     * @param string $outSuffix Suffix for the extracted file (e.g. '_summary.pdf').
+     * @return ?string Absolute path to the extracted PDF, or null.
+     */
+    private function extractReportPdf(string $stem, string $entryName, string $outSuffix): ?string
+    {
+        if ($this->evidataLogDir === null) {
+            return null;
+        }
+        $zipPath = "{$this->evidataLogDir}/{$stem}.report.zip";
+        if (!is_file($zipPath)) {
+            return null;
+        }
+        $outPath = "{$this->evidataLogDir}/{$stem}{$outSuffix}";
+
+        $za = new \ZipArchive();
+        if ($za->open($zipPath) !== true) {
+            return null;
+        }
+        $bytes = $za->getFromName($entryName);
+        $za->close();
+
+        if ($bytes === false) {
+            return null;   // entry not present in this zip
+        }
+        if (file_put_contents($outPath, $bytes) === false) {
+            return null;
+        }
+        return $outPath;
+    }
+
+    /**
+     * Compress a PDF in place via Ghostscript, so EviData report
+     * attachments fit comfortably under the local MTA's size cap.
+     *
+     * EviData's PDFs ship with very high-DPI rasterised charts that
+     * make the raw file 4–5 MB each. /printer (300 DPI) typically
+     * yields ~90% reduction while keeping risk-distribution charts
+     * sharp enough for a privacy reviewer.
+     *
+     * Returns the path to the compressed file on success, or the
+     * ORIGINAL $srcPath on any failure — so missing/broken `gs`, a
+     * non-zero exit, or a zero-byte output never blocks the email.
+     * Pipeline degrades gracefully: emails get larger, not absent.
+     *
+     * @param string $srcPath  Input PDF on disk.
+     * @param string $dstPath  Output PDF path (created alongside).
+     * @param string $setting  Ghostscript -dPDFSETTINGS value
+     *                         ('/printer', '/ebook', '/screen').
+     * @return string  The path to use for the attachment.
+     */
+    private function compressPdf(string $srcPath, string $dstPath, string $setting): string
+    {
+        if (!is_file($srcPath)) {
+            return $srcPath;   // can't compress nothing
+        }
+
+        // Only allow known-safe setting tokens; never interpolate
+        // arbitrary strings into the shell.
+        $allowed = ['/printer', '/ebook', '/screen', '/prepress', '/default'];
+        if (!in_array($setting, $allowed, true)) {
+            $this->log("    compressPdf: invalid setting '{$setting}', "
+                . "using original (no compression)");
+            return $srcPath;
+        }
+
+        $cmd = sprintf(
+            'gs -sDEVICE=pdfwrite -dCompatibilityLevel=1.4 '
+            . '-dPDFSETTINGS=%s -dNOPAUSE -dQUIET -dBATCH '
+            . '-sOutputFile=%s %s 2>&1',
+            escapeshellarg($setting),
+            escapeshellarg($dstPath),
+            escapeshellarg($srcPath)
+        );
+
+        $output = [];
+        $rc     = 0;
+        exec($cmd, $output, $rc);
+
+        if ($rc !== 0 || !is_file($dstPath) || filesize($dstPath) < 1024) {
+            $msg = $rc !== 0
+                ? "gs exit={$rc}"
+                : (!is_file($dstPath) ? "no output" : "output too small");
+            $this->log("    compressPdf: {$msg}, falling back to original "
+                . basename($srcPath));
+            if (is_file($dstPath)) {
+                @unlink($dstPath);
+            }
+            return $srcPath;
+        }
+
+        $orig = filesize($srcPath);
+        $new  = filesize($dstPath);
+        $pct  = $orig > 0 ? round(100 * (1 - $new / $orig)) : 0;
+        $this->log(sprintf(
+            "    compressPdf: %s  %d KB -> %d KB (%d%% smaller, %s)",
+            basename($srcPath),
+            (int)round($orig / 1024),
+            (int)round($new / 1024),
+            $pct,
+            $setting
+        ));
+        return $dstPath;
+    }
+
+    /**
+     * Collect one named PDF (extracted from each failed file's report
+     * ZIP) into an attachment list, and return [attachments, totalBytes].
+     * Used by the tiered attachment ladder in the failure email:
+     * try full report.pdf first, then summary_letter.pdf.
+     *
+     * Each extracted PDF is compressed via Ghostscript (configurable
+     * setting, defaults to /printer) before being added as an
+     * attachment. Compression failure falls back to the uncompressed
+     * file silently.
+     *
+     * @param string $entryName  PDF name inside the zip (e.g. 'report.pdf').
+     * @param string $outSuffix  Extracted-file suffix (e.g. '_report.pdf').
+     * @param string $mailSuffix Suffix for the name shown in the email.
+     * @return array{0: array<array{path:string,name:string}>, 1: int}
+     */
+    private function collectEvidataPdfs(string $entryName, string $outSuffix, string $mailSuffix): array
+    {
+        $compressionSetting = $this->config['evidata']['pdf_compression']
+            ?? '/printer';
+
+        $attachments = [];
+        $totalBytes  = 0;
+        foreach (($this->stats['evidata_results'] ?? []) as $name => $r) {
+            if ($r['passed'] ?? false) {
+                continue;   // only failed files
+            }
+            $stem = pathinfo($name, PATHINFO_FILENAME);
+            $stem = preg_replace('/[^A-Za-z0-9._-]/', '_', $stem) ?: 'artifact';
+            $pdf  = $this->extractReportPdf($stem, $entryName, $outSuffix);
+            if ($pdf === null || !is_file($pdf)) {
+                continue;
+            }
+
+            // Compress (if enabled). The raw extracted PDF stays in the
+            // log dir untouched — only the emailed copy is compressed.
+            $attachPath = $pdf;
+            if ($compressionSetting !== null && $compressionSetting !== '') {
+                $base       = pathinfo($pdf, PATHINFO_FILENAME);
+                $compressed = dirname($pdf) . "/{$base}_compressed.pdf";
+                $attachPath = $this->compressPdf($pdf, $compressed, $compressionSetting);
+            }
+
+            $attachments[] = ['path' => $attachPath, 'name' => "{$stem}{$mailSuffix}"];
+            $totalBytes   += filesize($attachPath);
+        }
+        return [$attachments, $totalBytes];
+    }
+
     private function writeEvidataRunSummary(array $project, bool $allPassed): void
     {
         if ($this->evidataLogDir === null) {
@@ -744,39 +1147,57 @@ class ClinicalPipeline
 
         $attachments = [];
         $totalBytes  = 0;
+        $attachTier  = 'none';   // 'full' | 'summary' | 'none'
         if ($clientErrorOverride === null && $this->evidataLogDir !== null) {
-            foreach (($this->stats['evidata_results'] ?? []) as $name => $r) {
-                if ($r['passed'] ?? false) {
-                    continue;
-                }
-                $stem = pathinfo($name, PATHINFO_FILENAME);
-                $stem = preg_replace('/[^A-Za-z0-9._-]/', '_', $stem) ?: 'artifact';
-                $zip  = "{$this->evidataLogDir}/{$stem}.report.zip";
-                if (is_file($zip)) {
-                    $attachments[] = [
-                        'path' => $zip,
-                        'name' => "{$stem}_evidata_report.zip",
-                    ];
-                    $totalBytes += filesize($zip);
-                }
+            // Graceful fallback ladder for attachments. Email size
+            // limits apply to the WHOLE message, so we pick the richest
+            // tier whose TOTAL fits under the ceiling:
+            //   1. full report.pdf for every failed file, else
+            //   2. summary_letter.pdf for every failed file, else
+            //   3. nothing — tell the recipient to contact the team.
+            // EviData's report.zip bundles both report.pdf (full) and
+            // summary_letter.pdf (summary) per file.
+            [$fullAtt,    $fullBytes]    = $this->collectEvidataPdfs('report.pdf', '_report.pdf', '_evidata_report.pdf');
+            [$summaryAtt, $summaryBytes] = $this->collectEvidataPdfs('summary_letter.pdf', '_summary.pdf', '_evidata_summary.pdf');
+
+            if (!empty($fullAtt) && $fullBytes <= self::EVIDATA_MAX_ATTACH_BYTES) {
+                $attachments = $fullAtt;
+                $totalBytes  = $fullBytes;
+                $attachTier  = 'full';
+            } elseif (!empty($summaryAtt) && $summaryBytes <= self::EVIDATA_MAX_ATTACH_BYTES) {
+                $attachments = $summaryAtt;
+                $totalBytes  = $summaryBytes;
+                $attachTier  = 'summary';
+            } else {
+                $attachments = [];
+                $attachTier  = 'none';
             }
         }
 
-        if ($totalBytes > self::EVIDATA_MAX_ATTACH_BYTES) {
-            $mb = round($totalBytes / 1024 / 1024, 1);
-            $this->log("  EviData attachments total {$mb}MB — over "
-                . (self::EVIDATA_MAX_ATTACH_BYTES / 1024 / 1024)
-                . "MB ceiling, sending link-only email");
-            $body .= "\n\nReports too large to attach by email ({$mb}MB total).\n"
-                . "Find them on the pipeline host at:\n"
+        $ceilingMb = self::EVIDATA_MAX_ATTACH_BYTES / 1024 / 1024;
+        if ($attachTier === 'full') {
+            $this->log("  EviData attachments: full report PDF(s), "
+                . round($totalBytes / 1024 / 1024, 1) . "MB total");
+            $body .= "\n\nThe full privacy report PDF(s) for the failed file(s) are attached.\n"
+                . "All audit artifacts are also on the pipeline host at:\n"
                 . "  {$this->evidataLogDir}\n";
-            $attachments = [];
-        } elseif (!empty($attachments)) {
-            $body .= "\n\nReport ZIPs for failed files are attached.\n"
-                . "Full audit artifacts (including passing reports) at:\n"
+        } elseif ($attachTier === 'summary') {
+            $this->log("  EviData attachments: full reports over {$ceilingMb}MB — "
+                . "attaching summary PDF(s) instead, "
+                . round($totalBytes / 1024 / 1024, 1) . "MB total");
+            $body .= "\n\nThe full reports were too large to email, so the shorter\n"
+                . "summary report PDF(s) for the failed file(s) are attached instead.\n"
+                . "The full reports are on the pipeline host at:\n"
                 . "  {$this->evidataLogDir}\n";
-        } elseif ($this->evidataLogDir !== null) {
-            $body .= "\n\nAudit artifacts at:\n  {$this->evidataLogDir}\n";
+        } else {
+            // Tier 3: even summaries don't fit (or no PDFs found).
+            $this->log("  EviData attachments: reports exceed {$ceilingMb}MB even as "
+                . "summaries — sending contact-the-team email (no attachment)");
+            $body .= "\n\nThe privacy reports are too large to send by email.\n"
+                . "Please contact the ARCHIMEDES team to obtain the report(s) for\n"
+                . "the failed file(s). For reference, they are stored on the\n"
+                . "pipeline host at:\n"
+                . "  {$this->evidataLogDir}\n";
         }
 
         if ($this->dryRun) {
@@ -879,14 +1300,30 @@ class ClinicalPipeline
         string $projectName,
         ?string $clientErrorOverride
     ): string {
-        $body  = "EviData privacy pre-flight check failed for clinical ingestion.\n";
+        // Per-file gate: files that did not pass EviData are SKIPPED
+        // (not ingested) and retried next run; files that passed are
+        // still ingested. No whole-project abort.
+        $failedCount  = $this->stats['evidata_files_failed']  ?? 0;
+        $passedCount  = $this->stats['evidata_files_passed']  ?? 0;
+        $checkedCount = $this->stats['evidata_files_checked'] ?? 0;
+
+        $body  = "EviData privacy pre-flight: one or more files did not pass.\n";
         $body .= "Project   : {$projectName}\n";
         $body .= "Run       : {$this->runTimestamp}"
             . ($this->dryRun ? " (DRY RUN)" : "") . "\n";
         $body .= "Timestamp : " . date('Y-m-d H:i:s') . "\n";
-        $body .= "Status    : " . ($this->dryRun
-                ? "PREVIEW — no LORIS writes attempted (dry run)"
-                : "INGESTION ABORTED — no records written to LORIS") . "\n\n";
+
+        if ($this->dryRun) {
+            $body .= "Status    : PREVIEW — no LORIS writes attempted (dry run)\n\n";
+        } else {
+            $body .= "Status    : The file(s) listed below were NOT ingested.\n";
+            $body .= "            They will be retried on the next pipeline run.\n";
+            if ($checkedCount > 0) {
+                $body .= "            Outcome: {$passedCount} passed, {$failedCount} failed/errored"
+                    . " (of {$checkedCount} checked).\n";
+            }
+            $body .= "\n";
+        }
 
         if ($clientErrorOverride !== null) {
             $body .= "Client error:\n{$clientErrorOverride}\n\n";
@@ -902,15 +1339,25 @@ class ClinicalPipeline
             }
         }
 
+        // Show every file's outcome, but lead with the failures since
+        // this is the privacy email.
         $body .= "Per-file results:\n" . str_repeat('-', 50) . "\n";
-        foreach (($this->stats['evidata_results'] ?? []) as $name => $r) {
+        $allResults = $this->stats['evidata_results'] ?? [];
+        // Failures first, then any passers (for context).
+        uksort($allResults, function ($a, $b) use ($allResults) {
+            $pa = $allResults[$a]['passed'] ?? false;
+            $pb = $allResults[$b]['passed'] ?? false;
+            if ($pa === $pb) return strcmp($a, $b);
+            return $pa ? 1 : -1;
+        });
+        foreach ($allResults as $name => $r) {
             $mark = $r['passed'] ? '✔' : '✗';
             if ($r['passed']) {
-                $detail = "(report_id={$r['report_id']})";
+                $detail = "passed (report_id={$r['report_id']}) — ingested";
             } elseif ($r['error'] !== null) {
-                $detail = "ERROR: {$r['error']}";
+                $detail = "ERROR: {$r['error']} — NOT ingested";
             } else {
-                $detail = "overall_passed=false (report_id={$r['report_id']})";
+                $detail = "overall_passed=false (report_id={$r['report_id']}) — NOT ingested";
             }
             $body .= "  {$mark} {$name}  {$detail}\n";
         }
@@ -926,9 +1373,10 @@ class ClinicalPipeline
     private function evidataActionFooter(bool $hasReport = true): string
     {
         if ($hasReport) {
-            return "Action required: review the failed report(s) in the EviData UI\n"
-                . "and re-export the dataset with adequate de-identification before\n"
-                . "re-running the clinical pipeline.\n";
+            return "Action required: review the failed report(s) for the file(s)\n"
+                . "listed above and re-export them with adequate de-identification.\n"
+                . "The next pipeline run will automatically re-check those files;\n"
+                . "files that pass on the next run will be ingested then.\n";
         }
 
         return "Action required: the failure occurred before an EviData report\n"
@@ -937,7 +1385,7 @@ class ClinicalPipeline
             . "cover the file, or the file was unreadable. Fix the CSV column\n"
             . "names, or correct the 'qis' list (project.json evidata.qis, or\n"
             . "the global config/evidata_config.json) to match the actual\n"
-            . "headers, then re-run the clinical pipeline.\n";
+            . "headers. The next pipeline run will re-check the file(s).\n";
     }
 
     // ══════════════════════════════════════════════════════════════════
@@ -1075,6 +1523,16 @@ class ClinicalPipeline
             if (in_array($filename, $excludeFiles, true)) {
                 $this->log("  [{$filename}] SKIPPED - excluded in project.json");
                 $this->dataResults[$filename] = ['status' => 'skipped', 'reason' => 'excluded'];
+                $this->stats['data_skipped']++;
+                continue;
+            }
+
+            // Per-file privacy gate: a file that did not pass EviData
+            // (failed verdict or errored — no verdict) is never ingested.
+            // It is skipped here and retried on the next run.
+            if (in_array($filename, $this->evidataFailedFiles, true)) {
+                $this->log("  [{$filename}] SKIPPED - did not pass EviData privacy check");
+                $this->dataResults[$filename] = ['status' => 'skipped', 'reason' => 'evidata failed'];
                 $this->stats['data_skipped']++;
                 continue;
             }
@@ -1437,10 +1895,16 @@ class ClinicalPipeline
         if ($this->trackingFilePath === null) {
             return;
         }
-        file_put_contents(
-            $this->trackingFilePath,
+        // Atomic write: temp + rename, so a crash or mount loss mid-write
+        // never leaves a half-written / corrupt tracking file.
+        $tmp = $this->trackingFilePath . '.tmp';
+        $ok  = file_put_contents(
+            $tmp,
             json_encode($this->trackingData, JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES)
         );
+        if ($ok !== false) {
+            @rename($tmp, $this->trackingFilePath);
+        }
     }
 
     private function detectFileChange(string $filename, string $filePath): string
@@ -1834,7 +2298,8 @@ class ClinicalPipeline
             $this->log("  Error log: {$this->errorLogPath}");
         }
 
-        $hasErrors = ($s['data_failed'] > 0 || $s['dd_failed'] > 0);
+        $hasErrors = ($s['data_failed'] > 0 || $s['dd_failed'] > 0
+            || ($s['evidata_files_failed'] ?? 0) > 0);
         $outcome   = $hasErrors ? 'COMPLETED WITH ERRORS' : 'COMPLETED SUCCESSFULLY';
         $this->log("");
         $this->log("  Result: {$outcome}");
@@ -1847,13 +2312,36 @@ class ClinicalPipeline
 
     private function sendNotification(array $project): void
     {
-        $name        = $project['project_common_name'] ?? 'Unknown';
-        $s           = $this->stats;
-        $hasFailures = ($s['data_failed'] > 0 || $s['dd_failed'] > 0);
+        $name = $project['project_common_name'] ?? 'Unknown';
+        $s    = $this->stats;
 
+        // Heading rule (SUCCESS / SUMMARY / FAILURE) is based on the
+        // OVERALL outcome of the run, counting any of:
+        //   - EviData skips (file did not pass the privacy check)
+        //   - install/ingest errors (DD or data upload failure)
+        // as "errors". Hash-unchanged skips and config-excluded files
+        // are NOT errors (steady-state runs stay SUCCESS).
+        $eviPassed   = $s['evidata_files_passed']  ?? 0;
+        $eviFailed   = $s['evidata_files_failed']  ?? 0;
+        $ingestOk    = $s['data_uploaded']         ?? 0;
+        $ingestFail  = $s['data_failed']           ?? 0;
+        $ddFail      = $s['dd_failed']             ?? 0;
+
+        $successCount = $eviPassed + $ingestOk;   // anything that went right
+        $errorCount   = $eviFailed + $ingestFail + $ddFail;
+
+        if ($errorCount === 0) {
+            $status = 'SUCCESS';
+        } elseif ($successCount === 0) {
+            $status = 'FAILURE';
+        } else {
+            $status = 'SUMMARY';
+        }
+
+        // Anything other than a clean SUCCESS goes to the error list.
         $successEmails = $project['notification_emails']['clinical']['on_success'] ?? [];
         $errorEmails   = $project['notification_emails']['clinical']['on_error']   ?? [];
-        $emailsToSend  = $hasFailures ? $errorEmails : $successEmails;
+        $emailsToSend  = ($status === 'SUCCESS') ? $successEmails : $errorEmails;
 
         $emailsToSend = array_values(array_unique($emailsToSend));
 
@@ -1862,7 +2350,6 @@ class ClinicalPipeline
             return;
         }
 
-        $status  = $hasFailures ? 'FAILED' : 'SUCCESS';
         $subject = "{$status}: {$name} Clinical Ingestion";
 
         $body  = "Project: {$name}\n";
@@ -1879,6 +2366,10 @@ class ClinicalPipeline
             $body .= "  Files checked: {$s['evidata_files_checked']}, "
                 . "passed: {$s['evidata_files_passed']}, "
                 . "failed: {$s['evidata_files_failed']}\n";
+            if (!empty($this->evidataFailedFiles)) {
+                $body .= "  Skipped (did not pass EviData, not ingested): "
+                    . implode(', ', $this->evidataFailedFiles) . "\n";
+            }
             if ($this->evidataLogDir !== null) {
                 $body .= "  Artifacts: {$this->evidataLogDir}\n";
             }
@@ -2013,7 +2504,17 @@ class ClinicalPipeline
             $body .= "\n";
         }
 
-        if ($hasFailures) {
+        if ($status === 'SUMMARY') {
+            $body .= "⚠ Partial ingestion. Files that passed EviData were ingested; "
+                . "files that failed or errored were skipped (not ingested) and "
+                . "will be retried next run.\n";
+            $body .= "See the EviData section above for the skipped files, and the "
+                . "attached/linked report(s) for why they failed.\n";
+        } elseif ($status === 'FAILURE' && ($s['evidata_files_checked'] ?? 0) > 0
+            && ($s['evidata_files_passed'] ?? 0) === 0) {
+            $body .= "✗ No files passed the EviData privacy check — nothing was ingested.\n";
+            $body .= "See the attached/linked report(s) for details.\n";
+        } elseif ($status === 'FAILURE') {
             $body .= "⚠ Some instruments failed to install or ingest.\n";
             $body .= "Check logs for details.\n";
         } elseif ($s['data_uploaded'] > 0) {

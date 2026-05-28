@@ -1,59 +1,73 @@
 {
-  "project_full_name": "Example Multisite Clinical-Imaging Study",
-  "project_common_name": "Example-Study",
-  "pi": "Dr. Jane Doe & Dr. John Smith",
-  "tier": "Registered",
-  "number_of_sites": "2",
+  "_comment": "TEMPLATE — copy to project.json inside the project's mount directory (typically /data/<collection>/<project>/project.json) and fill in. This .example file is safe to commit. The real project.json carries project-specific paths and stakeholder emails; edit per project. Comments are inline as '_comment_*' keys (JSON has no comment syntax); the pipeline ignores keys starting with '_comment'.",
+
+  "_comment_project_metadata": "Descriptive fields shown to humans (PI, study description, sites, cohorts, visit names). The pipeline uses project_common_name in logs/emails; the rest is reference material for stakeholders and the LORIS module that surfaces this data.",
+  "project_full_name":   "<Full Project Title>",
+  "project_common_name": "<YourProjectName>",
+  "pi":                  "<Principal Investigator(s)>",
+  "tier":                "<Registered | Open | Restricted>",
+  "number_of_sites":     "<count>",
   "sites": [
-    "Example University Hospital (EUH)",
-    "Example Mental Health Centre (EMHC)"
+    "<Site Full Name 1>",
+    "<Site Full Name 2>"
   ],
   "site_alias": [
-    "SITE1",
-    "SITE2"
+    "<SITE1>",
+    "<SITE2>"
   ],
   "visits": [
-    "V1",
-    "V2"
+    "<VISIT_LABEL_1>",
+    "<VISIT_LABEL_2>"
   ],
   "cohorts": [
-    "CohortA",
-    "CohortB"
+    "<Cohort A>",
+    "<Cohort B>"
   ],
-  "guids": "No",
-  "pi_storage": "",
-  "project_alias_4_characters": "EMCIS",
-  "number_of_participants": "10",
-  "modalities": ["Imaging", "Clinical"],
-  "number_of_instruments": "2",
+  "guids":                      "<Yes | No>",
+  "pi_storage":                 "",
+  "project_alias_4_characters": "<ABCD>",
+  "number_of_participants":     "<count>",
+  "modalities":                 ["<Imaging>", "<Clinical>"],
+  "number_of_instruments":      "<count>",
   "imaging_modalities": [
-    "Example-MR",
-    "Example-PET"
+    "<MODALITY-1>",
+    "<MODALITY-2>"
   ],
-  "biosample_tissue_types": "",
-  "protocol_link": "",
+  "biosample_tissue_types": "<e.g. Blood, Saliva, None>",
+  "protocol_link":          "<protocol_filename.pdf>",
+
+  "_comment_clinical_instruments": "List of instrument short-names expected in this project's clinical data. Used by LORIS-side validation and the data-dictionary pipeline; the clinical ingestion pipeline derives instruments from CSV headers and filenames at runtime, so this list is for stakeholders/LORIS, not for the pipeline.",
   "clinical_instruments": [
-    "example_clinical_form",
-    "example_scan_parameter_form"
+    "<instrument_short_name_1>",
+    "<instrument_short_name_2>"
   ],
+
+  "_comment_data_access": "Where the pipeline reads from. mount_enabled gates whether the project is processed at all; mount_path is the root for the project on the pipeline host. deidentified-raw/, documentation/, processed/, and logs/ sit under it.",
   "data_access": {
     "mount_enabled": true,
-    "mount_path": "/data/projects/Example-Study"
+    "mount_path":    "/data/<collection>/<YourProjectName>"
   },
+
+  "_comment_candidate_defaults": "Fallback values used when a candidate row in clinical data is missing one of these fields. Applied at ingestion time on a per-field basis. Keep dob conservative (e.g. 1970-01-01) — it should never be a real DOB.",
   "candidate_defaults": {
-    "sex":        "Other",
+    "sex":        "<Female | Male | Other>",
     "dob":        "1970-01-01",
-    "cohort":     "Control",
-    "site":       "Example University Hospital",
-    "project":    "Example-Study",
-    "site_alias": "SITE1"
+    "cohort":     "<default cohort>",
+    "site":       "<default site full name>",
+    "project":    "<default project label>",
+    "site_alias": "<SITE>"
   },
+
+  "_comment_project_mappings": "Map from in-data project label to LORIS internal project ID. Used by LORIS API calls that need a numeric project ID; keys here should match the values that appear in candidate_defaults.project and in the clinical CSVs.",
+  "project_mappings": { "<project label>": "<loris_project_id>" },
+
+  "_comment_participant_metadata": "How the pipeline locates participant-level metadata (e.g. Date of Death) and merges it into LORIS. Two source kinds: (a) the BIDS/clinical data files themselves (defaults.bids and defaults.clinical) — identifier_field is the column that holds the participant id, optional identifier_strip_prefix strips 'sub-' from BIDS-style ids; fields maps the LORIS metadata key to an array of acceptable column name aliases. (b) Separate registry CSV files listed under 'sources'. Both kinds can coexist; values from sources are merged on top of data-file values. Omit this whole block if the project has no participant metadata.",
   "participant_metadata": {
     "enabled": true,
     "defaults": {
       "bids": {
-        "identifier_field": "participant_id",
-        "identifier_type": "ExtStudyID",
+        "identifier_field":        "participant_id",
+        "identifier_type":         "ExtStudyID",
         "identifier_strip_prefix": "sub-",
         "fields": {
           "DoD": ["date_of_death", "dod"]
@@ -61,7 +75,7 @@
       },
       "clinical": {
         "identifier_field": "external_id",
-        "identifier_type": "ExtStudyID",
+        "identifier_type":  "ExtStudyID",
         "fields": {
           "DoD": ["DoD", "DateOfDeath", "date_of_death"]
         }
@@ -69,46 +83,56 @@
     },
     "sources": [
       {
-        "path": "deidentified-raw/registry/weekly_deaths.csv",
+        "path":             "deidentified-raw/registry/<registry_file>.csv",
         "identifier_field": "external_id",
-        "identifier_type": "ExtStudyID",
+        "identifier_type":  "ExtStudyID",
         "fields": {
           "DoD": ["dod"]
         }
       }
     ]
   },
+
+  "_comment_notification_emails": "Per-modality recipient lists. Each modality has on_success (run completed cleanly) and on_error (any failure) channels — the pipeline picks the list based on outcome. The 'enabled' key under each modality is reserved for future use and is currently ignored by the code; presence of a non-empty list is what makes notifications go out.",
+  "_comment_notification_evidata": "The 'evidata' block UNDER notification_emails is for PRIVACY-CHECK failure recipients (on_check_failed) — completely separate from the top-level 'evidata' block at the bottom of this file, which controls QI policy. They share a name on purpose: notifications about EviData go here, configuration for EviData goes there.",
   "notification_emails": {
     "clinical": {
-      "enabled": true,
-      "on_success": ["clinical_team@example.org"],
-      "on_error":   ["clinical_team@example.org"]
+      "enabled":    true,
+      "on_success": ["<clinical-success-recipient@example.org>"],
+      "on_error":   ["<clinical-error-recipient@example.org>"]
     },
     "dicom": {
-      "enabled": true,
-      "on_success": ["imaging_team@example.org"],
-      "on_error":   ["admin@example.com"]
+      "enabled":    true,
+      "on_success": ["<dicom-success-recipient@example.org>"],
+      "on_error":   ["<dicom-error-recipient@example.org>"]
     },
     "bids": {
-      "enabled": true,
-      "on_success": ["imaging_team@example.org"],
-      "on_error":   ["imaging_team@example.org"]
+      "enabled":    true,
+      "on_success": ["<bids-success-recipient@example.org>"],
+      "on_error":   ["<bids-error-recipient@example.org>"]
     },
     "participant_metadata": {
-      "enabled": true,
-      "on_success": ["imaging_team@example.org"],
-      "on_error":   ["clinical_team@example.org", "admin@example.com"]
+      "enabled":    true,
+      "on_success": ["<metadata-success-recipient@example.org>"],
+      "on_error":   ["<metadata-error-recipient@example.org>"]
     },
     "evidata": {
-          "enabled": true,
-          "on_check_failed": [
-            "fdg-pet-privacy@example.com",
-            "fdg-pet-pi@example.com"
-          ]
+      "enabled":         true,
+      "on_check_failed": ["<privacy-team@example.org>"]
     }
   },
+
+  "_comment_evidata": "EviData QI policy for THIS project (per-project override of the global evidata_config.json -> qis). Resolution: if 'qis' here is non-empty -> used as-is; if empty/absent -> falls back to global; if global also empty -> ALL-HEADERS mode (every CSV column becomes a QI, minus exclude_qis, minus unique-per-row identifier columns).",
+  "_comment_evidata_qis_shapes": "Two shapes are accepted: (a) flat array applied to every clinical CSV in the project (e.g. ['Candidate_Age','Sex']), or (b) map with '_default' + per-filename overrides (e.g. {'_default':['Sex'], 'redcap_data.csv':['dob','sex']}). EviData's server-side QI validation is CASE-SENSITIVE — spell every QI exactly as it appears in that file's CSV header. Set qis to [] (or omit) to deliberately use the all-headers default for this project.",
+  "_comment_evidata_exclude_qis": "Optional. Column names to DROP in all-headers mode (ignored when an explicit qis list is in effect). CASE-INSENSITIVE matching. Use it to remove known non-identifying columns or identifier columns (study IDs, visit labels, comment fields) from the all-headers set, on top of the automatic unique-per-row removal.",
+  "evidata": {
+    "qis":         [],
+    "exclude_qis": ["<ColumnName1>", "<ColumnName2>", "<ColumnName3>"]
+  },
+
+  "_comment_logging": "Per-project logging. log_path defaults to <mount_path>/logs when omitted; level is one of DEBUG / INFO / WARNING / ERROR.",
   "logging": {
-    "level": "INFO",
-    "log_path": "/data/projects/Example-Study/logs"
+    "level":    "INFO",
+    "log_path": "/data/<collection>/<YourProjectName>/logs"
   }
 }

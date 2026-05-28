@@ -1,7 +1,7 @@
 {
   "_comment": "TEMPLATE — copy to evidata_config.json and fill in. This .example file is safe to commit. The real evidata_config.json should NOT be committed (add it to .gitignore) since it carries environment-specific endpoint values. No secrets live in either file — only env-var NAMES; the secret values stay in the separate env_file (see below).",
 
-  "_comment_enabled": "Master switch. false (or this whole file absent) => preflight skipped silently, pipeline behaves as if EviData never existed. true => preflight runs and a failure aborts the whole project. The flag is GLOBAL — there is no per-project enable/disable.",
+  "_comment_enabled": "Master switch. false (or this whole file absent) => preflight skipped silently, pipeline behaves as if EviData never existed. true => preflight runs PER FILE before clinical ingestion: each CSV is checked individually, files that pass are ingested, files that fail/error are SKIPPED (not ingested) and retried next run. The whole project is NOT aborted on a single failure. The flag is GLOBAL — there is no per-project enable/disable.",
   "enabled": false,
 
   "_comment_endpoints": "Both URLs point at the EviData deployment. If EviData is fronted by a TLS reverse proxy (recommended), use https:// with no port — the proxy routes /api to the EviData API and /auth to Keycloak. If you must hit the containers directly, the API is on :8000 and Keycloak on :3000. Replace <evidata-host> and <keycloak-realm> accordingly.",
@@ -31,8 +31,12 @@
   "client_name":    "<your-org>",
   "recipient_name": "<your-pipeline-name>",
 
-  "_comment_qis": "GLOBAL BASELINE quasi-identifier list. QI lists are resolved at TWO levels: (1) project.json -> evidata.qis is the per-project override — when a project defines it, that project fully owns its QI policy; (2) this global qis is the fallback, used ONLY by projects that do NOT define their own. Keep this global value a simple FLAT ARRAY — a per-filename map here would wrongly apply the same filename rule to every project that falls back to it. Per-project / per-file granularity belongs in each project.json. EviData's server-side QI validation is CASE-SENSITIVE: every QI name must match the CSV header casing exactly. REQUIRED when enabled=true — resolveEvidataConfig() throws if missing or malformed. This baseline is intentionally minimal; projects with age/DOB/postal data MUST set their own evidata.qis in project.json.",
-  "qis": ["Sex"],
+  "_comment_qis": "GLOBAL BASELINE quasi-identifier list. QI lists are resolved at TWO levels: (1) project.json -> evidata.qis is the per-project override — when a project defines a non-empty qis, that project fully owns its QI policy; (2) this global qis is the fallback, used ONLY by projects that do NOT define their own. Keep this global value a simple FLAT ARRAY — a per-filename map here would wrongly apply the same filename rule to every project that falls back to it (many projects share filenames like redcap_data.csv). Per-project / per-file granularity belongs in each project's project.json. EviData's server-side QI validation is CASE-SENSITIVE: every QI name must match the CSV header casing exactly.",
+  "_comment_qis_all_headers_default": "IMPORTANT — ALL-HEADERS DEFAULT: if qis is EMPTY ([]) or ABSENT at BOTH levels (no project.json evidata.qis and this global qis empty/absent), the pipeline uses EVERY column header in each CSV as a QI, automatically per file. Two automatic reductions apply in this mode: (a) columns listed in exclude_qis are dropped; (b) columns whose every value is unique-per-row (identifiers / pseudonyms / timestamps such as StudyID) are dropped automatically, because EviData treats them as QIs and they force maximum re-identification risk. Per-file log records which columns were used and which were excluded. Set qis to [] (empty) here to deliberately select the all-headers default globally.",
+  "qis": [],
+
+  "_comment_exclude_qis": "Optional. Column names to DROP when running in all-headers mode (ignored when an explicit qis list is in effect). Two-level like qis: project.json -> evidata.exclude_qis overrides this global list. Matching is CASE-INSENSITIVE (exclusion is deliberately liberal). Use it to remove known non-identifying or identifier columns from the all-headers set, on top of the automatic unique-per-row removal.",
+  "exclude_qis": [],
 
   "_comment_population_size": "Reference population size. Must be >= (CSV rows + 1). Optional (default 50000).",
   "population_size": 50000,
