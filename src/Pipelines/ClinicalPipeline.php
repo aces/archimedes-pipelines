@@ -115,6 +115,15 @@ class ClinicalPipeline
     /** Key in a qis map supplying the QI list for files with no exact match. */
     private const QIS_DEFAULT_KEY = '_default';
 
+    /**
+     * Sentinel value for a per-file qis map entry meaning "use ALL of
+     * this file's headers" (resolved via resolveAllHeaderQis(), so
+     * exclude_qis and unique-per-row pruning still apply). Valid ONLY
+     * as a per-filename value inside a qis map — not for '_default'
+     * and not as a flat-list element.
+     */
+    private const QIS_ALL_HEADERS = '*';
+
     private const DATE_COLUMN_NAMES = [
         'dob', 'date_of_birth', 'birth_date',
         'dod', 'date_of_death', 'death_date',
@@ -388,9 +397,29 @@ class ClinicalPipeline
                         $path, $excludeSet, basename($path)
                     );
                 } else {
-                    $qisByPath[$path] = $this->resolveQisForFile(
+                    // Explicit qis config: resolve the configured list,
+                    // then drop any column that isn't actually in THIS
+                    // file. A configured QI absent from the file is
+                    // reported and skipped — the file is still checked
+                    // against the QIs that ARE present. Only an empty
+                    // remainder is fatal (nothing left to assess).
+                    $resolved = $this->resolveQisForFile(
                         $qisConfig, basename($path)
                     );
+                    if ($resolved === [self::QIS_ALL_HEADERS]) {
+                        // Per-file all-headers sentinel ("*"): this file
+                        // uses every header (minus exclude_qis and
+                        // unique-per-row), exactly like project-wide
+                        // all-headers mode, even though other files in
+                        // the same project use explicit lists.
+                        $qisByPath[$path] = $this->resolveAllHeaderQis(
+                            $path, $excludeSet, basename($path)
+                        );
+                    } else {
+                        $qisByPath[$path] = $this->pruneMissingQis(
+                            $path, $resolved, basename($path)
+                        );
+                    }
                 }
             } catch (\RuntimeException $e) {
                 $qiResolveErr[basename($path)] = $e->getMessage();
@@ -772,10 +801,27 @@ class ClinicalPipeline
         }
 
         foreach ($qis as $key => $list) {
+            // A per-file entry may be the all-headers sentinel ("*"),
+            // meaning "use every header in that file". Not allowed for
+            // '_default' — the default must be a concrete list.
+            if (is_string($list) && $list === self::QIS_ALL_HEADERS) {
+                if ($key === self::QIS_DEFAULT_KEY) {
+                    throw new \RuntimeException(
+                        "{$where}['" . self::QIS_DEFAULT_KEY . "'] cannot be '"
+                        . self::QIS_ALL_HEADERS . "' — the default must be a "
+                        . "concrete list of QI column names. The '"
+                        . self::QIS_ALL_HEADERS . "' sentinel is only valid for "
+                        . "a specific filename entry."
+                    );
+                }
+                continue;
+            }
+
             if (!is_array($list) || empty($list)) {
                 throw new \RuntimeException(
                     "{$where}['{$key}'] must be a non-empty array of QI "
-                    . "column-name strings."
+                    . "column-name strings (or the string '"
+                    . self::QIS_ALL_HEADERS . "' to use all of that file's headers)."
                 );
             }
             foreach ($list as $q) {
@@ -810,6 +856,12 @@ class ClinicalPipeline
         }
 
         if (isset($qisConfig[$basename])) {
+            // A per-file entry may be the all-headers sentinel string.
+            // Return it wrapped so the caller can detect it and route
+            // the file through resolveAllHeaderQis() instead.
+            if ($qisConfig[$basename] === self::QIS_ALL_HEADERS) {
+                return [self::QIS_ALL_HEADERS];
+            }
             return array_values($qisConfig[$basename]);
         }
 
@@ -824,6 +876,72 @@ class ClinicalPipeline
             . self::QIS_DEFAULT_KEY . "' key, in the project's project.json "
             . "evidata.qis (or the global evidata_config.json)."
         );
+    }
+
+    /**
+     * Drop configured QIs that are not present in THIS file's header,
+     * reporting each dropped column. The file is still assessed against
+     * the QIs that ARE present; a missing configured QI is no longer a
+     * hard failure. Throws only if the file is unreadable or if NONE of
+     * the configured QIs exist in it (nothing left to assess).
+     *
+     * Header match is case-INSENSITIVE (courtesy); kept QI names keep
+     * the configured casing, which is what EviData validates against
+     * server-side.
+     *
+     * @param array<string> $qis  Resolved QI list for this file.
+     * @return array<string>      QIs that exist in the file's header.
+     * @throws \RuntimeException  If unreadable, or every QI is missing.
+     */
+    private function pruneMissingQis(string $path, array $qis, string $basename): array
+    {
+        $delim   = str_ends_with(strtolower($path), '.tsv') ? "\t" : ',';
+        $fh      = @fopen($path, 'r');
+        if ($fh === false) {
+            throw new \RuntimeException("CSV unreadable: {$basename}");
+        }
+        $headers = fgetcsv($fh, 0, $delim);
+        fclose($fh);
+        if (!is_array($headers) || $headers === []) {
+            throw new \RuntimeException("CSV unreadable: {$basename}");
+        }
+
+        $headersLower = array_map(
+            fn($h) => strtolower(trim((string)$h)),
+            $headers
+        );
+
+        $kept    = [];
+        $missing = [];
+        foreach ($qis as $qi) {
+            $qiLower = strtolower(trim((string)$qi));
+            if (in_array($qiLower, $headersLower, true)) {
+                $kept[] = $qi;
+            } else {
+                $missing[] = $qi;
+            }
+        }
+
+        if (!empty($missing)) {
+            $this->log(sprintf(
+                "    %s — configured QI(s) not in file, skipped: %s"
+                . " (continuing with %d of %d)",
+                $basename,
+                implode(', ', $missing),
+                count($kept),
+                count($qis)
+            ));
+        }
+
+        if ($kept === []) {
+            throw new \RuntimeException(
+                "None of the configured QI columns exist in {$basename}: "
+                . implode(', ', $qis)
+                . ". Correct the project's evidata.qis to match the file's headers."
+            );
+        }
+
+        return array_values($kept);
     }
 
     /**

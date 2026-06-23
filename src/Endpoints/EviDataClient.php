@@ -24,10 +24,13 @@ use RuntimeException;
  *
  * Report lifecycle per file:
  *   1. POST /datasets/upload          -> dataset_id      (multipart)
- *   2. POST /reports/generate         -> report_id       (JSON)
- *   3. GET  /reports/{report_id}      -> poll status until completed
- *   4. GET  /reports/{report_id}/results       -> JSON pass/fail payload
- *   5. GET  /reports/{report_id}/download-zip  -> bundled PDF artifact
+ *   2. POST /datasets/validate        -> is_valid (server-side pre-flight;
+ *                                       confirms dataset shape + QI presence
+ *                                       BEFORE the async report pipeline)
+ *   3. POST /reports/generate         -> report_id       (JSON)
+ *   4. GET  /reports/{report_id}      -> poll status until completed
+ *   5. GET  /reports/{report_id}/results       -> JSON pass/fail payload
+ *   6. GET  /reports/{report_id}/download-zip  -> bundled PDF artifact
  *
  * Per-file quasi-identifiers:
  *   EviData's server-side QI validation is CASE-SENSITIVE and matches
@@ -122,6 +125,7 @@ class EviDataClient
     {
         $this->authenticate();
         $datasetId = $this->uploadDataset($csvPath);
+        $this->validateDataset($datasetId, $qis);    // throws on is_valid=false
         $reportId  = $this->generateReport($datasetId, $qis);
         $this->waitForCompletion($reportId);
         $results = $this->http('GET', "/reports/{$reportId}/results");
@@ -166,6 +170,17 @@ class EviDataClient
                 }
 
                 $datasetId      = $this->uploadDataset($csvPath);
+                // Server-side pre-flight: EviData's /datasets/validate
+                // confirms the dataset exists, is well-formed, and that
+                // the configured QIs are present. Failure here means
+                // we never spend an async report cycle on a file that
+                // would have failed anyway, and the error messages
+                // returned by validate are cleaner / more actionable
+                // than what a later /reports/generate failure would
+                // produce. A validate failure THROWS — caught below,
+                // recorded as passed=false with the parsed messages,
+                // and the file is skipped for the rest of the cycle.
+                $this->validateDataset($datasetId, $qis);
                 $reportId       = $this->generateReport($datasetId, $qis);
                 $this->waitForCompletion($reportId);
                 $resultsPayload = $this->http('GET', "/reports/{$reportId}/results");
@@ -292,6 +307,61 @@ class EviDataClient
             );
         }
         return (string)$datasetId;
+    }
+
+    /**
+     * Server-side pre-flight via POST /datasets/validate.
+     *
+     * EviData verifies that the uploaded dataset exists, is well-formed,
+     * and that the supplied quasi-identifier names are actually present
+     * as columns. Catches problems CHEAPLY — before the async report
+     * pipeline is started — with clearer error messages than what
+     * /reports/generate produces on failure.
+     *
+     * Response shape (from EviData API docs):
+     *   { is_valid: bool,
+     *     errors:    array<string>,
+     *     warnings:  array<string>,
+     *     dataset_info: { ... } }
+     *
+     * Behaviour:
+     *   - is_valid=true            -> log any warnings, return.
+     *   - is_valid=false           -> throw with the joined error
+     *                                 messages so the caller marks the
+     *                                 file failed with a useful reason.
+     *   - HTTP / transport failure -> propagates (caller treats as
+     *                                 failure; conservative — never
+     *                                 ingest a file we couldn't verify).
+     *
+     * @param string        $datasetId  dataset_id from uploadDataset().
+     * @param array<string> $qis        QI columns expected in the dataset.
+     */
+    private function validateDataset(string $datasetId, array $qis): void
+    {
+        $resp = $this->http('POST', '/datasets/validate', [
+            'data_type'               => 'De-identified',
+            'deidentified_dataset_id' => $datasetId,
+            'qis'                     => array_values($qis),
+        ]);
+
+        $isValid  = (bool)($resp['is_valid'] ?? false);
+        $errors   = is_array($resp['errors']   ?? null) ? $resp['errors']   : [];
+        $warnings = is_array($resp['warnings'] ?? null) ? $resp['warnings'] : [];
+
+        // Warnings are surfaced via the log but do NOT fail the file.
+        // Per EviData docs, warnings cover non-blocking observations
+        // (e.g. column shape differences across compared datasets);
+        // they're informational, not policy violations.
+        foreach ($warnings as $w) {
+            error_log("EviData validate warning (dataset {$datasetId}): " . (string)$w);
+        }
+
+        if (!$isValid) {
+            $msg = !empty($errors)
+                ? implode('; ', array_map(fn($e) => (string)$e, $errors))
+                : 'validate rejected the dataset (no error messages returned)';
+            throw new RuntimeException("Dataset validation failed: {$msg}");
+        }
     }
 
     /**
