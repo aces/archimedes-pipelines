@@ -129,7 +129,14 @@ class ClinicalPipeline
         'dod', 'date_of_death', 'death_date',
     ];
 
-    private const EVIDATA_MAX_ATTACH_BYTES = 15 * 1024 * 1024;
+    /**
+     * Default MTA message_size_limit in MB, used when the host's
+     * evidata_config.json does not set evidata.mta_message_size_limit_mb.
+     * The real per-host value (from `postconf message_size_limit`) should
+     * be configured per server — msruthy-dev, the EviData host, and the
+     * production targets may each differ. See maxAttachBytes().
+     */
+    private const EVIDATA_DEFAULT_MTA_LIMIT_MB = 10;
 
     public function __construct(
         array $config,
@@ -1083,23 +1090,67 @@ class ClinicalPipeline
     }
 
     /**
-     * Compress a PDF in place via Ghostscript, so EviData report
+     * Locate the mutool binary, or null if it is not installed/usable.
+     * Resolved once and cached on the instance. The path is overridable
+     * via config (evidata.mutool_path) for non-standard installs; by
+     * default it probes PATH via `command -v mutool`.
+     *
+     * @return ?string Absolute path to mutool, or null if not found.
+     */
+    private function mutoolPath(): ?string
+    {
+        // Cache: false = not yet checked, null = checked & absent,
+        // string = resolved path.
+        static $resolved = false;
+        if ($resolved !== false) {
+            return $resolved;
+        }
+
+        // Explicit override from config wins, if it points at a real file.
+        $configured = $this->config['evidata']['mutool_path'] ?? null;
+        if (is_string($configured) && $configured !== '' && is_executable($configured)) {
+            return $resolved = $configured;
+        }
+
+        // Otherwise probe PATH. `command -v` prints the path and exits 0
+        // when found, exits non-zero when not.
+        $out = [];
+        $rc  = 0;
+        exec('command -v mutool 2>/dev/null', $out, $rc);
+        if ($rc === 0 && !empty($out[0]) && is_executable(trim($out[0]))) {
+            return $resolved = trim($out[0]);
+        }
+
+        return $resolved = null;
+    }
+
+    /**
+     * Compress a PDF in place via mutool (MuPDF), so EviData report
      * attachments fit comfortably under the local MTA's size cap.
      *
-     * EviData's PDFs ship with very high-DPI rasterised charts that
-     * make the raw file 4–5 MB each. /printer (300 DPI) typically
-     * yields ~90% reduction while keeping risk-distribution charts
-     * sharp enough for a privacy reviewer.
+     * EviData's failed-report PDFs ship with high-DPI rasterised charts
+     * that make each file 30 MB+. mutool garbage-collects unused
+     * objects (-g), deflate-compresses streams (-z), and downsamples
+     * embedded images above a DPI threshold, typically pulling the file
+     * well under the attachment ceiling while keeping risk-distribution
+     * charts legible for a privacy reviewer.
+     *
+     * Replaces the previous Ghostscript implementation: mutool has no
+     * PostScript interpreter and a smaller attack surface for the
+     * untrusted-PDF input this handles.
      *
      * Returns the path to the compressed file on success, or the
-     * ORIGINAL $srcPath on any failure — so missing/broken `gs`, a
-     * non-zero exit, or a zero-byte output never blocks the email.
-     * Pipeline degrades gracefully: emails get larger, not absent.
+     * ORIGINAL $srcPath on any failure — so missing/broken `mutool`, a
+     * non-zero exit, a zero-byte output, or a result no smaller than the
+     * source never blocks the email. Pipeline degrades gracefully:
+     * emails get larger, not absent.
      *
      * @param string $srcPath  Input PDF on disk.
      * @param string $dstPath  Output PDF path (created alongside).
-     * @param string $setting  Ghostscript -dPDFSETTINGS value
-     *                         ('/printer', '/ebook', '/screen').
+     * @param string $setting  Image-downsample target DPI as a string
+     *                         ('150', '200', '300'); validated against a
+     *                         whitelist. Empty/unknown -> structural
+     *                         compression only (no downsampling).
      * @return string  The path to use for the attachment.
      */
     private function compressPdf(string $srcPath, string $dstPath, string $setting): string
@@ -1108,22 +1159,40 @@ class ClinicalPipeline
             return $srcPath;   // can't compress nothing
         }
 
-        // Only allow known-safe setting tokens; never interpolate
-        // arbitrary strings into the shell.
-        $allowed = ['/printer', '/ebook', '/screen', '/prepress', '/default'];
-        if (!in_array($setting, $allowed, true)) {
-            $this->log("    compressPdf: invalid setting '{$setting}', "
-                . "using original (no compression)");
+        // Clear, upfront check: is mutool actually installed? Without
+        // this, a missing binary only shows up as the cryptic shell exit
+        // 127 ("command not found"). Say so plainly so the operator knows
+        // to `sudo apt install mupdf-tools` rather than guessing.
+        if ($this->mutoolPath() === null) {
+            $this->log("    compressPdf: mutool not found on host — cannot compress "
+                . basename($srcPath) . ". Install it with 'sudo apt install mupdf-tools' "
+                . "(package: mupdf-tools). Attaching the original uncompressed file.");
             return $srcPath;
         }
 
+        // Only allow known-safe DPI tokens; never interpolate arbitrary
+        // strings into the shell. An unrecognised value falls back to
+        // structural compression only (still safe, just less shrink).
+        $allowedDpi = ['150', '200', '300'];
+        $dpi        = in_array($setting, $allowedDpi, true) ? $setting : null;
+
+        // mutool clean flags:
+        //   -g  garbage-collect unused objects (repeat = more aggressive)
+        //   -z  deflate-compress streams
+        //   -D  decompress-then-recompress (normalises existing streams)
+        //   -L <dpi>  downsample images above the given DPI (the part
+        //             that actually shrinks image-heavy reports)
+        $flags = '-ggg -z -D';
+        if ($dpi !== null) {
+            $flags .= ' -L ' . escapeshellarg($dpi);
+        }
+
         $cmd = sprintf(
-            'gs -sDEVICE=pdfwrite -dCompatibilityLevel=1.4 '
-            . '-dPDFSETTINGS=%s -dNOPAUSE -dQUIET -dBATCH '
-            . '-sOutputFile=%s %s 2>&1',
-            escapeshellarg($setting),
-            escapeshellarg($dstPath),
-            escapeshellarg($srcPath)
+            '%s clean %s %s %s 2>&1',
+            escapeshellarg($this->mutoolPath()),
+            $flags,
+            escapeshellarg($srcPath),
+            escapeshellarg($dstPath)
         );
 
         $output = [];
@@ -1132,7 +1201,7 @@ class ClinicalPipeline
 
         if ($rc !== 0 || !is_file($dstPath) || filesize($dstPath) < 1024) {
             $msg = $rc !== 0
-                ? "gs exit={$rc}"
+                ? "mutool exit={$rc}"
                 : (!is_file($dstPath) ? "no output" : "output too small");
             $this->log("    compressPdf: {$msg}, falling back to original "
                 . basename($srcPath));
@@ -1144,16 +1213,52 @@ class ClinicalPipeline
 
         $orig = filesize($srcPath);
         $new  = filesize($dstPath);
-        $pct  = $orig > 0 ? round(100 * (1 - $new / $orig)) : 0;
+
+        // If mutool did not actually reduce the file, keep the original
+        // so we never attach a larger copy than the source.
+        if ($new >= $orig) {
+            $this->log(sprintf(
+                "    compressPdf: no reduction (%d KB -> %d KB), using original %s",
+                (int)round($orig / 1024), (int)round($new / 1024), basename($srcPath)
+            ));
+            @unlink($dstPath);
+            return $srcPath;
+        }
+
+        $pct = $orig > 0 ? round(100 * (1 - $new / $orig)) : 0;
         $this->log(sprintf(
-            "    compressPdf: %s  %d KB -> %d KB (%d%% smaller, %s)",
+            "    compressPdf: %s  %d KB -> %d KB (%d%% smaller, mutool%s)",
             basename($srcPath),
             (int)round($orig / 1024),
             (int)round($new / 1024),
             $pct,
-            $setting
+            $dpi !== null ? " -L {$dpi}" : ""
         ));
         return $dstPath;
+    }
+
+    /**
+     * Raw attachment-size ceiling in bytes, derived from the host's MTA
+     * message_size_limit. The limit is read (in MB) from config:
+     *   evidata.mta_message_size_limit_mb  (matches `postconf
+     *   message_size_limit` / 1024 / 1024 on this host),
+     * defaulting to EVIDATA_DEFAULT_MTA_LIMIT_MB when absent.
+     *
+     * The limit applies to the WHOLE MIME message AFTER encoding. MIME
+     * base64 inflates attachments by ~37%, and headers/boundaries add a
+     * little more, so the RAW attachment total must stay under
+     * limit / 1.4 for the encoded message to fit. Per-host: each server
+     * may set a different limit in its own evidata_config.json.
+     */
+    private function maxAttachBytes(): int
+    {
+        $limitMb    = $this->config['evidata']['mta_message_size_limit_mb']
+            ?? self::EVIDATA_DEFAULT_MTA_LIMIT_MB;
+        $limitBytes = (int)($limitMb * 1024 * 1024);
+
+        // Reserve ~37% for base64 plus a small margin for MIME headers
+        // and boundary strings: divide by 1.4.
+        return (int)($limitBytes / 1.4);
     }
 
     /**
@@ -1162,10 +1267,9 @@ class ClinicalPipeline
      * Used by the tiered attachment ladder in the failure email:
      * try full report.pdf first, then summary_letter.pdf.
      *
-     * Each extracted PDF is compressed via Ghostscript (configurable
-     * setting, defaults to /printer) before being added as an
-     * attachment. Compression failure falls back to the uncompressed
-     * file silently.
+     * Each extracted PDF is returned RAW (uncompressed). Compression is
+     * applied later, to the whole batch, and only when the batch total
+     * exceeds the attachment cap — see sendEvidataFailureNotification().
      *
      * @param string $entryName  PDF name inside the zip (e.g. 'report.pdf').
      * @param string $outSuffix  Extracted-file suffix (e.g. '_report.pdf').
@@ -1174,9 +1278,6 @@ class ClinicalPipeline
      */
     private function collectEvidataPdfs(string $entryName, string $outSuffix, string $mailSuffix): array
     {
-        $compressionSetting = $this->config['evidata']['pdf_compression']
-            ?? '/printer';
-
         $attachments = [];
         $totalBytes  = 0;
         foreach (($this->stats['evidata_results'] ?? []) as $name => $r) {
@@ -1190,19 +1291,73 @@ class ClinicalPipeline
                 continue;
             }
 
-            // Compress (if enabled). The raw extracted PDF stays in the
-            // log dir untouched — only the emailed copy is compressed.
-            $attachPath = $pdf;
-            if ($compressionSetting !== null && $compressionSetting !== '') {
-                $base       = pathinfo($pdf, PATHINFO_FILENAME);
-                $compressed = dirname($pdf) . "/{$base}_compressed.pdf";
-                $attachPath = $this->compressPdf($pdf, $compressed, $compressionSetting);
-            }
-
-            $attachments[] = ['path' => $attachPath, 'name' => "{$stem}{$mailSuffix}"];
-            $totalBytes   += filesize($attachPath);
+            // Raw extracted PDF. Compression (if needed) is decided on the
+            // WHOLE batch later, not here — a batch that already fits is
+            // attached as-is. The raw extracted PDF stays in the log dir.
+            $attachments[] = ['path' => $pdf, 'name' => "{$stem}{$mailSuffix}"];
+            $totalBytes   += filesize($pdf);
         }
         return [$attachments, $totalBytes];
+    }
+
+    /**
+     * Compress every PDF in an attachment batch via mutool, returning
+     * [newAttachments, newTotalBytes]. Called ONLY when a batch's raw
+     * total exceeds the attachment cap. Each file that fails to compress,
+     * or would grow, keeps its original (compressPdf() guarantees this).
+     * The compressed copies live alongside the originals in the log dir;
+     * the raw extracted PDFs are left untouched.
+     *
+     * @param array<array{path:string,name:string}> $attachments
+     * @return array{0: array<array{path:string,name:string}>, 1: int}
+     */
+    private function compressAttachmentBatch(array $attachments): array
+    {
+        $compressionSetting = $this->config['evidata']['pdf_compression']
+            ?? '200';
+
+        // Compression disabled -> return the batch unchanged.
+        if ($compressionSetting === null || $compressionSetting === '') {
+            $total = 0;
+            foreach ($attachments as $att) {
+                $total += is_file($att['path']) ? filesize($att['path']) : 0;
+            }
+            return [$attachments, $total];
+        }
+
+        // One clear, batch-level clue when mutool is missing: the whole
+        // over-cap batch cannot be shrunk, so the email will fall back to
+        // summaries / contact-team. Say why, once, instead of leaving the
+        // operator to infer it from per-file lines.
+        if ($this->mutoolPath() === null) {
+            $total = 0;
+            foreach ($attachments as $att) {
+                $total += is_file($att['path']) ? filesize($att['path']) : 0;
+            }
+            $this->log(sprintf(
+                "  EviData attachments: batch is over the email cap but mutool is "
+                . "NOT installed — cannot compress %d file(s) (%.1f MB). Install it "
+                . "with 'sudo apt install mupdf-tools'. Falling back to smaller "
+                . "attachments or a contact-the-team note.",
+                count($attachments), $total / 1024 / 1024
+            ));
+            return [$attachments, $total];
+        }
+
+        $out   = [];
+        $total = 0;
+        foreach ($attachments as $att) {
+            $src = $att['path'];
+            if (!is_file($src)) {
+                continue;
+            }
+            $base       = pathinfo($src, PATHINFO_FILENAME);
+            $compressed = dirname($src) . "/{$base}_compressed.pdf";
+            $use        = $this->compressPdf($src, $compressed, $compressionSetting);
+            $out[]      = ['path' => $use, 'name' => $att['name']];
+            $total     += filesize($use);
+        }
+        return [$out, $total];
     }
 
     private function writeEvidataRunSummary(array $project, bool $allPassed): void
@@ -1267,32 +1422,76 @@ class ClinicalPipeline
         $totalBytes  = 0;
         $attachTier  = 'none';   // 'full' | 'summary' | 'none'
         if ($clientErrorOverride === null && $this->evidataLogDir !== null) {
-            // Graceful fallback ladder for attachments. Email size
-            // limits apply to the WHOLE message, so we pick the richest
-            // tier whose TOTAL fits under the ceiling:
-            //   1. full report.pdf for every failed file, else
-            //   2. summary_letter.pdf for every failed file, else
+            // Graceful fallback ladder for attachments. The email size
+            // limit applies to the WHOLE message, so the decision is
+            // made on each batch's TOTAL size, not per file:
+            //   1. full report.pdf set — attach as-is if the total fits;
+            //      if the total exceeds the cap, compress the whole set
+            //      and use it if the compressed total now fits.
+            //   2. summary_letter.pdf set — same rule (as-is if it fits,
+            //      else compress and re-check).
             //   3. nothing — tell the recipient to contact the team.
             // EviData's report.zip bundles both report.pdf (full) and
             // summary_letter.pdf (summary) per file.
             [$fullAtt,    $fullBytes]    = $this->collectEvidataPdfs('report.pdf', '_report.pdf', '_evidata_report.pdf');
             [$summaryAtt, $summaryBytes] = $this->collectEvidataPdfs('summary_letter.pdf', '_summary.pdf', '_evidata_summary.pdf');
 
-            if (!empty($fullAtt) && $fullBytes <= self::EVIDATA_MAX_ATTACH_BYTES) {
-                $attachments = $fullAtt;
-                $totalBytes  = $fullBytes;
-                $attachTier  = 'full';
-            } elseif (!empty($summaryAtt) && $summaryBytes <= self::EVIDATA_MAX_ATTACH_BYTES) {
-                $attachments = $summaryAtt;
-                $totalBytes  = $summaryBytes;
-                $attachTier  = 'summary';
-            } else {
+            // Per-host attachment ceiling, derived from the MTA limit in
+            // config (post-base64 headroom already applied).
+            $maxBytes = $this->maxAttachBytes();
+            $capMb    = $maxBytes / 1024 / 1024;
+
+            // ── Tier 1: full reports ────────────────────────────────
+            if (!empty($fullAtt)) {
+                if ($fullBytes <= $maxBytes) {
+                    // Already fits — no compression needed.
+                    $attachments = $fullAtt;
+                    $totalBytes  = $fullBytes;
+                    $attachTier  = 'full';
+                } else {
+                    // Batch total is over the cap — compress the whole set.
+                    $this->log(sprintf(
+                        "  EviData attachments: full report batch is %.1f MB, "
+                        . "exceeds the %.1f MB email cap — compressing the batch",
+                        $fullBytes / 1024 / 1024, $capMb
+                    ));
+                    [$fullC, $fullCBytes] = $this->compressAttachmentBatch($fullAtt);
+                    if ($fullCBytes <= $maxBytes) {
+                        $attachments = $fullC;
+                        $totalBytes  = $fullCBytes;
+                        $attachTier  = 'full';
+                    }
+                }
+            }
+
+            // ── Tier 2: summaries (only if tier 1 didn't land) ──────
+            if ($attachTier === 'none' && !empty($summaryAtt)) {
+                if ($summaryBytes <= $maxBytes) {
+                    $attachments = $summaryAtt;
+                    $totalBytes  = $summaryBytes;
+                    $attachTier  = 'summary';
+                } else {
+                    $this->log(sprintf(
+                        "  EviData attachments: summary batch is %.1f MB, "
+                        . "exceeds the %.1f MB email cap — compressing the batch",
+                        $summaryBytes / 1024 / 1024, $capMb
+                    ));
+                    [$sumC, $sumCBytes] = $this->compressAttachmentBatch($summaryAtt);
+                    if ($sumCBytes <= $maxBytes) {
+                        $attachments = $sumC;
+                        $totalBytes  = $sumCBytes;
+                        $attachTier  = 'summary';
+                    }
+                }
+            }
+
+            // ── Tier 3: nothing fits ────────────────────────────────
+            if ($attachTier === 'none') {
                 $attachments = [];
-                $attachTier  = 'none';
             }
         }
 
-        $ceilingMb = self::EVIDATA_MAX_ATTACH_BYTES / 1024 / 1024;
+        $ceilingMb = $this->maxAttachBytes() / 1024 / 1024;
         if ($attachTier === 'full') {
             $this->log("  EviData attachments: full report PDF(s), "
                 . round($totalBytes / 1024 / 1024, 1) . "MB total");
