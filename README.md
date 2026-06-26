@@ -808,9 +808,15 @@ Per-project in `project.json`:
             "enabled": true,
             "on_success": ["team@example.com"],
             "on_error": ["admin@example.com"]
+        },
+        "evidata": {
+            "enabled": true,
+            "on_check_failed": ["team@example.com"]
         }
     }
 }
 ```
+
+The `evidata` channel differs from the others: it has a single `on_check_failed` list (privacy-check failures) instead of `on_success`/`on_error`.
 
 ---
