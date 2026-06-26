@@ -65,6 +65,64 @@ nano config/loris_client_config.json
 
 Each project requires a `project.json` file at its root. See `config/project.json.example` for reference.
 
+### EviData Configuration
+
+EviData settings are split across two files: service/connection settings go in the **global** `config/evidata_config.json` (shared by every project on the host), and per-project policy goes in each **`project.json`**. The pipeline merges both, with project values taking precedence.
+
+**Global — `config/evidata_config.json`** (the service connection, the same for all projects):
+
+```json
+"evidata": {
+  "enabled": true,
+  "api_base_url": "https://cbigr-docker.loris.ca/api",
+  "token_url": "https://<keycloak-host>/.../token",
+  "client_id": "<keycloak-client-id>",
+  "client_secret_env": "EVIDATA_CLIENT_SECRET",
+  "username_env": "EVIDATA_USERNAME",
+  "password_env": "EVIDATA_PASSWORD",
+  "population_size": 500000,
+  "pdf_compression": "200",
+  "mta_message_size_limit_mb": 10
+}
+```
+
+**Per-project — `project.json`** (QI policy and who gets notified for this project):
+
+```json
+"evidata": {
+  "qis": [],
+  "exclude_qis": []
+},
+"notification_emails": {
+  "evidata": {
+    "enabled": true,
+    "on_check_failed": ["team@example.com"]
+  }
+}
+```
+
+A few things worth knowing:
+
+- Set `population_size` explicitly — the default does not reflect the true study population and skews the risk result.
+- `mta_message_size_limit_mb` should match the mail host's limit (`postconf message_size_limit`, in MB) and is per-host. It controls when failure-report attachments get compressed before emailing.
+- Leave `qis`/`exclude_qis` empty to use all columns as quasi-identifiers (the all-headers default), or list specific columns to override.
+- Failure-report recipients use the `on_check_failed` key (not `on_success`/`on_error` like the other channels).
+
+**Credentials (environment file).** Credentials are never stored in the JSON config. The config holds only the *names* of the environment variables (`client_secret_env`, `username_env`, `password_env`); the actual values come from an env file that the clinical runner loads automatically at startup — so cron does not need to `source` anything and a forgotten `source` cannot break a run.
+
+Create the env file once (default location `/home/lorisadmin/evidata/evidata.env`):
+
+```bash
+# /home/lorisadmin/evidata/evidata.env
+EVIDATA_CLIENT_SECRET=...
+EVIDATA_USERNAME=...
+EVIDATA_PASSWORD=...
+```
+
+The runner resolves the file path in this order: the `EVIDATA_ENV_FILE` environment variable, then an `env_file` key in `evidata_config.json`, then the default above. A real environment variable, if already set in the shell, always takes precedence over the file. If a variable is missing entirely the pipeline fails fast and names what it expected; values are never written to logs.
+
+See `config/evidata_config.json.example` for the complete set of available keys and defaults.
+
 ---
 
 ## Clinical Ingestion Workflow
@@ -115,6 +173,26 @@ Collections and projects are defined in `loris_client_config.json`. Each collect
 ### Instrument Data Dictionary Location
 
 Instrument Data Dictionary should be placed in the project's `documentation/data_dictionary/` folder. The pipeline automatically detects the format (LINST or REDCap CSV) and installs accordingly.
+
+### EviData Privacy-Risk Validation
+
+EviData (by Woodway Assurance) provides automated privacy-risk validation for tabular clinical data. It applies only to the clinical pipeline; imaging, DICOM, and BIDS pipelines are not affected.
+
+**Setup**
+
+EviData runs as a separate service that the clinical pipeline calls over HTTP. Before running the pipeline against EviData, ensure:
+
+- The EviData service is reachable at the host/port configured in your config file. Do not point production runs at a local install or personal dev VM; use the shared, provisioned EviData host.
+- The EviData connection settings (base URL, company tag, population size, QI configuration) are set in config. Nothing is hardcoded — the population size in particular must be set explicitly in config, as the client default does not match study requirements.
+- For emailed failure reports, set `mta_message_size_limit_mb` in the EviData config to match the mail host's `postconf message_size_limit` (value in MB). This is per-host: the dev VM and production targets may differ. When a failed-report attachment batch would exceed this limit, the pipeline compresses the report PDFs with `mutool` before sending; install it with `sudo apt install mupdf-tools`.
+
+**Usage**
+
+When EviData is enabled, each clinical file passes through the validation lifecycle (upload → validate → generate → poll → results → download report) as part of normal ingestion. Files that pass are ingested; files that fail the privacy check are skipped (not ingested) and retried on the next run. For failed files, a privacy-risk report is emailed to the configured recipients, with all report artifacts also preserved under the project's `logs/evidata/` directory.
+
+When the combined report attachments exceed the configured mail size limit, the pipeline first compresses the whole batch, then falls back to shorter summary PDFs, and finally to a contact-the-team note if even those do not fit. If `mutool` is not installed, compression is skipped and the pipeline says so in the log before falling back.
+
+QI (quasi-identifier) resolution follows this precedence: project `project.json` → global `evidata_config.json` → all-headers default.
 
 ---
 
@@ -652,6 +730,29 @@ php scripts/run_participant_metadata_pipeline.php --all --force
     ├── data_dictionary/                  # Instrument Data Dictionary (.linst, REDCap CSV)
     └── readme.txt
 ```
+
+### Directory Permissions
+
+The pipeline treats the de-identified input directories as **read-only** and writes only to its own output and log trees. Getting these permissions right matters: a missing write bit causes silent failures (tracking not persisted, snapshots not archived, EviData artifacts not saved) while reads still succeed, so the run appears to work but loses state between runs.
+
+**Read-only (the pipeline never writes here):**
+- `deidentified-raw/` and its subdirectories (`clinical/`, `bids/`, `imaging/`, `genomics/`)
+- `documentation/data_dictionary/`
+
+**Read-write (the pipeline must be able to create and write files here):**
+- `processed/` and all its subdirectories (`clinical/`, `imaging/`, `bids/`, `participant_metadata/`, etc.)
+- `logs/` and all its subdirectories (`clinical/`, `dicom/`, `evidata/`, `participant_metadata/`)
+- In-place tracking files: `.clinical_tracking.json` under `processed/clinical/`, `.dicom_import_processed.json` under `deidentified-raw/imaging/dicoms/`, `.participant_metadata_tracking.json` under `processed/participant_metadata/`
+
+```bash
+# Owner + group read/write/execute, others read/execute; setgid for inheritance.
+sudo chmod -R 2775 PROJECT/processed PROJECT/logs
+sudo chown -R <pipeline_user>:<group> PROJECT/processed PROJECT/logs
+```
+
+The owner bits matter most: a directory owned by the pipeline user but with the owner bits cleared (e.g. `d---rwxrwx`) locks the owner out entirely, because Linux applies the owner class first and does not fall through to group permissions. Verify with `ls -ld` — you want the owner to show `rwx` (e.g. `drwxrwsr-x`).
+
+On NFS-mounted data, the mount must export these paths read-write and the mount owner/permissions must match the pipeline account; a read-only or mismatched-ownership mount (e.g. NFS `root_squash` mapping `sudo` to `nobody`) will cause write failures even though reads succeed. In that case the export itself, not just the local permissions, must be corrected on the NFS server.
 
 ---
 
