@@ -23,6 +23,7 @@ declare(strict_types=1);
  *   5. /api/health endpoint responds       (no auth)
  *   6. Keycloak token endpoint issues a bearer token (with openid scope)
  *   7. /api/datasets works with that token  (authenticated round-trip)
+ *   8. /api/auth/login + /api/auth/me session round-trip
  *
  * Note on the token scope: the EviData API rejects bearer tokens
  * issued without the 'openid' scope (HTTP 401 "Failed to authenticate
@@ -361,6 +362,81 @@ if ($dsCode === 200) {
 } else {
     $excerpt = strlen($dsBody) > 300 ? substr($dsBody, 0, 300) . '…' : $dsBody;
     echo "     response: {$excerpt}\n";
+}
+
+// ── Test 8: EviData session auth (/api/auth/login + /api/auth/me) ───
+// Tests 6-7 cover programmatic bearer-token access. This exercises
+// the app's browser/cookie login instead — /api/auth/me only accepts
+// the session cookie, so this is the one way to smoke-test it.
+echo "\n[7] Session auth (/api/auth/login + /api/auth/me)\n";
+
+$ch = curl_init("{$apiBase}/auth/login");
+curl_setopt_array($ch, [
+    CURLOPT_RETURNTRANSFER => true,
+    CURLOPT_POST           => true,
+    CURLOPT_POSTFIELDS     => json_encode(['username' => $user, 'password' => $pass]),
+    CURLOPT_HTTPHEADER     => ['Content-Type: application/json'],
+    CURLOPT_COOKIEFILE     => '',   // enable in-memory cookie engine
+    CURLOPT_TIMEOUT        => 15,
+]);
+$loginBody = curl_exec($ch);
+$loginCode = curl_getinfo($ch, CURLINFO_HTTP_CODE);
+$loginErr  = curl_error($ch);
+
+// Some builds expose login as form-encoded rather than JSON — retry
+// once before declaring failure.
+if ($loginBody !== false && in_array($loginCode, [400, 415, 422], true)) {
+    curl_setopt_array($ch, [
+        CURLOPT_URL        => "{$apiBase}/auth/login",
+        CURLOPT_POSTFIELDS => http_build_query(['username' => $user, 'password' => $pass]),
+        CURLOPT_HTTPHEADER => ['Content-Type: application/x-www-form-urlencoded'],
+    ]);
+    $loginBody = curl_exec($ch);
+    $loginCode = curl_getinfo($ch, CURLINFO_HTTP_CODE);
+    $loginErr  = curl_error($ch);
+}
+
+if ($loginBody === false) {
+    $check('POST /api/auth/login responds', false, "cURL error: {$loginErr}");
+    curl_close($ch);
+} else {
+    $check('POST /api/auth/login HTTP 200', $loginCode === 200, "HTTP {$loginCode}");
+
+    if ($loginCode === 200) {
+        // Reuse the same handle so the session cookie carries over.
+        curl_setopt_array($ch, [
+            CURLOPT_URL        => "{$apiBase}/auth/me",
+            CURLOPT_HTTPGET    => true,
+            CURLOPT_HTTPHEADER => [],
+        ]);
+        $meBody = curl_exec($ch);
+        $meCode = curl_getinfo($ch, CURLINFO_HTTP_CODE);
+        $meErr  = curl_error($ch);
+
+        if ($meBody === false) {
+            $check('GET /api/auth/me responds', false, "cURL error: {$meErr}");
+        } else {
+            $check('GET /api/auth/me HTTP 200', $meCode === 200, "HTTP {$meCode}");
+            if ($meCode === 200) {
+                $me = json_decode($meBody, true);
+                if (is_array($me)) {
+                    $who = $me['username']
+                        ?? $me['preferred_username']
+                        ?? $me['email']
+                        ?? '?';
+                    $check('session identity matches login user',
+                        $who === $user, "server says '{$who}'");
+                }
+            } else {
+                $excerpt = strlen($meBody) > 300 ? substr($meBody, 0, 300) . '…' : $meBody;
+                echo "     response: {$excerpt}\n";
+            }
+        }
+    } else {
+        $excerpt = strlen($loginBody) > 300 ? substr($loginBody, 0, 300) . '…' : $loginBody;
+        echo "     response: {$excerpt}\n";
+    }
+    curl_close($ch);
 }
 
 // ── Summary ─────────────────────────────────────────────────────────

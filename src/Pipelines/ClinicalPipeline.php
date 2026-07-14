@@ -130,6 +130,18 @@ class ClinicalPipeline
     ];
 
     /**
+     * candidate_defaults keys consumed by the clinical pipeline, mapped to
+     * the CSV column name they stamp. Extend later with e.g.
+     * 'redcap_event_name' => 'redcap_event_name', 'visit_label' => 'Visit_label'.
+     * Config is authoritative: every row gets the configured value.
+     */
+    private const CLINICAL_DEFAULT_COLUMNS = [
+        'project' => 'Project',
+        'cohort'  => 'Cohort',
+        'site'    => 'Site',
+    ];
+
+    /**
      * Default MTA message_size_limit in MB, used when the host's
      * evidata_config.json does not set evidata.mta_message_size_limit_mb.
      * The real per-host value (from `postconf message_size_limit`) should
@@ -1909,8 +1921,24 @@ class ClinicalPipeline
             return;
         }
 
-        $uploadPath = $this->normalizeDatesInFile($filePath, $format);
-        $usingTemp  = ($uploadPath !== $filePath);
+        // Stamp project/cohort/site from project.json candidate_defaults
+        // BEFORE anything touches the instrument endpoint. Original stays
+        // read-only; ingestion reads the processed copy.
+        $sourcePath = $this->applyCandidateDefaults($project, $filePath, $format);
+        if ($sourcePath === null) {
+            $this->writeError($filename, "candidate_defaults: processed copy could not be created");
+            $this->dataResults[$filename] = [
+                'status'        => 'failed',
+                'reason'        => 'candidate_defaults processed copy failed',
+                'rows'          => $rows,
+                'change_status' => $changeStatus,
+            ];
+            $this->stats['data_failed']++;
+            return;
+        }
+
+        $uploadPath = $this->normalizeDatesInFile($sourcePath, $format);
+        $usingTemp  = ($uploadPath !== $sourcePath);
 
         try {
             if ($this->client->instrumentExists($baseName)) {
@@ -1973,6 +2001,140 @@ class ClinicalPipeline
                 @unlink($uploadPath);
             }
         }
+    }
+
+    /**
+     * Stamp project/cohort/site from project.json -> candidate_defaults
+     * onto a data file BEFORE it reaches the instrument upload endpoint.
+     * Same source of truth as the BIDS participants.tsv enrichment.
+     *
+     * Config is a FALLBACK, not an override. For each key in
+     * CLINICAL_DEFAULT_COLUMNS present in candidate_defaults:
+     *   - column absent from the header -> appended, stamped on every row
+     *   - column present, cell blank    -> filled from config
+     *   - column present, cell populated-> left alone (the file wins)
+     * A key absent from candidate_defaults never stamps.
+     *
+     * A file that needs nothing gets no processed copy: the original path
+     * is returned and ingestion reads it directly. In practice only the
+     * REDCap exports, which omit these columns, reach processed/clinical/.
+     *
+     * The original in deidentified-raw/ is NEVER modified (read-only
+     * contract). Returns the processed path; the ORIGINAL path when
+     * nothing needed a default; or null on read/write failure - the
+     * caller fails the file rather than ingesting without the defaults.
+     */
+    private function applyCandidateDefaults(array $project, string $srcPath, string $format): ?string
+    {
+        $defaults = $project['candidate_defaults'] ?? [];
+
+        // Only the keys this pipeline consumes, and only when present.
+        // REDCap-format files use lowercase structural column names
+        // (project/site/cohort) - stamp with matching casing so the
+        // server-side header check recognises the appended columns.
+        $isRedcap = $this->client->isRedcapCSV($srcPath);
+
+        $apply = [];   // CSV column name => value
+        foreach (self::CLINICAL_DEFAULT_COLUMNS as $key => $column) {
+            if (isset($defaults[$key]) && $defaults[$key] !== '') {
+                $col         = $isRedcap ? strtolower($column) : $column;
+                $apply[$col] = (string)$defaults[$key];
+            }
+        }
+        if ($apply === []) {
+            return $srcPath;
+        }
+
+        $delimiter = ($format === 'BIDS_TSV') ? "\t" : ',';
+        $basename  = basename($srcPath);
+
+        $in = fopen($srcPath, 'r');
+        if ($in === false) {
+            $this->log("    candidate_defaults: cannot read {$basename}");
+            return null;
+        }
+        $headers = fgetcsv($in, 0, $delimiter);
+        if (!is_array($headers) || $headers === []) {
+            fclose($in);
+            $this->log("    candidate_defaults: no header row in {$basename}");
+            return null;
+        }
+
+        // Match case-insensitively: an existing column keeps the file's
+        // casing and is only filled where blank; a missing one is
+        // appended and stamped on every row.
+        $headersLower = array_map(fn($h) => strtolower(trim((string)$h)), $headers);
+        $origCount    = count($headers);
+        $fillIndex    = [];   // column => index of the existing column
+        $appended     = [];   // columns added to the header
+        foreach (array_keys($apply) as $column) {
+            $idx = array_search(strtolower($column), $headersLower, true);
+            if ($idx !== false) {
+                $fillIndex[$column] = $idx;
+            } else {
+                $appended[] = $column;
+                $headers[]  = $column;
+            }
+        }
+
+        $outDir = rtrim($project['data_access']['mount_path'] ?? $project['_projectPath'], '/')
+            . '/processed/clinical';
+        if (!is_dir($outDir) && !mkdir($outDir, 0755, true)) {
+            fclose($in);
+            $this->log("    candidate_defaults: cannot create {$outDir}");
+            return null;
+        }
+        $outPath = "{$outDir}/{$basename}";
+
+        $out = fopen($outPath, 'w');
+        if ($out === false) {
+            fclose($in);
+            $this->log("    candidate_defaults: cannot write {$outPath}");
+            return null;
+        }
+        fputcsv($out, $headers, $delimiter);
+
+        $filled = array_fill_keys(array_keys($fillIndex), 0);
+        $rows   = 0;
+        while (($row = fgetcsv($in, 0, $delimiter)) !== false) {
+            $rows++;
+            $row = array_pad($row, $origCount, '');
+            foreach ($fillIndex as $column => $idx) {
+                if (trim((string)$row[$idx]) === '') {
+                    $row[$idx] = $apply[$column];
+                    $filled[$column]++;
+                }
+            }
+            foreach ($appended as $column) {
+                $row[] = $apply[$column];
+            }
+            fputcsv($out, $row, $delimiter);
+        }
+        fclose($in);
+        fclose($out);
+
+        // Nothing was missing - the copy matches the original, so discard
+        // it and ingest the original. Only files that actually needed a
+        // default reach processed/clinical/.
+        if ($appended === [] && array_sum($filled) === 0) {
+            @unlink($outPath);
+            $this->log("    candidate_defaults: {$basename} already carries every target column - using file as-is");
+            return $srcPath;
+        }
+
+        $parts = [];
+        foreach ($appended as $column) {
+            $parts[] = "{$column}={$apply[$column]} (column added)";
+        }
+        foreach ($filled as $column => $n) {
+            if ($n > 0) {
+                $parts[] = "{$column}={$apply[$column]} ({$n}/{$rows} blank cell(s) filled)";
+            }
+        }
+        $this->log("    candidate_defaults applied from project.json: " . implode(', ', $parts));
+        $this->log("    Processed copy: processed/clinical/{$basename}");
+
+        return $outPath;
     }
 
     private function detectInstrumentsFromHeaders(string $filePath, string $format): array
