@@ -144,10 +144,12 @@ if (empty($evi['enabled'])) {
     $check('evidata.enabled', true);
 }
 
-// Required keys for connecting.
+// Keys required to CONNECT. 'qis' is deliberately NOT required: an
+// empty/absent qis means ALL-HEADERS mode in ClinicalPipeline, and this
+// script never uploads a dataset, so it needs no QI list at all.
 $required = [
     'api_base_url', 'token_url', 'client_id',
-    'client_secret_env', 'username_env', 'password_env', 'qis',
+    'client_secret_env', 'username_env', 'password_env',
 ];
 $missing = array_filter($required, fn($k) => empty($evi[$k]));
 if (!empty($missing)) {
@@ -162,7 +164,16 @@ $scope = $evi['scope'] ?? $defaultScope;
 echo "     api_base_url : {$evi['api_base_url']}\n";
 echo "     token_url    : {$evi['token_url']}\n";
 echo "     client_id    : {$evi['client_id']}\n";
-echo "     qis          : [" . implode(', ', $evi['qis']) . "]\n";
+// qis may be absent (all-headers mode), a flat list, or a per-file map.
+$qis = $evi['qis'] ?? [];
+if (is_array($qis) && $qis !== []) {
+    $isFlatList = array_keys($qis) === range(0, count($qis) - 1);
+    echo "     qis          : " . ($isFlatList
+            ? '[' . implode(', ', $qis) . ']'
+            : 'per-file map (' . count($qis) . ' entries)') . "\n";
+} else {
+    echo "     qis          : (none — pipeline will use ALL HEADERS mode)\n";
+}
 echo "     scope        : {$scope}\n";
 
 // ── Test 2: env vars ─────────────────────────────────────────────────
@@ -295,6 +306,33 @@ if ($tokBody === false) {
 
 if ($tokCode !== 200) {
     $excerpt = strlen($tokBody) > 300 ? substr($tokBody, 0, 300) . '…' : $tokBody;
+    $tokJson = json_decode($tokBody, true);
+    $errCode = is_array($tokJson) ? ($tokJson['error'] ?? '') : '';
+
+    // Keycloak reports bad credentials as 400 invalid_grant (wrong
+    // username/password) or 401 invalid_client (wrong client_id/secret).
+    // Say "authentication failed" outright rather than leaving an
+    // HTTP code to be decoded.
+    $isAuthFailure = in_array($tokCode, [400, 401], true)
+        && in_array($errCode, ['invalid_grant', 'invalid_client', 'unauthorized_client'], true);
+
+    if ($isAuthFailure) {
+        $check('AUTHENTICATION', false,
+            "FAILED — Keycloak rejected the credentials (HTTP {$tokCode} {$errCode})");
+        echo "\n ✗ AUTHENTICATION FAILED — the credentials are wrong.\n\n";
+        if ($errCode === 'invalid_grant') {
+            echo "  Wrong username or password:\n";
+            echo "    - check {$userEnv} / {$passEnv} in {$evidataEnvFile}\n";
+            echo "    - or the user does not exist in Keycloak (ask Jefferson to add you)\n";
+        } else {
+            echo "  Wrong client credentials:\n";
+            echo "    - {$secretEnv} must match APP_API_CLIENT_ID_SECRET on the EviData server\n";
+            echo "    - client_id in the config is '{$evi['client_id']}'\n";
+        }
+        echo "\n";
+        exit(1);
+    }
+
     $check('token request HTTP 200', false, "HTTP {$tokCode}: {$excerpt}");
     echo "\nCommon causes:\n";
     echo "  - Wrong client_secret (check APP_API_CLIENT_ID_SECRET on EviData server)\n";
@@ -400,7 +438,14 @@ if ($loginBody === false) {
     $check('POST /api/auth/login responds', false, "cURL error: {$loginErr}");
     curl_close($ch);
 } else {
-    $check('POST /api/auth/login HTTP 200', $loginCode === 200, "HTTP {$loginCode}");
+    if (in_array($loginCode, [401, 403], true)) {
+        // Same wording as the token test: a rejected login is an
+        // authentication failure, not a generic bad status code.
+        $check('POST /api/auth/login accepts credentials', false,
+            "AUTHENTICATION FAILED — session login rejected the credentials (HTTP {$loginCode})");
+    } else {
+        $check('POST /api/auth/login HTTP 200', $loginCode === 200, "HTTP {$loginCode}");
+    }
 
     if ($loginCode === 200) {
         // Reuse the same handle so the session cookie carries over.
