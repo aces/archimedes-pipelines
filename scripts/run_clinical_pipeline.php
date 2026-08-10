@@ -1,9 +1,16 @@
 #!/usr/bin/env php
 <?php
 /**
- * LORIS Clinical Data Ingestion Pipeline Runner
+ * ARCHIMEDES Clinical Data Ingestion Pipeline Runner
  *
- * Uses LORIS API (priority) with database fallback
+ * Uses the ARCHIMEDES API (priority) with database fallback
+ *
+ * Data sources:
+ *   deidentified-raw/clinical/        .csv / .tsv
+ *   deidentified-raw/bids/phenotype/  BIDS phenotype .tsv
+ *
+ * All data dictionaries (.linst, REDCap .csv, BIDS .json) live in
+ * documentation/data_dictionary/ — none are read from phenotype/.
  */
 
 require __DIR__ . '/../vendor/autoload.php';
@@ -66,7 +73,7 @@ $opts = getopt('', ['collection::', 'project::', 'instrument::', 'all::', 'dry-r
 if (isset($opts['help'])) {
     echo <<<'HELP'
 
-LORIS Clinical Data Ingestion Pipeline
+ARCHIMEDES Clinical Data Ingestion Pipeline
 
 Usage:
   php scripts/run_clinical_pipeline.php [OPTIONS]
@@ -78,18 +85,20 @@ Options:
   --all                Process all enabled projects
   --dry-run            Test mode (no uploads)
   --force              Bypass hash check — re-upload all files even if unchanged
-                       (LORIS will still skip rows that already exist)
+                       (ARCHIMEDES will still skip rows that already exist)
   --verbose            Debug output
   --help               Show this help
 
 Reingestion behaviour:
+  Applies to files from deidentified-raw/clinical/ and from
+  deidentified-raw/bids/phenotype/ alike.
   Each file's MD5 hash is stored in processed/clinical/.clinical_tracking.json.
   On every run the pipeline compares the current hash to the stored one:
 
-    No entry in tracking  →  FIRST UPLOAD   (all rows sent, LORIS inserts everything)
-    Hash differs          →  RE-INGESTION   (full file sent, LORIS saves only new rows)
+    No entry in tracking  →  FIRST UPLOAD   (all rows sent, ARCHIMEDES inserts everything)
+    Hash differs          →  RE-INGESTION   (full file sent, ARCHIMEDES saves only new rows)
     Hash matches          →  SKIPPED        (file unchanged, nothing sent)
-    --force flag set      →  RE-INGESTION   (always re-uploads, LORIS skips existing rows)
+    --force flag set      →  RE-INGESTION   (always re-uploads, ARCHIMEDES skips existing rows)
 
   To reset a single file's tracking entry (force it to re-upload next run):
     Delete its key from processed/clinical/.clinical_tracking.json
@@ -97,7 +106,8 @@ Reingestion behaviour:
 EviData privacy gate:
   When config/evidata_config.json exists AND its "enabled" field is true,
   every project run starts with a privacy check against the configured
-  EviData service. Failures abort that project entirely (no LORIS write,
+  EviData service. BIDS phenotype TSVs go through the same gate as
+  clinical CSVs. Failures abort that project entirely (no ARCHIMEDES write,
   no tracking update) and send a notification to the project's evidata
   recipients with the report ZIPs attached.
 
@@ -129,7 +139,7 @@ Examples:
   # Dry run first (always recommended)
   php scripts/run_clinical_pipeline.php --all --dry-run --verbose
 
-  # Force re-upload all files (LORIS still skips existing rows)
+  # Force re-upload all files (ARCHIMEDES still skips existing rows)
   php scripts/run_clinical_pipeline.php --all --force
 
   # Force re-upload for one project
@@ -139,13 +149,22 @@ Directory Structure:
   /data/{collection}/{project}/
   ├── project.json
   ├── deidentified-raw/
-  │   └── clinical/                      ← Place CSV/TSV files here
-  │       ├── instrument1.csv
-  │       └── instrument2.csv
+  │   ├── clinical/                      ← Place CSV/TSV files here
+  │   │   ├── instrument1.csv
+  │   │   └── instrument2.csv
+  │   └── bids/
+  │       └── phenotype/                 ← BIDS phenotype .tsv here
+  │           └── moca.tsv
+  ├── documentation/
+  │   └── data_dictionary/               ← ALL dictionaries here, incl. moca.json
   └── processed/
       ├── .clinical_tracking.json        ← Hash tracking (auto-managed)
       └── clinical/2025-11-10/           ← Snapshots archived after each upload
           └── instrument1.csv
+
+  Filenames must be unique across clinical/ and bids/phenotype/ —
+  tracking, privacy artifacts and the processed copy are keyed by
+  filename. A colliding phenotype file is reported and not ingested.
 
 Cron:
   0 2 * * * cd /opt/archimedes-pipelines && php scripts/run_clinical_pipeline.php --all
@@ -155,7 +174,7 @@ HELP;
 }
 
 try {
-    // ── Load LORIS client config ────────────────────────────────────
+    // ── Load ARCHIMEDES client config ───────────────────────────────
     $configFile = __DIR__ . '/../config/loris_client_config.json';
 
     if (!file_exists($configFile)) {
@@ -170,7 +189,7 @@ try {
 
     // ── Optionally merge EviData config ─────────────────────────────
     // EviData lives in its own file so its settings can be edited
-    // independently of LORIS API config. The pipeline still sees
+    // independently of ARCHIMEDES API config. The pipeline still sees
     // $config['evidata'] exactly as if the block were inline — the
     // merge happens here at load time.
     //

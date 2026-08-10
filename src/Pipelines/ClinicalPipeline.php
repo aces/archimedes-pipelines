@@ -14,9 +14,19 @@ use Psr\Log\LoggerInterface;
  *
  * Read-only contract:
  *   The user-shared input subdirectories are treated as READ-ONLY. The
- *   pipeline NEVER writes to deidentified-raw/clinical/ or
- *   documentation/data_dictionary/. It only writes to its own
- *   subdirectories: processed/clinical/, logs/clinical/, logs/evidata/.
+ *   pipeline NEVER writes to deidentified-raw/clinical/,
+ *   deidentified-raw/bids/phenotype/ or documentation/data_dictionary/.
+ *   It only writes to its own subdirectories: processed/clinical/,
+ *   logs/clinical/, logs/evidata/.
+ *
+ * Data sources:
+ *   deidentified-raw/clinical/        .csv and .tsv data files
+ *   deidentified-raw/bids/phenotype/  BIDS phenotype .tsv data files
+ *   documentation/data_dictionary/    ALL dictionaries: .linst / REDCap
+ *                                     .csv / BIDS .json
+ *   Both data directories feed one list (discoverDataFiles) so the
+ *   privacy gate and the upload step always see the same files.
+ *   Filenames must be unique across the two data directories.
  *
  * EviData privacy pre-flight gate — quasi-identifier (qis) resolution:
  *   QI lists are resolved with the following precedence:
@@ -112,6 +122,36 @@ class ClinicalPipeline
 
     private const DEFAULT_EXCLUDE_FORMS = ['nip_connector', 'project_request_form'];
 
+    /**
+     * Clinical data directory, relative to the project mount.
+     */
+    private const CLINICAL_DIR = 'deidentified-raw/clinical';
+
+    /**
+     * BIDS phenotype directory, relative to the project mount.
+     *
+     * BIDS keeps tabular phenotype measures at the dataset root in
+     * phenotype/. Phenotype data is clinical data, so the clinical
+     * pipeline owns it: the .tsv files ingest as BIDS_TSV. The
+     * instrument endpoint resolves participant_id / session_id itself —
+     * see ClinicalClient::validateColumns(), which lists both as
+     * structural columns — so nothing is remapped here.
+     *
+     * DATA ONLY. Data dictionaries are never read from here: every
+     * dictionary, including a BIDS .json, lives in
+     * documentation/data_dictionary/. A .json sitting next to a .tsv in
+     * phenotype/ is ignored.
+     *
+     * Read-only, exactly like deidentified-raw/clinical.
+     */
+    private const PHENOTYPE_DIR = 'deidentified-raw/bids/phenotype';
+
+    /**
+     * Data-file extensions accepted from PHENOTYPE_DIR. Only .tsv.
+     */
+    private const PHENOTYPE_DATA_EXTENSIONS = ['tsv' => 'BIDS_TSV'];
+
+
     /** Key in a qis map supplying the QI list for files with no exact match. */
     private const QIS_DEFAULT_KEY = '_default';
 
@@ -123,6 +163,44 @@ class ClinicalPipeline
      * and not as a flat-list element.
      */
     private const QIS_ALL_HEADERS = '*';
+
+    /**
+     * Candidate-identifier column names, in priority order, matched
+     * case-insensitively against the header. Drawn from the structural
+     * columns ClinicalClient::validateColumns() treats as essential, so
+     * the same names LORIS uses to locate a candidate are the ones row
+     * tracking keys on. Overridable per project via
+     * project.json -> row_tracking.identifier_columns.
+     */
+    private const ROW_ID_COLUMNS = [
+        'PSCID', 'CandID', 'candid', 'participant_id', 'study_id', 'StudyID',
+        // REDCap's default record identifier. Last in priority: when an
+        // export carries both, study_id is what LORIS keys the candidate
+        // on, so it wins. Present here so a stock REDCap export still
+        // gets row-level tracking instead of falling back to whole-file.
+        'record_id',
+    ];
+
+    /**
+     * Session/visit column names, in priority order. A file with no
+     * visit column still tracks rows — the key is then the identifier
+     * alone.  Overridable via project.json -> row_tracking.visit_columns.
+     */
+    private const ROW_VISIT_COLUMNS = [
+        'Visit_label', 'visit_label', 'session_id', 'redcap_event_name',
+    ];
+
+    /**
+     * Extra columns folded into the row key when present. REDCap repeat
+     * instruments put several rows on one candidate+event, which would
+     * otherwise collapse to a single key.
+     */
+    private const ROW_QUALIFIER_COLUMNS = [
+        'redcap_repeat_instrument', 'redcap_repeat_instance',
+    ];
+
+    /** Field separator used when hashing a row's cells. */
+    private const ROW_HASH_SEPARATOR = "\x1F";
 
     private const DATE_COLUMN_NAMES = [
         'dob', 'date_of_birth', 'birth_date',
@@ -188,7 +266,7 @@ class ClinicalPipeline
         if ($this->dryRun) {
             $this->logger->info("╔══════════════════════════════════════════════════════════╗");
             $this->logger->info("║  MODE: DRY RUN                                           ║");
-            $this->logger->info("║  - No data will be ingested into LORIS                   ║");
+            $this->logger->info("║  - No data will be ingested into ARCHIMEDES              ║");
             $this->logger->info("║  - No outcome notifications will be sent                 ║");
             $this->logger->info("║  - Mount-failure alerts still go to the tech team        ║");
             $this->logger->info("║  - Run again without --dry-run to actually ingest data   ║");
@@ -243,8 +321,9 @@ class ClinicalPipeline
             return;
         }
 
-        $ddDir   = "{$mountPath}/documentation/data_dictionary";
-        $dataDir = "{$mountPath}/deidentified-raw/clinical";
+        $ddDir    = "{$mountPath}/documentation/data_dictionary";
+        $dataDir  = "{$mountPath}/" . self::CLINICAL_DIR;
+        $phenoDir = "{$mountPath}/" . self::PHENOTYPE_DIR;
 
         $this->logDir = "{$mountPath}/logs/clinical";
         $this->openRunLog();
@@ -252,8 +331,10 @@ class ClinicalPipeline
         $this->log("========================================");
         $this->log("Project: {$name}");
         $this->log("Run: {$this->runTimestamp}");
-        $this->log("DD dir   (read-only): {$ddDir}");
-        $this->log("Data dir (read-only): {$dataDir}");
+        $this->log("DD dir    (read-only): {$ddDir}");
+        $this->log("Data dir  (read-only): {$dataDir}");
+        $this->log("Phenotype (read-only): {$phenoDir}"
+            . (is_dir($phenoDir) ? "" : "  [absent - skipped]"));
         $this->log("========================================");
         $this->log("  ✓ Data accessible: {$mountPath}");
 
@@ -267,7 +348,12 @@ class ClinicalPipeline
         // Files that pass are ingested; files that fail (bad verdict)
         // or error (no verdict) are skipped and retried next run. The
         // project is NOT aborted as a whole — passing files proceed.
-        $evidataOutcome = $this->runEvidataPreflight($project, $mountPath, $dataDir);
+        // One file list for the whole project: clinical CSV/TSV plus
+        // BIDS phenotype TSV. The SAME list feeds the privacy gate and
+        // the upload step, so the two can never drift apart.
+        $dataFiles = $this->discoverDataFiles($dataDir, $phenoDir);
+
+        $evidataOutcome = $this->runEvidataPreflight($project, $mountPath, $dataFiles);
 
         if ($evidataOutcome === 'all_passed') {
             $this->log("");
@@ -291,7 +377,7 @@ class ClinicalPipeline
         $this->loadTrackingFile($project);
 
         $this->installFromDirectory($ddDir);
-        $this->uploadFromDirectory($project, $dataDir);
+        $this->uploadFromDirectory($project, $dataFiles);
 
         $this->saveTrackingFile();
 
@@ -318,7 +404,7 @@ class ClinicalPipeline
             $this->candidateClassificationAvailable = true;
             $this->log("  Pre-run candidate snapshot: "
                 . count($this->existingCandIdsAtProjectStart)
-                . " CandID(s) already in LORIS");
+                . " CandID(s) already in ARCHIMEDES");
         } catch (\Exception $e) {
             $this->log("  Pre-run candidate snapshot FAILED: " . $e->getMessage()
                 . " - new-candidate count unavailable for this run");
@@ -330,17 +416,23 @@ class ClinicalPipeline
     // ══════════════════════════════════════════════════════════════════
 
     /**
-     * Run the EviData pre-flight against every CSV/TSV in $clinicalDir,
-     * PER FILE. Records the basenames that did NOT pass in
+     * Run the EviData pre-flight against every data file the project
+     * offers, PER FILE. Records the basenames that did NOT pass in
      * $this->evidataFailedFiles so ingestion can skip them.
      *
+     * The file list is supplied by discoverDataFiles() — clinical CSV/TSV
+     * plus BIDS phenotype TSV — so phenotype data goes through exactly
+     * the same privacy gate as any other clinical file.
+     *
+     * @param array<array{path:string,name:string,format:string,source:string}> $dataFiles
+     *
      * Returns one of:
-     *   'skipped'    — gate disabled / no clinical dir / no CSV files
+     *   'skipped'    — gate disabled / no data files
      *   'all_passed' — every file passed
      *   'partial'    — some passed, some failed/errored
      *   'all_failed' — no file passed
      */
-    private function runEvidataPreflight(array $project, string $mountPath, string $clinicalDir): string
+    private function runEvidataPreflight(array $project, string $mountPath, array $dataFiles): string
     {
         $evi = $this->resolveEvidataConfig();
         if ($evi === null) {
@@ -348,25 +440,23 @@ class ClinicalPipeline
             return 'skipped';
         }
 
-        if (!is_dir($clinicalDir)) {
-            $this->log("  EviData: no clinical dir at {$clinicalDir} — nothing to check");
-            return 'skipped';
-        }
-
-        $csvFiles = array_merge(
-            glob("{$clinicalDir}/*.csv") ?: [],
-            glob("{$clinicalDir}/*.tsv") ?: []
-        );
+        $csvFiles = array_column($dataFiles, 'path');
         sort($csvFiles);
 
         if (empty($csvFiles)) {
-            $this->log("  EviData: no CSV/TSV files in {$clinicalDir} — nothing to check");
+            $this->log("  EviData: no CSV/TSV data files for this project — nothing to check");
             return 'skipped';
         }
 
+        $phenoCount = count(array_filter(
+            $dataFiles,
+            fn(array $f) => ($f['source'] ?? 'clinical') === 'phenotype'
+        ));
+
         $this->log("");
         $this->log("──── EVIDATA PRE-FLIGHT" . ($this->dryRun ? " [DRY RUN]" : "") . " ────");
-        $this->log("  Checking " . count($csvFiles) . " file(s) against EviData");
+        $this->log("  Checking " . count($csvFiles) . " file(s) against EviData"
+            . ($phenoCount > 0 ? " ({$phenoCount} from BIDS phenotype/)" : ""));
         $this->log("  API endpoint: {$evi['api_base_url']}");
 
         // ── Choose the QI source for this project ───────────────────
@@ -1021,14 +1111,33 @@ class ClinicalPipeline
         return $dir;
     }
 
+    /**
+     * Filesystem-safe stem for a file's EviData artifacts.
+     *
+     * The EXTENSION IS KEPT. Two data files may share a stem but differ
+     * in extension — moca.csv in deidentified-raw/clinical and moca.tsv
+     * in bids/phenotype are distinct files with distinct privacy
+     * results. Stripping the extension would make both write
+     * moca.results.json / moca.report.zip into the same run directory,
+     * silently overwriting one verdict with the other and attaching the
+     * wrong PDF to the failure email.
+     *
+     * Must be the single source of this value: persistEvidataArtifacts()
+     * writes the files and collectEvidataPdfs() reads them back, so the
+     * two have to agree exactly.
+     */
+    private function evidataArtifactStem(string $sourceName): string
+    {
+        return preg_replace('/[^A-Za-z0-9._-]/', '_', $sourceName) ?: 'artifact';
+    }
+
     private function persistEvidataArtifacts(string $sourceName, array $result): array
     {
         if ($this->evidataLogDir === null) {
             return [];
         }
 
-        $stem    = pathinfo($sourceName, PATHINFO_FILENAME);
-        $stem    = preg_replace('/[^A-Za-z0-9._-]/', '_', $stem) ?: 'artifact';
+        $stem    = $this->evidataArtifactStem($sourceName);
         $written = [];
 
         if (!empty($result['results']) && is_array($result['results'])) {
@@ -1296,8 +1405,7 @@ class ClinicalPipeline
             if ($r['passed'] ?? false) {
                 continue;   // only failed files
             }
-            $stem = pathinfo($name, PATHINFO_FILENAME);
-            $stem = preg_replace('/[^A-Za-z0-9._-]/', '_', $stem) ?: 'artifact';
+            $stem = $this->evidataArtifactStem($name);
             $pdf  = $this->extractReportPdf($stem, $entryName, $outSuffix);
             if ($pdf === null || !is_file($pdf)) {
                 continue;
@@ -1643,7 +1751,7 @@ class ClinicalPipeline
         $body .= "Timestamp : " . date('Y-m-d H:i:s') . "\n";
 
         if ($this->dryRun) {
-            $body .= "Status    : PREVIEW — no LORIS writes attempted (dry run)\n\n";
+            $body .= "Status    : PREVIEW — no ARCHIMEDES writes attempted (dry run)\n\n";
         } else {
             $body .= "Status    : The file(s) listed below were NOT ingested.\n";
             $body .= "            They will be retried on the next pipeline run.\n";
@@ -1818,22 +1926,113 @@ class ClinicalPipeline
     //  STEP 2: Upload data, file by file
     // ══════════════════════════════════════════════════════════════════
 
-    private function uploadFromDirectory(array $project, string $dataDir): void
+    /**
+     * Build the project's data-file list: everything in
+     * deidentified-raw/clinical (.csv, .tsv) plus every BIDS phenotype
+     * .tsv in deidentified-raw/bids/phenotype.
+     *
+     * Called ONCE per project. The same list is handed to the EviData
+     * gate and to the upload step, so a file can never be ingested
+     * without having been privacy-checked, or checked without being
+     * considered for ingestion.
+     *
+     * Basenames must be unique ACROSS both directories. Tracking
+     * (.clinical_tracking.json), per-file results, EviData artifacts and
+     * the processed copy are all keyed by basename, so a duplicate would
+     * silently overwrite the other file's state. A colliding phenotype
+     * file is therefore reported as a failure and excluded, rather than
+     * ingested under a key that already belongs to a clinical file.
+     *
+     * @return array<array{path:string,name:string,format:string,source:string}>
+     */
+    private function discoverDataFiles(string $clinicalDir, string $phenoDir): array
+    {
+        $files = [];
+        $seen  = [];   // basename => source dir label
+
+        if (is_dir($clinicalDir)) {
+            foreach (self::DATA_EXTENSIONS as $ext => $format) {
+                foreach (glob("{$clinicalDir}/*.{$ext}") ?: [] as $path) {
+                    $name         = basename($path);
+                    $seen[$name]  = 'clinical';
+                    $files[]      = [
+                        'path'   => $path,
+                        'name'   => $name,
+                        'format' => $format,
+                        'source' => 'clinical',
+                    ];
+                }
+            }
+        }
+
+        if (is_dir($phenoDir)) {
+            $phenoCount = 0;
+            foreach (self::PHENOTYPE_DATA_EXTENSIONS as $ext => $format) {
+                foreach (glob("{$phenoDir}/*.{$ext}") ?: [] as $path) {
+                    $name = basename($path);
+
+                    if (isset($seen[$name])) {
+                        $msg = "phenotype/{$name} has the same filename as a file "
+                            . "in {$seen[$name]}/ — not ingested. Tracking, privacy "
+                            . "artifacts and the processed copy are keyed by "
+                            . "filename, so rename one of them.";
+                        $this->log("  [phenotype/{$name}] FAILED - duplicate filename");
+                        $this->writeError("phenotype/{$name}", $msg);
+                        $this->dataResults["phenotype/{$name}"] = [
+                            'status' => 'failed',
+                            'reason' => "duplicate filename (also in {$seen[$name]}/)",
+                        ];
+                        $this->stats['data_failed']++;
+                        continue;
+                    }
+
+                    // Same stem, different extension: clinical/moca.csv
+                    // and phenotype/moca.tsv are separate files (own
+                    // tracking entry, own privacy verdict, own artifacts
+                    // — evidataArtifactStem keeps the extension) but
+                    // processOneDataFile derives the instrument from the
+                    // stem, so BOTH upload to instrument "moca". Legal,
+                    // and ARCHIMEDES dedupes the rows, but worth surfacing so
+                    // a mistakenly duplicated export is not mistaken for
+                    // two datasets.
+                    $stem = pathinfo($name, PATHINFO_FILENAME);
+                    foreach (array_keys($seen) as $seenName) {
+                        if (pathinfo($seenName, PATHINFO_FILENAME) === $stem) {
+                            $this->log("  [phenotype/{$name}] NOTE: targets the "
+                                . "same instrument '{$stem}' as {$seenName} "
+                                . "(different extension). Both will be ingested.");
+                            break;
+                        }
+                    }
+
+                    $seen[$name] = 'phenotype';
+                    $files[]     = [
+                        'path'   => $path,
+                        'name'   => $name,
+                        'format' => $format,
+                        'source' => 'phenotype',
+                    ];
+                    $phenoCount++;
+                }
+            }
+            if ($phenoCount > 0) {
+                $this->log("  BIDS phenotype: {$phenoCount} .tsv file(s) found in {$phenoDir}");
+            }
+        }
+
+        usort($files, fn(array $a, array $b) => strcmp($a['name'], $b['name']));
+
+        return $files;
+    }
+
+    /**
+     * @param array<array{path:string,name:string,format:string,source:string}> $files
+     *        Prepared by discoverDataFiles(): clinical + BIDS phenotype.
+     */
+    private function uploadFromDirectory(array $project, array $files): void
     {
         $this->log("");
         $this->log("──── STEP 2: UPLOAD CLINICAL DATA ────");
-
-        if (!is_dir($dataDir)) {
-            $this->log("  Directory not found: {$dataDir}");
-            return;
-        }
-
-        $files = [];
-        foreach (self::DATA_EXTENSIONS as $ext => $format) {
-            foreach (glob("{$dataDir}/*.{$ext}") as $path) {
-                $files[] = ['path' => $path, 'name' => basename($path), 'format' => $format];
-            }
-        }
 
         $this->stats['data_files_found'] += count($files);
         $excludeFiles = $project['exclude_data_files'] ?? [];
@@ -1864,6 +2063,10 @@ class ClinicalPipeline
                 $this->dataResults[$filename] = ['status' => 'skipped', 'reason' => 'evidata failed'];
                 $this->stats['data_skipped']++;
                 continue;
+            }
+
+            if (($f['source'] ?? 'clinical') === 'phenotype') {
+                $this->log("  [{$filename}] source: BIDS phenotype/");
             }
 
             $changeStatus = $this->detectFileChange($filename, $f['path']);
@@ -1921,6 +2124,33 @@ class ClinicalPipeline
             return;
         }
 
+        // Row-level change detection, computed from the ORIGINAL before
+        // any enrichment. --force skips it: the whole file goes up.
+        // A null plan means "send everything" (first upload, no usable
+        // identifier column, or no stored row map yet).
+        $rowPlan = $this->force
+            ? null
+            : $this->planRowUpload($project, $filename, $filePath, $format);
+
+        if ($rowPlan !== null && $rowPlan['skip']) {
+            // The file changed — reordered columns, whitespace, a removed
+            // row — but no row's content did. Nothing to send. Record the
+            // new file hash so the next run takes the fast path.
+            $this->log("    SKIPPED - file changed but no row content changed"
+                . ($rowPlan['removed'] > 0
+                    ? " ({$rowPlan['removed']} row(s) no longer present; LORIS is never asked to delete)"
+                    : ""));
+            $this->dataResults[$filename] = [
+                'status'        => 'skipped',
+                'reason'        => 'no row changes',
+                'rows'          => $rows,
+                'change_status' => $changeStatus,
+            ];
+            $this->stats['data_skipped']++;
+            $this->updateTracking($filename, $filePath, [], $rowPlan['current']);
+            return;
+        }
+
         // Stamp project/cohort/site from project.json candidate_defaults
         // BEFORE anything touches the instrument endpoint. Original stays
         // read-only; ingestion reads the processed copy.
@@ -1940,6 +2170,27 @@ class ClinicalPipeline
         $uploadPath = $this->normalizeDatesInFile($sourcePath, $format);
         $usingTemp  = ($uploadPath !== $sourcePath);
 
+        // Narrow the upload to the new/changed rows. Done AFTER enrichment
+        // and date normalisation, both of which rewrite row-for-row in
+        // order, so the indices computed from the original still line up.
+        if ($rowPlan !== null && !$rowPlan['all']) {
+            $filtered = $this->filterRowsByIndex($uploadPath, $rowPlan['keep'], $format);
+            if ($filtered !== null) {
+                if ($usingTemp) {
+                    @unlink($uploadPath);
+                }
+                $uploadPath = $filtered;
+                $usingTemp  = true;
+                $rows       = count($rowPlan['keep']);
+                $this->log("    Uploading {$rows} of "
+                    . ($rowPlan['new'] + $rowPlan['changed'] + $rowPlan['unchanged'])
+                    . " row(s)");
+            } else {
+                $this->log("    Row filter failed - uploading the full file "
+                    . "(LORIS will skip rows that already exist)");
+            }
+        }
+
         try {
             if ($this->client->instrumentExists($baseName)) {
                 $this->log("    Instrument: {$baseName} (matched by filename)");
@@ -1953,7 +2204,7 @@ class ClinicalPipeline
                     'rows_existed'  => $result['rows_existed'] ?? 0,
                 ]);
                 if ($result['status'] === 'success') {
-                    $this->updateTracking($filename, $filePath, $result);
+                    $this->updateTracking($filename, $filePath, $result, $rowPlan['current'] ?? null);
                     $this->archiveSnapshot($project, $filePath);
                 }
                 return;
@@ -1993,7 +2244,7 @@ class ClinicalPipeline
             ]);
 
             if ($result['status'] === 'success') {
-                $this->updateTracking($filename, $filePath, $result);
+                $this->updateTracking($filename, $filePath, $result, $rowPlan['current'] ?? null);
                 $this->archiveSnapshot($project, $filePath);
             }
         } finally {
@@ -2135,6 +2386,320 @@ class ClinicalPipeline
         $this->log("    Processed copy: processed/clinical/{$basename}");
 
         return $outPath;
+    }
+
+
+    // ══════════════════════════════════════════════════════════════════
+    //  Row-level change detection
+    // ══════════════════════════════════════════════════════════════════
+
+    /**
+     * Locate the columns that identify a row, from the file's header.
+     *
+     * Returns null when no identifier column can be found — the file then
+     * falls back to whole-file re-ingestion, exactly as before. Row
+     * tracking is a narrowing optimisation, never a gate: if we cannot
+     * identify rows with confidence we send the whole file and let LORIS
+     * dedupe, rather than risk withholding a row.
+     *
+     * @return array{id:int, visit:?int, quals:array<int>, headers:array}|null
+     */
+    private function resolveRowKeyColumns(array $project, array $headers, string $basename): ?array
+    {
+        $cfg = $project['row_tracking'] ?? [];
+
+        if (($cfg['enabled'] ?? true) === false) {
+            $this->log("    Row tracking: disabled in project.json for this project");
+            return null;
+        }
+
+        $lower = [];
+        foreach ($headers as $i => $h) {
+            $lower[strtolower(trim((string)$h))] = $i;
+        }
+
+        $find = function (array $candidates) use ($lower): ?int {
+            foreach ($candidates as $name) {
+                $key = strtolower(trim($name));
+                if (isset($lower[$key])) {
+                    return $lower[$key];
+                }
+            }
+            return null;
+        };
+
+        // candidate_defaults appends columns to the PROCESSED copy that
+        // the original may not carry. Row keys are read from the
+        // ORIGINAL, so a stamped column is invisible here. Today that is
+        // harmless: only Project/Cohort/Site are stamped, and none of
+        // them is a key column. But CLINICAL_DEFAULT_COLUMNS is
+        // documented as extensible to visit_label / redcap_event_name —
+        // and the moment a key column is stamped rather than supplied,
+        // keying on the original would silently lose the visit, collapse
+        // a candidate's rows onto one key, and leave them separated only
+        // by positional occurrence suffixes that reordering would break.
+        // Detect that and fall back to whole-file upload instead.
+        $stamped = [];
+        foreach (self::CLINICAL_DEFAULT_COLUMNS as $key => $column) {
+            if (isset($project['candidate_defaults'][$key])
+                && $project['candidate_defaults'][$key] !== ''
+            ) {
+                $stamped[] = strtolower($column);
+            }
+        }
+        $keyColumns = array_map('strtolower', array_merge(
+            $cfg['identifier_columns'] ?? self::ROW_ID_COLUMNS,
+            $cfg['visit_columns']      ?? self::ROW_VISIT_COLUMNS,
+            self::ROW_QUALIFIER_COLUMNS
+        ));
+        foreach ($stamped as $col) {
+            if (in_array($col, $keyColumns, true) && !isset($lower[$col])) {
+                $this->log("    Row tracking: '{$col}' is supplied by "
+                    . "candidate_defaults and absent from {$basename} - row keys "
+                    . "cannot be derived from the original, falling back to "
+                    . "whole-file upload");
+                return null;
+            }
+        }
+
+        $idIdx = $find($cfg['identifier_columns'] ?? self::ROW_ID_COLUMNS);
+        if ($idIdx === null) {
+            $this->log("    Row tracking: no identifier column in {$basename} "
+                . "(looked for: " . implode(', ', $cfg['identifier_columns'] ?? self::ROW_ID_COLUMNS)
+                . ") - falling back to whole-file upload");
+            return null;
+        }
+
+        $visitIdx = $find($cfg['visit_columns'] ?? self::ROW_VISIT_COLUMNS);
+
+        $quals = [];
+        foreach (self::ROW_QUALIFIER_COLUMNS as $name) {
+            $i = $lower[strtolower($name)] ?? null;
+            if ($i !== null) {
+                $quals[] = $i;
+            }
+        }
+
+        $this->log(sprintf(
+            "    Row tracking: id=%s%s%s",
+            (string)$headers[$idIdx],
+            $visitIdx !== null ? ", visit=" . (string)$headers[$visitIdx] : ", visit=(none)",
+            $quals ? ", qualifiers=" . implode('+', array_map(fn($i) => (string)$headers[$i], $quals)) : ""
+        ));
+
+        return ['id' => $idIdx, 'visit' => $visitIdx, 'quals' => $quals, 'headers' => $headers];
+    }
+
+    /**
+     * Read the ORIGINAL file and compute, per data row, a stable key and
+     * a content hash.
+     *
+     * Both are taken from the file as delivered — before
+     * applyCandidateDefaults() stamps Project/Cohort/Site and before
+     * normalizeDatesInFile() rewrites dates — so pipeline enrichment can
+     * never make a row look changed.
+     *
+     * A key that repeats within one file (same candidate, visit and
+     * qualifiers) gets an occurrence suffix so the rows stay distinct
+     * rather than collapsing onto one entry.
+     *
+     * @return array{keys:array<int,string>, hashes:array<string,string>, labels:array<string,string>}
+     */
+    private function computeRowHashes(string $path, string $format, array $cols): array
+    {
+        $delimiter = ($format === 'BIDS_TSV') ? "\t" : ',';
+
+        $keys   = [];   // row index (0-based, data rows only) => key
+        $hashes = [];   // key => md5 of the row
+        $labels = [];   // key => human-readable "PSCID / visit"
+        $seen   = [];   // key => occurrences so far
+
+        $fh = @fopen($path, 'r');
+        if ($fh === false) {
+            return ['keys' => [], 'hashes' => [], 'labels' => []];
+        }
+        fgetcsv($fh, 0, $delimiter);   // discard header
+
+        $i = 0;
+        while (($row = fgetcsv($fh, 0, $delimiter)) !== false) {
+            $cell = fn(?int $idx) => ($idx !== null && isset($row[$idx]))
+                ? trim((string)$row[$idx]) : '';
+
+            $parts = [$cell($cols['id'])];
+            if ($cols['visit'] !== null) {
+                $parts[] = $cell($cols['visit']);
+            }
+            foreach ($cols['quals'] as $q) {
+                $parts[] = $cell($q);
+            }
+            $label = implode(' / ', array_filter($parts, fn($p) => $p !== ''));
+            $base  = implode('|', $parts);
+
+            $seen[$base] = ($seen[$base] ?? 0) + 1;
+            $key = md5($seen[$base] > 1 ? "{$base}#{$seen[$base]}" : $base);
+
+            $keys[$i]     = $key;
+            $hashes[$key] = md5(implode(self::ROW_HASH_SEPARATOR, array_map(
+                fn($v) => trim((string)$v),
+                $row
+            )));
+            $labels[$key] = $label !== '' ? $label : "(row " . ($i + 1) . ")";
+            $i++;
+        }
+        fclose($fh);
+
+        return ['keys' => $keys, 'hashes' => $hashes, 'labels' => $labels];
+    }
+
+    /**
+     * Decide which rows of a changed file actually need uploading.
+     *
+     * Returns null to mean "send the whole file" — first upload, --force,
+     * no usable identifier column, or no stored row map yet. Otherwise
+     * returns the row indices to keep plus the current hash map for
+     * tracking.
+     *
+     * @return array{all:bool, skip:bool, keep:array<int>, current:array<string,string>,
+     *               new:int, changed:int, unchanged:int, removed:int}|null
+     */
+    private function planRowUpload(
+        array $project,
+        string $filename,
+        string $filePath,
+        string $format
+    ): ?array {
+        $delimiter = ($format === 'BIDS_TSV') ? "\t" : ',';
+
+        $fh = @fopen($filePath, 'r');
+        if ($fh === false) {
+            return null;
+        }
+        $headers = fgetcsv($fh, 0, $delimiter);
+        fclose($fh);
+        if (!is_array($headers) || $headers === []) {
+            return null;
+        }
+
+        $cols = $this->resolveRowKeyColumns($project, $headers, $filename);
+        if ($cols === null) {
+            return null;
+        }
+
+        $now    = $this->computeRowHashes($filePath, $format, $cols);
+        $stored = $this->trackingData[$filename]['rows'] ?? null;
+
+        if (!is_array($stored) || $stored === []) {
+            // No row map yet (first upload, or tracking written by an
+            // older build). Send everything, and record the map so the
+            // NEXT run can narrow.
+            $this->log("    Row tracking: no stored row map - uploading all "
+                . count($now['keys']) . " row(s), map recorded for next run");
+            return [
+                'all' => true, 'skip' => false, 'keep' => array_keys($now['keys']),
+                'current' => $now['hashes'], 'new' => count($now['keys']),
+                'changed' => 0, 'unchanged' => 0, 'removed' => 0,
+            ];
+        }
+
+        $keep = $newRows = $changedRows = [];
+        $unchanged = 0;
+        foreach ($now['keys'] as $idx => $key) {
+            if (!isset($stored[$key])) {
+                $keep[]    = $idx;
+                $newRows[] = $now['labels'][$key];
+            } elseif ($stored[$key] !== $now['hashes'][$key]) {
+                $keep[]        = $idx;
+                $changedRows[] = $now['labels'][$key];
+            } else {
+                $unchanged++;
+            }
+        }
+
+        $removed = count(array_diff_key($stored, $now['hashes']));
+
+        $summary = sprintf(
+            "    Row tracking: %d new, %d changed, %d unchanged%s",
+            count($newRows), count($changedRows), $unchanged,
+            $removed > 0 ? ", {$removed} no longer in file" : ""
+        );
+        $this->log($summary);
+
+        foreach (array_slice($newRows, 0, 10) as $l) {
+            $this->log("      + {$l}");
+        }
+        if (count($newRows) > 10) {
+            $this->log("      + ... and " . (count($newRows) - 10) . " more new");
+        }
+        foreach (array_slice($changedRows, 0, 10) as $l) {
+            $this->log("      ~ {$l}");
+        }
+        if (count($changedRows) > 10) {
+            $this->log("      ~ ... and " . (count($changedRows) - 10) . " more changed");
+        }
+
+        return [
+            'all'       => count($keep) === count($now['keys']),
+            'skip'      => $keep === [],
+            'keep'      => $keep,
+            'current'   => $now['hashes'],
+            'new'       => count($newRows),
+            'changed'   => count($changedRows),
+            'unchanged' => $unchanged,
+            'removed'   => $removed,
+        ];
+    }
+
+    /**
+     * Write header + the given data-row indices to a temp file.
+     *
+     * Indices are positions in the ORIGINAL file. applyCandidateDefaults()
+     * and normalizeDatesInFile() both rewrite row-for-row in order, so
+     * position N here is still the same record after enrichment — that
+     * invariant is what lets the row plan be computed from the original
+     * and applied to the enriched copy.
+     *
+     * Returns the temp path, or null on any failure (caller then uploads
+     * the unfiltered file rather than dropping rows).
+     */
+    private function filterRowsByIndex(string $path, array $keepIndices, string $format): ?string
+    {
+        $delimiter = ($format === 'BIDS_TSV') ? "\t" : ',';
+        $keep      = array_flip($keepIndices);
+
+        $in = @fopen($path, 'r');
+        if ($in === false) {
+            return null;
+        }
+        $headers = fgetcsv($in, 0, $delimiter);
+        if (!is_array($headers)) {
+            fclose($in);
+            return null;
+        }
+
+        $tmp = tempnam(sys_get_temp_dir(), 'clinical_rows_') . '_' . basename($path);
+        $out = @fopen($tmp, 'w');
+        if ($out === false) {
+            fclose($in);
+            return null;
+        }
+        fputcsv($out, $headers, $delimiter);
+
+        $i = $written = 0;
+        while (($row = fgetcsv($in, 0, $delimiter)) !== false) {
+            if (isset($keep[$i])) {
+                fputcsv($out, $row, $delimiter);
+                $written++;
+            }
+            $i++;
+        }
+        fclose($in);
+        fclose($out);
+
+        if ($written !== count($keepIndices)) {
+            @unlink($tmp);
+            return null;   // row count drifted - do not risk a partial upload
+        }
+        return $tmp;
     }
 
     private function detectInstrumentsFromHeaders(string $filePath, string $format): array
@@ -2280,7 +2845,7 @@ class ClinicalPipeline
 
         if ($ui['rows_saved'] !== null) {
             if ($ui['rows_saved'] === 0 && $ui['rows_existed'] > 0) {
-                $parts[] = "0 new rows - {$ui['rows_existed']} already existed in LORIS";
+                $parts[] = "0 new rows - {$ui['rows_existed']} already existed in ARCHIMEDES";
             } elseif ($ui['rows_existed'] > 0) {
                 $parts[] = "{$ui['rows_saved']} new rows inserted, {$ui['rows_existed']} already existed";
             } else {
@@ -2402,21 +2967,50 @@ class ClinicalPipeline
         return ($currentHash !== ($stored['hash'] ?? '')) ? 'reingestion' : 'unchanged';
     }
 
-    private function updateTracking(string $filename, string $filePath, array $uploadResult): void
-    {
+    /**
+     * Persist a file's tracking entry after a successful upload.
+     *
+     * The stored 'hash' is always the MD5 of the ORIGINAL under
+     * deidentified-raw/, never of the enriched copy.
+     *
+     * $rowHashes, when supplied, replaces the per-row map wholesale with
+     * the rows present in the file NOW. Rows deleted upstream therefore
+     * drop out of tracking; LORIS is never asked to delete anything, and
+     * if such a row reappears it is treated as new and re-sent (harmless
+     * — LORIS skips rows that already exist). Null leaves any existing
+     * map untouched, which is what a --force or whole-file upload wants.
+     *
+     * An empty $uploadResult means nothing was sent (file changed, no row
+     * content changed); the previous row counts are preserved rather than
+     * overwritten with nulls, so the "last run" detail stays truthful.
+     */
+    private function updateTracking(
+        string $filename,
+        string $filePath,
+        array $uploadResult,
+        ?array $rowHashes = null
+    ): void {
         $existing = $this->trackingData[$filename] ?? null;
         $now      = date('Y-m-d\TH:i:s');
+        $sent     = $uploadResult !== [];
 
-        $this->trackingData[$filename] = [
+        $entry = [
             'hash'              => md5_file($filePath),
             'first_uploaded_at' => $existing['first_uploaded_at'] ?? $now,
-            'last_uploaded_at'  => $now,
+            'last_uploaded_at'  => $sent ? $now : ($existing['last_uploaded_at'] ?? $now),
             'run_timestamp'     => $this->runTimestamp,
-            'upload_count'      => ($existing['upload_count'] ?? 0) + 1,
-            'rows_total'        => $uploadResult['rows_total']   ?? null,
-            'rows_saved'        => $uploadResult['rows_saved']   ?? null,
-            'rows_existed'      => $uploadResult['rows_existed'] ?? 0,
+            'upload_count'      => ($existing['upload_count'] ?? 0) + ($sent ? 1 : 0),
+            'rows_total'        => $uploadResult['rows_total']   ?? $existing['rows_total']   ?? null,
+            'rows_saved'        => $uploadResult['rows_saved']   ?? $existing['rows_saved']   ?? null,
+            'rows_existed'      => $uploadResult['rows_existed'] ?? $existing['rows_existed'] ?? 0,
         ];
+
+        $rows = $rowHashes ?? ($existing['rows'] ?? null);
+        if ($rows !== null) {
+            $entry['rows'] = $rows;
+        }
+
+        $this->trackingData[$filename] = $entry;
 
         $this->saveTrackingFile();
     }
@@ -2678,7 +3272,7 @@ class ClinicalPipeline
             $this->log("  CANDIDATES TOUCHED THIS RUN:");
             $this->log("    Total distinct CandIDs: " . count($nc['total_candids']));
             if ($nc['available']) {
-                $this->log("    Newly created in LORIS: {$nc['new_count']}");
+                $this->log("    Newly created in ARCHIMEDES: {$nc['new_count']}");
                 if (!empty($nc['new_candids'])) {
                     $this->log("      CandIDs: " . implode(', ', $nc['new_candids']));
                 }
@@ -2688,7 +3282,7 @@ class ClinicalPipeline
                     $this->log("      CandIDs: " . implode(', ', $existingIds));
                 }
             } else {
-                $this->log("    (classification unavailable - pre-run LORIS snapshot failed)");
+                $this->log("    (classification unavailable - pre-run ARCHIMEDES snapshot failed)");
                 $this->log("    All CandIDs: " . implode(', ', $nc['total_candids']));
             }
         }
@@ -2766,7 +3360,7 @@ class ClinicalPipeline
         $this->log("    Data files processed:{$s['data_uploaded']}");
         $this->log("    Data files failed:   {$s['data_failed']}");
         $this->log("    Data files skipped:  {$s['data_skipped']} (hash unchanged)");
-        $this->log("    Rows existed:        {$s['rows_existed']} (already in LORIS - includes last-known from skipped files)");
+        $this->log("    Rows existed:        {$s['rows_existed']} (already in ARCHIMEDES - includes last-known from skipped files)");
         $this->log("    Candidate-session pairs touched: {$s['pairs_processed']}");
         $this->log("");
 
@@ -2960,7 +3554,7 @@ class ClinicalPipeline
             . "{$s['data_failed']} failed, {$s['data_skipped']} skipped\n";
 
         if ($s['rows_existed'] > 0) {
-            $body .= "  Rows existed (skipped LORIS): {$s['rows_existed']}\n";
+            $body .= "  Rows existed (skipped ARCHIMEDES): {$s['rows_existed']}\n";
         }
         if ($s['pairs_processed'] > 0) {
             $body .= "  Candidate-session pairs touched: {$s['pairs_processed']}\n";

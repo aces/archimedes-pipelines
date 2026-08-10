@@ -11,7 +11,7 @@ The pipelines are expected to be installed on the predefined data mount for the 
 ## Features
 
 - **Clinical Data Ingestion** - Automated CSV processing and upload
-- **Clinical Instrument Install** - Install REDCap or LINST instruments
+- **Clinical Instrument Install** - Install LINST, REDCap or BIDS instruments
 - **Bulk Operations** - Process multiple files and projects
 - **Email Notifications** - Success/failure reports via email
 - **Comprehensive Logging** - Detailed execution logs with rotation
@@ -148,7 +148,6 @@ The clinical pipeline follows this process:
    ├── Check if instrument is installed in ARCHIMEDES
    ├── If NOT installed:
    │   ├── Look for Data Dictionary in documentation/data_dictionary/
-   │   │   or in deidentified-raw/bids/phenotype/ (BIDS .json sidecars)
    │   ├── Find .linst file OR REDCap data dictionary CSV
    │   └── Install instrument via API
    └── If installed:
@@ -239,7 +238,18 @@ inside `/path/A` — it only processes `project_x`, the one project it lists.
 
 ### Instrument Data Dictionary Location
 
-Instrument Data Dictionary should be placed in the project's `documentation/data_dictionary/` folder. The pipeline automatically detects the format (LINST or REDCap CSV) and installs accordingly.
+All data dictionaries go in the project's `documentation/data_dictionary/`
+folder — including the BIDS `.json` for a phenotype file. The format is detected
+from the file extension alone; file contents are never inspected.
+
+| Extension | Type sent as `instrument_type` |
+|-----------|--------------------------------|
+| `.linst` | `linst` |
+| `.csv` | `redcap` |
+| `.json` | `bids` |
+
+A dictionary saved with the wrong extension is installed under the wrong type,
+with no warning.
 
 ### BIDS Phenotype Data
 
@@ -249,16 +259,22 @@ not the BIDS imaging pipeline. Two locations are read:
 | Location | Contents |
 |----------|----------|
 | `deidentified-raw/clinical/` | Clinical `.csv` / `.tsv` |
-| `deidentified-raw/bids/phenotype/` | Phenotype `.tsv` + matching `.json` sidecars |
+| `deidentified-raw/bids/phenotype/` | Phenotype `.tsv` data files |
 
-Sidecars are read as data dictionaries **in place** — no need to copy them into
-`documentation/data_dictionary/`.
+**Data dictionaries are not read from `phenotype/`.** Every dictionary lives in
+`documentation/data_dictionary/`, including the BIDS `.json` for a phenotype
+file. A `.json` left beside the `.tsv` in `phenotype/` is ignored.
 
 ```
 deidentified-raw/bids/phenotype/
-├── moca.tsv     # phenotype data
-└── moca.json    # its data dictionary
+└── moca.tsv                  # phenotype data
+
+documentation/data_dictionary/
+└── moca.json                 # its data dictionary
 ```
+
+Filenames must be unique across `clinical/` and `bids/phenotype/` — tracking,
+privacy artifacts and the processed copy are all keyed by filename.
 
 ### EviData Privacy-Risk Validation
 
@@ -788,7 +804,7 @@ php scripts/run_participant_metadata_pipeline.php --all --force
 │   ├── imaging/
 │   │   └── dicoms/                       # Raw DICOM studies (one folder per study)
 │   ├── bids/                             # Deidentified MRI and EEG Data (ExternalIDs)
-│   │   └── phenotype/                    # BIDS phenotype .tsv + .json (read by clinical pipeline)
+│   │   └── phenotype/                    # BIDS phenotype .tsv (read by clinical pipeline)
 │   └── genomics/
 │
 ├── deidentified-lorisid/                 # LORIS-relabelled deidentified data
@@ -901,6 +917,6 @@ Per-project in `project.json`:
 }
 ```
 
-The `evidata` email workflow differs from the others: it has a single `on_check_failed` list (privacy-check failures) instead of `on_success`/`on_error`.
+The `evidata` channel differs from the others: it has a single `on_check_failed` list (privacy-check failures) instead of `on_success`/`on_error`.
 
 ---
