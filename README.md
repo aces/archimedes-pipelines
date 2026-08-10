@@ -57,13 +57,13 @@ This will automatically install:
 Copy the example config file and edit your LORIS credentials and collections:
 
 ```bash
-cp config/loris_client_config.json.example config/loris_client_config.json
+cp config/loris_client_config.example.json config/loris_client_config.json
 nano config/loris_client_config.json
 ```
 
 ### Project Configuration
 
-Each project requires a `project.json` file at its root. See `config/project.json.example` for reference.
+Each project requires a `project.json` file at its root. See `config/project.example.json` for reference.
 
 ### EviData Configuration
 
@@ -121,7 +121,7 @@ EVIDATA_PASSWORD=...
 
 The runner resolves the file path in this order: the `EVIDATA_ENV_FILE` environment variable, then an `env_file` key in `evidata_config.json`, then the default above. A real environment variable, if already set in the shell, always takes precedence over the file. If a variable is missing entirely the pipeline fails fast and names what it expected; values are never written to logs.
 
-See `config/evidata_config.json.example` for the complete set of available keys and defaults.
+See `config/evidata_config.example.json` for the complete set of available keys and defaults.
 
 ---
 
@@ -372,7 +372,7 @@ The BIDS pipeline automates candidate creation, reidentification, and imaging im
 
 ### Collections Configuration
 
-Collections and projects are defined in `loris_client_config.json`. Each collection has a base path and a list of projects that can be individually enabled or disabled. See `config/loris_client_config.json.example` for reference.
+Collections and projects are defined in `loris_client_config.json`. Each collection has a base path and a list of projects that can be individually enabled or disabled. See `config/loris_client_config.example.json` for reference.
 
 ### Required participants.tsv Format
 
