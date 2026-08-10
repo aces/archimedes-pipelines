@@ -148,31 +148,117 @@ The clinical pipeline follows this process:
    ├── Check if instrument is installed in LORIS
    ├── If NOT installed:
    │   ├── Look for Data Dictionary in documentation/data_dictionary/
+   │   │   or in deidentified-raw/bids/phenotype/ (BIDS .json sidecars)
    │   ├── Find .linst file OR REDCap data dictionary CSV
    │   └── Install instrument via API
    └── If installed:
        └── Continue to data ingestion
 
 4. Data Ingestion:
-   ├── Read CSV from deidentified-raw/clinical/
-   ├── Validate data against instrument schema
-   ├── Create candidates (if not exist)
-   ├── Create visits (if not exist)
-   └── Upload instrument data via API
+   ├── Read CSV/TSV from deidentified-raw/clinical/ and bids/phenotype/
+   ├── Compare the ORIGINAL file hash against .clinical_tracking.json
+   │   └── Unchanged since last success → SKIPPED, no API call
+   ├── Write an enriched copy to processed/clinical/
+   │   └── Project / Cohort / Site stamped from project.json
+   └── Upload the enriched copy (CREATE_SESSIONS)
+       └── LORIS resolves candidate + session; visit labels must pre-exist
 
-5. Post-Processing:
-   ├── Move processed files to processed/clinical/
+5. Post-Processing (only on success):
+   ├── Record the ORIGINAL file hash in .clinical_tracking.json
+   ├── Copy the original to processed/clinical/YYYY-MM-DD/
    ├── Log results
    └── Send email notification (if enabled)
 ```
 
+### Processed Copies and Change Detection
+
+**The original is never modified, renamed, moved or deleted.** Everything the
+pipeline writes is a copy under `processed/clinical/`.
+
+| Copy | Path | Written | Notes |
+|------|------|---------|-------|
+| Enriched | `processed/clinical/<file>` | Before upload | What LORIS actually receives. Overwritten each run. Not created if the file already carries Project/Cohort/Site — the original is then uploaded as-is. |
+| Snapshot | `processed/clinical/YYYY-MM-DD/<file>` | After success | Dated copy of the original. Timestamp prefix on name clash. |
+
+Tracking lives in `processed/clinical/.clinical_tracking.json`, keyed by filename.
+The stored hash is MD5 of the **original**, never the enriched copy — so stamping
+Project/Cohort/Site cannot make a file look changed.
+
+| Situation | Result |
+|-----------|--------|
+| Hash matches last successful run | `SKIPPED - no changes`, no API call |
+| Hash differs, or no entry yet | Ingested; LORIS skips rows already present |
+| Upload failed | No hash written → retried next run |
+| Failed EviData check | Skipped before hashing → retried next run |
+| `--force` | Hash check bypassed, everything re-uploaded |
+
+**Candidates and visits are not created by the pipeline.** It makes no candidate
+or visit API calls. The enriched copy goes to the instrument endpoint in
+`CREATE_SESSIONS` mode and LORIS resolves candidate and session server-side.
+**Visit labels must already exist in LORIS** — rows carrying a label that is not
+configured for the project fail at upload.
+
 ### Collections Configuration
 
-Collections and projects are defined in `loris_client_config.json`. Each collection has a base path and a list of projects that can be individually enabled or disabled. See `config/loris_client_config.json.example` for reference.
+A **Collection** is a config-only grouping of projects that share one parent
+folder, defined in `loris_client_config.json`.
+
+| Key | Meaning |
+|-----|---------|
+| `name` | Label for logs and `--collection=NAME` |
+| `base_path` | Parent folder holding the project directories |
+| `enabled` | `false` skips the whole collection |
+| `projects[]` | Projects to process; each found at `base_path/name` |
+
+**Only the projects you list are processed.** There is no directory scanning, so
+an unlisted folder under `base_path` is never touched — which means nested
+layouts work by declaring one collection per folder:
+
+```
+/path/A/         → "sftp"   projects arriving via SFTP
+/path/A/B/       → "bic"    projects from the BIC (mostly CBIG)
+/path/A/ARCHI/   → "uohi"   projects directly from UOHI
+```
+
+```json
+"collections": [
+  { "name": "sftp", "base_path": "/path/A",       "enabled": true,
+    "projects": [ {"name": "project_x", "enabled": true} ] },
+
+  { "name": "bic",  "base_path": "/path/A/B",     "enabled": true,
+    "projects": [ {"name": "cbig_project_1", "enabled": true},
+                  {"name": "cbig_project_2", "enabled": false} ] },
+
+  { "name": "uohi", "base_path": "/path/A/ARCHI", "enabled": true,
+    "projects": [ {"name": "archi_project_1", "enabled": true} ] }
+]
+```
+
+`sftp` does not pick up `/path/A/B` or `/path/A/ARCHI` even though they sit
+inside `/path/A` — it only processes `project_x`, the one project it lists.
 
 ### Instrument Data Dictionary Location
 
 Instrument Data Dictionary should be placed in the project's `documentation/data_dictionary/` folder. The pipeline automatically detects the format (LINST or REDCap CSV) and installs accordingly.
+
+### BIDS Phenotype Data
+
+Phenotype data is tabular clinical data, so the **clinical** pipeline ingests it,
+not the BIDS imaging pipeline. Two locations are read:
+
+| Location | Contents |
+|----------|----------|
+| `deidentified-raw/clinical/` | Clinical `.csv` / `.tsv` |
+| `deidentified-raw/bids/phenotype/` | Phenotype `.tsv` + matching `.json` sidecars |
+
+Sidecars are read as data dictionaries **in place** — no need to copy them into
+`documentation/data_dictionary/`.
+
+```
+deidentified-raw/bids/phenotype/
+├── moca.tsv     # phenotype data
+└── moca.json    # its data dictionary
+```
 
 ### EviData Privacy-Risk Validation
 
@@ -705,6 +791,7 @@ php scripts/run_participant_metadata_pipeline.php --all --force
 │   ├── imaging/
 │   │   └── dicoms/                       # Raw DICOM studies (one folder per study)
 │   ├── bids/                             # Deidentified MRI and EEG Data (ExternalIDs)
+│   │   └── phenotype/                    # BIDS phenotype .tsv + .json (read by clinical pipeline)
 │   └── genomics/
 │
 ├── deidentified-lorisid/                 # LORIS-relabelled deidentified data
@@ -733,10 +820,10 @@ php scripts/run_participant_metadata_pipeline.php --all --force
 
 ### Directory Permissions
 
-The pipeline treats the de-identified input directories as **read-only** and writes only to its own output and log trees. Getting these permissions right matters: a missing write bit causes silent failures (tracking not persisted, snapshots not archived, EviData artifacts not saved) while reads still succeed, so the run appears to work but loses state between runs.
+Source files are never moved, renamed or deleted — what lands in `processed/` is always a copy. The pipeline treats the de-identified input directories as **read-only** and writes only to its own output and log trees. Getting these permissions right matters: a missing write bit causes silent failures (tracking not persisted, snapshots not archived, EviData artifacts not saved) while reads still succeed, so the run appears to work but loses state between runs.
 
 **Read-only (the pipeline never writes here):**
-- `deidentified-raw/` and its subdirectories (`clinical/`, `bids/`, `imaging/`, `genomics/`)
+- `deidentified-raw/` and its subdirectories (`clinical/`, `bids/`, `bids/phenotype/`, `imaging/`, `genomics/`)
 - `documentation/data_dictionary/`
 
 **Read-write (the pipeline must be able to create and write files here):**
