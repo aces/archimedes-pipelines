@@ -18,7 +18,7 @@ The pipelines are expected to be installed on the predefined data mount for the 
 - **Dry Run Mode** - Test without making actual changes
 - **Imaging Data Ingestion** - BIDS dataset ingestion
 - **DICOM Import** - Archive and insert DICOM studies into LORIS tarchive tables
-- **Participant Metadata Sync** - Update candidate demographic fields (Date of Death, Sex, DoB, etc.) in LORIS
+- **Participant Metadata Sync** - Update candidate demographic fields (Date of Death, Sex, DoB, etc.) in ARCHIMEDES
 - **Multi-Project Support** - Handle multiple projects and collections
 
 ---
@@ -54,7 +54,7 @@ This will automatically install:
 
 ### Main Configuration
 
-Copy the example config file and edit your LORIS credentials and collections:
+Copy the example config file and edit your ARCHIMEDES credentials and collections:
 
 ```bash
 cp config/loris_client_config.example.json config/loris_client_config.json
@@ -145,7 +145,7 @@ The clinical pipeline follows this process:
        └── Continue to instrument processing
 
 3. For each Instrument:
-   ├── Check if instrument is installed in LORIS
+   ├── Check if instrument is installed in ARCHIMEDES
    ├── If NOT installed:
    │   ├── Look for Data Dictionary in documentation/data_dictionary/
    │   │   or in deidentified-raw/bids/phenotype/ (BIDS .json sidecars)
@@ -161,7 +161,7 @@ The clinical pipeline follows this process:
    ├── Write an enriched copy to processed/clinical/
    │   └── Project / Cohort / Site stamped from project.json
    └── Upload the enriched copy (CREATE_SESSIONS)
-       └── LORIS resolves candidate + session; visit labels must pre-exist
+       └── ARCHIMEDES resolves candidate + session; visit labels must pre-exist
 
 5. Post-Processing (only on success):
    ├── Record the ORIGINAL file hash in .clinical_tracking.json
@@ -177,7 +177,7 @@ pipeline writes is a copy under `processed/clinical/`.
 
 | Copy | Path | Written | Notes |
 |------|------|---------|-------|
-| Enriched | `processed/clinical/<file>` | Before upload | What LORIS actually receives. Overwritten each run. Not created if the file already carries Project/Cohort/Site — the original is then uploaded as-is. |
+| Enriched | `processed/clinical/<file>` | Before upload | What ARCHIMEDES actually receives. Overwritten each run. Not created if the file already carries Project/Cohort/Site — the original is then uploaded as-is. |
 | Snapshot | `processed/clinical/YYYY-MM-DD/<file>` | After success | Dated copy of the original. Timestamp prefix on name clash. |
 
 Tracking lives in `processed/clinical/.clinical_tracking.json`, keyed by filename.
@@ -187,15 +187,15 @@ Project/Cohort/Site cannot make a file look changed.
 | Situation | Result |
 |-----------|--------|
 | Hash matches last successful run | `SKIPPED - no changes`, no API call |
-| Hash differs, or no entry yet | Ingested; LORIS skips rows already present |
+| Hash differs, or no entry yet | Ingested; ARCHIMEDES skips rows already present |
 | Upload failed | No hash written → retried next run |
 | Failed EviData check | Skipped before hashing → retried next run |
 | `--force` | Hash check bypassed, everything re-uploaded |
 
 **Candidates and visits are not created by the pipeline.** It makes no candidate
 or visit API calls. The enriched copy goes to the instrument endpoint in
-`CREATE_SESSIONS` mode and LORIS resolves candidate and session server-side.
-**Visit labels must already exist in LORIS** — rows carrying a label that is not
+`CREATE_SESSIONS` mode and ARCHIMEDES resolves candidate and session server-side.
+**Visit labels must already exist in ARCHIMEDES** — rows carrying a label that is not
 configured for the project fail at upload.
 
 ### Collections Configuration
@@ -319,6 +319,7 @@ php scripts/run_clinical_pipeline.php --collection=COLLECTION_NAME --project=PRO
 | `--project=NAME` | Specific project |
 | `--instrument=NAME` | Specific instrument |
 | `--dry-run` | Test without changes |
+| `--force` | Bypass hash check — re-upload all files even if unchanged |
 | `--verbose` | Detailed output |
 | `--help` | Show help |
 
@@ -344,12 +345,12 @@ The BIDS pipeline automates candidate creation, reidentification, and imaging im
        ├── Setup logging to project logs/bids_*_YYYY-MM-DD.log
        └── Continue to BIDS processing
 
-3. STEP 1: Participant Sync (Create LORIS Candidates)
+3. STEP 1: Participant Sync (Create ARCHIMEDES Candidates)
    ├── Script: run_bids_participant_sync.php
    ├── Read deidentified-raw/bids/participants.tsv
    ├── Validate BIDS structure (orphan/missing directories)
    ├── Check if candidate exists (CBIGR mapper)
-   ├── Create candidate (LORIS API)
+   ├── Create candidate (ARCHIMEDES API)
    ├── Link ExternalID to candidate 
    └── Log to logs/bids_participant_sync_YYYY-MM-DD.log
 
@@ -370,10 +371,6 @@ The BIDS pipeline automates candidate creation, reidentification, and imaging im
    └── Send email notification (if enabled)
 ```
 
-### Collections Configuration
-
-Collections and projects are defined in `loris_client_config.json`. Each collection has a base path and a list of projects that can be individually enabled or disabled. See `config/loris_client_config.example.json` for reference.
-
 ### Required participants.tsv Format
 
 Participant metadata must be in BIDS `participants.tsv` file with required columns:
@@ -387,10 +384,10 @@ sub-EXTERNAL002	34	Male	patient	EXTERNAL-002	UOHI	1989-06-20
 **Required columns:**
 - `participant_id` - BIDS subject ID (e.g., sub-EXTERNAL001)
 - `external_id` - External study identifier
-- `sex` - Male/Female (required by LORIS)
-- `site` - LORIS site name (must match database)
+- `sex` - Male/Female (required by ARCHIMEDES)
+- `site` - ARCHIMEDES site name (must match database)
 - `dob` - Date of birth in YYYY-MM-DD format
-- `project` - LORIS project name (optional if in project.json)
+- `project` - ARCHIMEDES project name (optional if in project.json)
 
 ---
 
@@ -398,7 +395,7 @@ sub-EXTERNAL002	34	Male	patient	EXTERNAL-002	UOHI	1989-06-20
 
 ### Step 1: Participant Sync
 
-Create LORIS candidates and link ExternalIDs.
+Create ARCHIMEDES candidates and link ExternalIDs.
 Source/target directories are resolved automatically from `project.json → data_access.mount_path`.
 
 ```bash
@@ -502,7 +499,7 @@ php scripts/run_bids_import_pipeline.php --all --confirm
 
 ## DICOM Ingestion Workflow (Convert to tarchive)
 
-The DICOM import pipeline scans each project's `deidentified-raw/imaging/dicoms/` directory for study folders, archives them into LORIS tarchive format, and inserts or updates the records in the LORIS database via the `cbigr_api` script endpoint.
+The DICOM import pipeline scans each project's `deidentified-raw/imaging/dicoms/` directory for study folders, archives them into LORIS tarchive format, and inserts or updates the records in the ARCHIMEDES database via the `cbigr_api` script endpoint.
 
 ```
 1. Load Collections from Config
@@ -515,7 +512,7 @@ The DICOM import pipeline scans each project's `deidentified-raw/imaging/dicoms/
 
 2. For each enabled Collection:
    └── For each enabled Project:
-       ├── Authenticate with LORIS API
+       ├── Authenticate with ARCHIMEDES API
        └── Continue to DICOM processing
 
 3. STEP 1: Scan DICOM Directories
@@ -530,7 +527,7 @@ The DICOM import pipeline scans each project's `deidentified-raw/imaging/dicoms/
    │   ├── Script archives DICOMs into .tar.gz
    │   ├── Calculates MD5 checksums
    │   ├── Inserts/updates tarchive record in database
-   │   └── Associates with LORIS session (if --session flag)
+   │   └── Associates with ARCHIMEDES session (if --session flag)
    │
    ├── Classify results:
    │   ├── SUCCESS → mark as processed
@@ -620,7 +617,7 @@ php scripts/run_dicom_import.php --collection=archimedes --project=FDG-PET --con
 | `--confirm` | Execute (default is dry run) |
 | `--force` | Reprocess already-processed studies |
 | `--update` | Use `--update` flag instead of `--insert` |
-| `--session` | Associate study with LORIS session |
+| `--session` | Associate study with ARCHIMEDES session |
 | `--overwrite` | Overwrite existing archive files |
 | `--profile=NAME` | Python config file (default: `database_config.py`) |
 | `--config=FILE` | Config file path (default: `config/loris_client_config.json`) |
@@ -631,7 +628,7 @@ php scripts/run_dicom_import.php --collection=archimedes --project=FDG-PET --con
 
 ## Participant Metadata Workflow
 
-The participant metadata pipeline updates candidate demographic fields in LORIS (Date of Death today; extensible to Sex, DoB, and other fields) from BIDS, clinical, and custom-configured source files. Each source's MD5 is tracked so unchanged files are skipped on subsequent runs.
+The participant metadata pipeline updates candidate demographic fields in ARCHIMEDES (Date of Death today; extensible to Sex, DoB, and other fields) from BIDS, clinical, and custom-configured source files. Each source's MD5 is tracked so unchanged files are skipped on subsequent runs.
 
 ```
 1. Load Collections from Config
@@ -675,7 +672,7 @@ The participant metadata pipeline updates candidate demographic fields in LORIS 
 
 ### project.json Configuration
 
-Each source declares which LORIS fields to update via a `fields` map (LORIS field name → list of source column names; first non-empty wins):
+Each source declares which ARCHIMEDES fields to update via a `fields` map (ARCHIMEDES field name → list of source column names; first non-empty wins):
 
 ```json
 "participant_metadata": {
@@ -904,6 +901,6 @@ Per-project in `project.json`:
 }
 ```
 
-The `evidata` channel differs from the others: it has a single `on_check_failed` list (privacy-check failures) instead of `on_success`/`on_error`.
+The `evidata` email workflow differs from the others: it has a single `on_check_failed` list (privacy-check failures) instead of `on_success`/`on_error`.
 
 ---
