@@ -57,7 +57,26 @@ class ClinicalClient
     private array $apiVersions;
     private ?string $activeVersion = null;
 
-    private ?array $installedInstruments = null;
+    /** Effective HTTP timeout, kept for the error message. */
+    private int $timeoutSeconds;
+
+    /**
+     * Default HTTP timeout in seconds. Generous because a data upload
+     * is not a quick API call: LORIS writes a candidate, a session and
+     * an instrument record per row, synchronously, inside the request.
+     */
+    private const DEFAULT_TIMEOUT_SECONDS = 600;
+
+    /**
+     * Instrument lists, keyed by the LORIS project they were fetched
+     * for. Previously a single flat list: the first project queried won
+     * and every later lookup silently reused it, so a run touching two
+     * projects checked the second project's files against the first
+     * project's instruments.
+     *
+     * @var array<string, array<string>>
+     */
+    private array $installedInstruments = [];
 
     // im3: DD type map — extension → instrument_type value
     private const DD_TYPE_MAP = [
@@ -70,13 +89,24 @@ class ClinicalClient
     // CONSTRUCTOR
     // ──────────────────────────────────────────────────────────────────
 
+    /**
+     * @param int $timeoutSeconds HTTP timeout for every request.
+     *        Data uploads are the long pole: LORIS creates a candidate,
+     *        a session and one instrument record per row, so an 84-row
+     *        file can take minutes. The previous hardcoded 30s was fine
+     *        while uploads were failing validation in ~2s and became a
+     *        cURL error 28 the moment they started doing real work.
+     *        Configure per host via loris_client_config.json ->
+     *        api.timeout_seconds.
+     */
     public function __construct(
         string $baseUrl,
         string $username,
         string $password,
         int    $tokenExpiryMinutes = 55,
         ?LoggerInterface $logger = null,
-        string $apiVersion = 'v0.0.4-dev'
+        string $apiVersion = 'v0.0.4-dev',
+        int    $timeoutSeconds = self::DEFAULT_TIMEOUT_SECONDS
     ) {
         $this->baseUrl            = rtrim($baseUrl, '/');
         $this->username           = $username;
@@ -87,9 +117,10 @@ class ClinicalClient
         $this->apiVersions        = [$apiVersion];
 
         $this->httpClient = new GuzzleClient([
-            'timeout' => 30,
+            'timeout' => $timeoutSeconds,
             'verify'  => true,
         ]);
+        $this->timeoutSeconds = $timeoutSeconds;
 
         if (class_exists(\LORISClient\Configuration::class)
             && class_exists(\LORISClient\Api\AuthenticationApi::class)
@@ -713,8 +744,9 @@ PHPCODE;
                 'idMapping' => [], 'method' => 'HTTP',
             ];
         } catch (\Exception $e) {
-            $this->logger->error("    ✗ HTTP upload failed: " . $e->getMessage());
-            return ['success' => false, 'message' => $e->getMessage(), 'idMapping' => [], 'method' => 'HTTP'];
+            $msg = $this->describeTransportError($e, 1);
+            $this->logger->error("    ✗ HTTP upload failed: {$msg}");
+            return ['success' => false, 'message' => $msg, 'idMapping' => [], 'method' => 'HTTP'];
         }
     }
 
@@ -790,8 +822,9 @@ PHPCODE;
             return ['success' => false, 'message' => $errMsg, 'idMapping' => [], 'method' => 'HTTP'];
 
         } catch (\Exception $e) {
-            $this->logger->error("    ✗ Multi-instrument HTTP upload failed: " . $e->getMessage());
-            return ['success' => false, 'message' => $e->getMessage(), 'idMapping' => [], 'method' => 'HTTP'];
+            $msg = $this->describeTransportError($e, count($instrumentNames));
+            $this->logger->error("    ✗ Multi-instrument HTTP upload failed: {$msg}");
+            return ['success' => false, 'message' => $msg, 'idMapping' => [], 'method' => 'HTTP'];
         }
     }
 
@@ -1025,35 +1058,125 @@ PHPCODE;
     // INSTRUMENT EXISTS  (cached via Projects API)
     // ──────────────────────────────────────────────────────────────────
 
+    /**
+     * Is $instrument available to $project?
+     *
+     * NOTE: this asks /projects/{project}/instruments, which is the
+     * project's TEST BATTERY — not "is the instrument installed". An
+     * instrument registered by installing a data dictionary but never
+     * added to a project's battery is installed and still returns false
+     * here. The log message says so, because the previous wording
+     * ("will attempt install") pointed at the wrong remedy: reinstalling
+     * the dictionary does not add anything to a battery.
+     *
+     * @param string|null $project LORIS project name. Passing null falls
+     *                             back to the first project the API
+     *                             lists, which is almost never what the
+     *                             caller means — pass it explicitly.
+     */
     public function instrumentExists(string $instrument, ?string $project = null): bool
     {
-        if ($this->installedInstruments === null) {
-            $this->installedInstruments = $this->fetchInstalledInstruments($project);
+        $resolved = $this->resolveProjectName($project);
+        if ($resolved === null) {
+            return false;
         }
-        $exists = in_array($instrument, $this->installedInstruments, true);
-        $this->logger->info($exists
-            ? "      ✓ '{$instrument}' found in LORIS"
-            : "      ✗ '{$instrument}' NOT found in LORIS — will attempt install"
-        );
+
+        $list   = $this->getInstalledInstruments($resolved);
+        $exists = in_array($instrument, $list, true);
+
+        // Logged at DEBUG when absent: this method is called speculatively -
+        // the pipeline tries a data file's own name as an instrument before
+        // falling back to header matching - so a miss is the normal case for
+        // any file that is not named after a single instrument. Reporting
+        // every miss at INFO produced alarming lines about the test battery
+        // for files that were about to be resolved correctly a moment later.
+        // A miss that actually matters is reported by the caller, in context.
+        if ($exists) {
+            $this->logger->info("      ✓ '{$instrument}' available in project '{$resolved}'");
+        } else {
+            $this->logger->debug("      · '{$instrument}' not in project '{$resolved}' instrument list");
+        }
         return $exists;
     }
 
     public function clearInstrumentCache(): void
     {
-        $this->installedInstruments = null;
+        $this->installedInstruments = [];
     }
 
-    private function fetchInstalledInstruments(?string $project = null): array
+    /**
+     * Every instrument available to the project, using the same
+     * run-scoped cache as instrumentExists().
+     *
+     * Exposed so a caller can ITERATE the set rather than probe one name
+     * at a time — needed when a data file's target instrument is unknown
+     * and has to be resolved by comparing each instrument's expected
+     * columns against the file's header.
+     *
+     * The list is the project's TEST BATTERY, not everything installed
+     * in LORIS. Cached per project for the run.
+     *
+     * @param string|null $project Project to scope the list to. Pass it
+     *                             explicitly; null falls back to the
+     *                             API's first project and warns.
+     * @return array<string> Instrument names.
+     */
+    public function getInstalledInstruments(?string $project = null): array
+    {
+        $resolved = $this->resolveProjectName($project);
+        if ($resolved === null) {
+            return [];
+        }
+
+        if (!array_key_exists($resolved, $this->installedInstruments)) {
+            $this->installedInstruments[$resolved] = $this->fetchInstalledInstruments($resolved);
+            $this->logger->info(sprintf(
+                "    Project '%s' instrument list: %d instrument(s)%s",
+                $resolved,
+                count($this->installedInstruments[$resolved]),
+                $this->installedInstruments[$resolved] === []
+                    ? " — nothing in this project's test battery"
+                    : ''
+            ));
+        }
+
+        return $this->installedInstruments[$resolved];
+    }
+
+    /**
+     * Resolve the project to scope an instrument lookup to, falling back
+     * to the API's first project only when the caller supplied nothing.
+     * The fallback is logged as a warning: it is a guess, and on a LORIS
+     * hosting several projects it will usually be the wrong one.
+     */
+    private function resolveProjectName(?string $project): ?string
+    {
+        if ($project !== null && $project !== '') {
+            return $project;
+        }
+
+        $first = $this->getFirstProject();
+        if ($first === null) {
+            $this->logger->warning("    No project found — cannot list instruments");
+            return null;
+        }
+
+        $this->logger->warning(
+            "    No project supplied for the instrument lookup — falling back to"
+            . " '{$first}', the first project the API lists. If that is not the"
+            . " project being ingested, every instrument check for this run is"
+            . " being made against the wrong instrument list."
+        );
+        return $first;
+    }
+
+    /**
+     * Fetch one project's instrument list. The project is resolved by the
+     * caller (getInstalledInstruments), so it is never null here.
+     */
+    private function fetchInstalledInstruments(string $project): array
     {
         $version = $this->activeVersion ?? $this->apiVersion;
-
-        if ($project === null) {
-            $project = $this->getFirstProject();
-            if ($project === null) {
-                $this->logger->warning("    No project found — cannot list instruments");
-                return [];
-            }
-        }
 
         // Priority 1: API client
         if ($this->hasApiClient && $this->apiConfig !== null) {
@@ -1365,6 +1488,37 @@ PHPCODE;
     // ──────────────────────────────────────────────────────────────────
     // INTERNAL HELPERS
     // ──────────────────────────────────────────────────────────────────
+
+    /**
+     * Turn a transport exception into something actionable.
+     *
+     * A timeout on an upload is the one worth calling out: the request
+     * was cut off client-side, but LORIS may well have kept working and
+     * committed some or all of the rows. Reporting it as a plain failure
+     * invites a re-run that duplicates nothing (LORIS skips existing
+     * rows) but hides the fact that data may already be in.
+     */
+    private function describeTransportError(\Exception $e, int $instrumentCount): string
+    {
+        $raw = $e->getMessage();
+
+        if (!str_contains($raw, 'cURL error 28') && !str_contains($raw, 'timed out')) {
+            return $raw;
+        }
+
+        return sprintf(
+            'Upload timed out after %ds (%d instrument(s)). The request was '
+            . 'abandoned client-side, but LORIS may have continued and committed '
+            . 'some or all rows — CHECK the candidate and instrument tables before '
+            . 're-running. LORIS writes a candidate, a session and an instrument '
+            . 'record per row inside the request, so large files legitimately take '
+            . 'minutes. Raise api.timeout_seconds in loris_client_config.json if '
+            . 'this is the expected size. Original error: %s',
+            $this->timeoutSeconds,
+            $instrumentCount,
+            $raw
+        );
+    }
 
     private function parseApiUploadResult($result): array
     {

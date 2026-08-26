@@ -36,12 +36,10 @@ use Psr\Log\LoggerInterface;
  *        used only when a project does not define its own).
  *     3. ALL-HEADERS DEFAULT (privacy-policy approved): when qis is
  *        empty/absent at BOTH levels, every CSV column header is used as
- *        a QI, per file, MINUS:
- *          - columns listed in evidata.exclude_qis (two-level,
- *            case-insensitive), and
- *          - columns whose every value is unique-per-row (identifiers /
- *            pseudonyms / timestamps), removed automatically because
- *            EviData treats them as QIs and they force maximum risk.
+ *        a QI, per file, MINUS columns listed in evidata.exclude_qis
+ *        (two-level, case-insensitive). No column is removed on any
+ *        other basis: the data is assessed as it stands, and inclusion
+ *        or exclusion is a configuration decision only.
  *   Levels 1 and 2 each accept a flat array OR a map ('_default' +
  *   per-filename). EviData's server-side QI validation is case-sensitive.
  *   The per-file log records which columns were used and which excluded.
@@ -88,6 +86,29 @@ class ClinicalPipeline
     private array $installResults = [];
     private array $dataResults = [];
 
+    /**
+     * instrument name => its lowercased data-field list, populated by
+     * instrumentDataFields(). Cached for the run so the field-matching
+     * fallback costs one template fetch per instrument rather than one
+     * per data file.
+     *
+     * @var array<string, array<string>>
+     */
+    private array $instrumentFieldCache = [];
+
+    /**
+     * LORIS project name for the project currently being processed,
+     * taken from project.json -> candidate_defaults.project.
+     *
+     * Instrument availability is per PROJECT: /projects/{name}/instruments
+     * returns that project's test battery. Without this, the client fell
+     * back to whichever project the API happened to list first, so on a
+     * multi-project LORIS every instrument check could be made against
+     * the wrong battery. Null means the project did not configure a
+     * project name and the client's fallback applies, with a warning.
+     */
+    private ?string $lorisProjectName = null;
+
     private array $stats = [
         'dd_files_found'        => 0,
         'dd_installed'          => 0,
@@ -121,6 +142,51 @@ class ClinicalPipeline
     ];
 
     private const DEFAULT_EXCLUDE_FORMS = ['nip_connector', 'project_request_form'];
+
+    /**
+     * Columns LORIS treats as STRUCTURAL — used to locate or create the
+     * candidate and session — rather than as instrument data.
+     *
+     * Mirrors RedcapCSVParser::getEssentialHeaders() (with creation
+     * columns) on the LORIS side, plus the equivalent identifiers used
+     * by the non-REDCap formats. Kept in sync with that method: if
+     * LORIS adds an essential column, add it here too.
+     *
+     * Used by detectInstrumentsFromFields(): every instrument template
+     * carries these columns, so they carry NO signal about which
+     * instrument a data file targets and must be excluded before
+     * comparing field lists.
+     */
+    private const STRUCTURAL_COLUMNS = [
+        // RedcapCSVParser::getEssentialHeaders() — creation columns
+        'study_id', 'dob', 'sex', 'project', 'site',
+        'redcap_event_name', 'cohort', 'edc',
+        // REDCap structural extras
+        'redcap_repeat_instrument', 'redcap_repeat_instance',
+        'redcap_data_access_group',
+        // LORIS_CSV / BIDS_TSV equivalents
+        'pscid', 'candid', 'record_id', 'participant_id',
+        'visit_label', 'session_id',
+    ];
+
+    /**
+     * Metadata fields LORIS injects into EVERY LINST instrument —
+     * see InstrumentDataParser::writeStandardLINSTFields(). They appear
+     * in every instrument's expected-header template but are supplied
+     * by LORIS, not by the data file: a REDCap export never carries
+     * Date_taken or the static age/window fields.
+     *
+     * Excluded when matching field lists for the same reason as
+     * STRUCTURAL_COLUMNS — present in all templates, so no signal — and
+     * because requiring them would match NOTHING.
+     *
+     * getInstrumentHeaders() already strips CommentID / UserID /
+     * Testdate / Examiner server-side; these four are what remain.
+     */
+    private const LINST_METADATA_COLUMNS = [
+        'date_taken', 'candidate_age', 'gestational_age',
+        'window_difference',
+    ];
 
     /**
      * Clinical data directory, relative to the project mount.
@@ -158,7 +224,7 @@ class ClinicalPipeline
     /**
      * Sentinel value for a per-file qis map entry meaning "use ALL of
      * this file's headers" (resolved via resolveAllHeaderQis(), so
-     * exclude_qis and unique-per-row pruning still apply). Valid ONLY
+     * exclude_qis still applies). Valid ONLY
      * as a per-filename value inside a qis map — not for '_default'
      * and not as a flat-list element.
      */
@@ -220,6 +286,32 @@ class ClinicalPipeline
     ];
 
     /**
+     * Source sex encodings mapped to the three values LORIS accepts:
+     * Male / Female / Other. Keys are lowercased; matching against the
+     * file's cell value is case-insensitive.
+     *
+     * Distinct from CLINICAL_DEFAULT_COLUMNS: that map STAMPS a
+     * configured value into a missing column, whereas this REWRITES an
+     * existing value into the vocabulary LORIS requires. Both happen in
+     * applyCandidateDefaults() so the processed copy is written once.
+     *
+     * A source encoding not covered here (e.g. numeric 1/2) is added
+     * per project via project.json -> sex_mappings, which is merged
+     * OVER this baseline.
+     */
+    private const SEX_VALUE_MAP = [
+        'm' => 'Male',   'male'   => 'Male',
+        'f' => 'Female', 'female' => 'Female',
+        'o' => 'Other',  'other'  => 'Other',
+    ];
+
+    /**
+     * Column names that hold the candidate's sex, matched
+     * case-insensitively against the header. First match wins.
+     */
+    private const SEX_COLUMN_NAMES = ['sex', 'gender'];
+
+    /**
      * Default MTA message_size_limit in MB, used when the host's
      * evidata_config.json does not set evidata.mta_message_size_limit_mb.
      * The real per-host value (from `postconf message_size_limit`) should
@@ -248,12 +340,18 @@ class ClinicalPipeline
         $this->logger = new Logger('clinical');
         $this->logger->pushHandler($console);
 
+        // api.timeout_seconds is per host: a data upload is not a quick
+        // API call. LORIS writes a candidate, a session and an instrument
+        // record per row synchronously inside the request, so an 84-row
+        // file takes minutes, not seconds.
         $this->client = new ClinicalClient(
             $config['api']['base_url'],
             $config['api']['username'],
             $config['api']['password'],
             $config['api']['token_expiry_minutes'] ?? 55,
-            $this->logger
+            $this->logger,
+            $config['api']['api_version'] ?? 'v0.0.4-dev',
+            (int)($config['api']['timeout_seconds'] ?? 600)
         );
 
         $this->notification = new Notification();
@@ -325,6 +423,8 @@ class ClinicalPipeline
         $dataDir  = "{$mountPath}/" . self::CLINICAL_DIR;
         $phenoDir = "{$mountPath}/" . self::PHENOTYPE_DIR;
 
+        $this->lorisProjectName = trim((string)($project['candidate_defaults']['project'] ?? '')) ?: null;
+
         $this->logDir = "{$mountPath}/logs/clinical";
         $this->openRunLog();
 
@@ -337,6 +437,13 @@ class ClinicalPipeline
             . (is_dir($phenoDir) ? "" : "  [absent - skipped]"));
         $this->log("========================================");
         $this->log("  ✓ Data accessible: {$mountPath}");
+        if ($this->lorisProjectName !== null) {
+            $this->log("  LORIS project (instrument scope): {$this->lorisProjectName}");
+        } else {
+            $this->log("  WARNING: candidate_defaults.project is not set — instrument"
+                . " availability will be checked against whichever project the LORIS"
+                . " API lists first, which may not be this one");
+        }
 
         $this->installResults          = [];
         $this->dataResults             = [];
@@ -409,6 +516,94 @@ class ClinicalPipeline
             $this->log("  Pre-run candidate snapshot FAILED: " . $e->getMessage()
                 . " - new-candidate count unavailable for this run");
         }
+    }
+
+    // ══════════════════════════════════════════════════════════════════
+    //  Small shared helpers
+    // ══════════════════════════════════════════════════════════════════
+
+    /**
+     * Field delimiter for a data format.
+     *
+     * ONE definition, used by every reader and writer in this class.
+     * Previously the delimiter was derived in two independent ways —
+     * from $format in the upload path and from the file extension in the
+     * EviData path — which agreed only because DATA_EXTENSIONS happens to
+     * map tsv => BIDS_TSV. Two sources of truth for the same fact is a
+     * latent bug: the privacy gate and the uploader could parse the same
+     * file differently. delimiterForPath() now resolves the extension
+     * THROUGH the same map, so the two can no longer drift.
+     */
+    private function delimiterForFormat(string $format): string
+    {
+        return ($format === 'BIDS_TSV') ? "\t" : ',';
+    }
+
+    /**
+     * Field delimiter for a path, resolved via DATA_EXTENSIONS so it
+     * always agrees with delimiterForFormat(). An unknown extension
+     * falls back to comma, matching the previous behaviour.
+     */
+    private function delimiterForPath(string $path): string
+    {
+        $ext    = strtolower(pathinfo($path, PATHINFO_EXTENSION));
+        $format = self::DATA_EXTENSIONS[$ext] ?? 'LORIS_CSV';
+        return $this->delimiterForFormat($format);
+    }
+
+    /**
+     * Read ONLY the header row of a delimited file and close it again.
+     *
+     * Returns null when the file cannot be opened or has no usable
+     * header — callers decide whether that is fatal for them. Replaces
+     * four identical open/fgetcsv/fclose blocks; the methods that need
+     * to keep reading after the header (applyCandidateDefaults,
+     * normalizeDatesInFile, computeRowHashes) still manage their own
+     * handle, since they consume the body in the same pass.
+     *
+     * @return array<int,string>|null
+     */
+    private function readHeaderRow(string $path, string $delimiter): ?array
+    {
+        $fh = @fopen($path, 'r');
+        if ($fh === false) {
+            return null;
+        }
+        $headers = fgetcsv($fh, 0, $delimiter);
+        fclose($fh);
+
+        if (!is_array($headers) || $headers === []) {
+            return null;
+        }
+        return array_map(fn($h) => (string)$h, $headers);
+    }
+
+    /**
+     * Group filenames by the reason recorded for them and render the
+     * "a, b [reason]; c [reason]" fragment used in the notification
+     * email. Replaces three near-identical inline loops.
+     *
+     * @param array<string>              $files   filenames to group
+     * @param array<string,array>        $results result map keyed by filename
+     * @param string                     $key     result key holding the reason
+     */
+    private function groupByReason(
+        array $files,
+        array $results,
+        string $key,
+        string $default
+    ): string {
+        $byReason = [];
+        foreach ($files as $file) {
+            $reason = $results[$file][$key] ?? $default;
+            $byReason[$reason][] = $file;
+        }
+
+        $parts = [];
+        foreach ($byReason as $reason => $group) {
+            $parts[] = implode(', ', $group) . " [{$reason}]";
+        }
+        return implode('; ', $parts);
     }
 
     // ══════════════════════════════════════════════════════════════════
@@ -495,45 +690,8 @@ class ClinicalPipeline
         // ── Resolve the QI list per file up front ───────────────────
         // In all-headers mode ($qisConfig === null) each file's headers
         // are read and pruned; otherwise the explicit config is used.
-        $excludeSet   = $this->resolveExcludeQis($project, $evi);
-        $qisByPath    = [];
-        $qiResolveErr = [];
-        foreach ($csvFiles as $path) {
-            try {
-                if ($qisConfig === null) {
-                    // ALL-HEADERS mode (privacy-policy approved default)
-                    $qisByPath[$path] = $this->resolveAllHeaderQis(
-                        $path, $excludeSet, basename($path)
-                    );
-                } else {
-                    // Explicit qis config: resolve the configured list,
-                    // then drop any column that isn't actually in THIS
-                    // file. A configured QI absent from the file is
-                    // reported and skipped — the file is still checked
-                    // against the QIs that ARE present. Only an empty
-                    // remainder is fatal (nothing left to assess).
-                    $resolved = $this->resolveQisForFile(
-                        $qisConfig, basename($path)
-                    );
-                    if ($resolved === [self::QIS_ALL_HEADERS]) {
-                        // Per-file all-headers sentinel ("*"): this file
-                        // uses every header (minus exclude_qis and
-                        // unique-per-row), exactly like project-wide
-                        // all-headers mode, even though other files in
-                        // the same project use explicit lists.
-                        $qisByPath[$path] = $this->resolveAllHeaderQis(
-                            $path, $excludeSet, basename($path)
-                        );
-                    } else {
-                        $qisByPath[$path] = $this->pruneMissingQis(
-                            $path, $resolved, basename($path)
-                        );
-                    }
-                }
-            } catch (\RuntimeException $e) {
-                $qiResolveErr[basename($path)] = $e->getMessage();
-            }
-        }
+        $excludeSet = $this->resolveExcludeQis($project, $evi);
+        [$qisByPath, $qiResolveErr] = $this->resolveQisByPath($csvFiles, $qisConfig, $excludeSet);
 
         // ── Local QI presence check (no network) ────────────────────
         // In all-headers mode the QIs ARE the file's headers, so the
@@ -548,39 +706,7 @@ class ClinicalPipeline
         // failed now and removed from the remote check. Files that
         // passed local validation still go on to EviData.
         if (!empty($qiErrors)) {
-            foreach ($qiErrors as $name => $missing) {
-                $this->stats['evidata_files_checked']++;
-                $this->stats['evidata_files_failed']++;
-
-                if (isset($missing['__resolve_error__'])) {
-                    $errMsg = $missing['__resolve_error__'];
-                } elseif ($missing === ['__unreadable__']) {
-                    $errMsg = 'CSV unreadable';
-                } else {
-                    $errMsg = 'Configured QI columns missing in CSV: '
-                        . implode(', ', $missing);
-                }
-
-                $result = [
-                    'passed'     => false,
-                    'error'      => $errMsg,
-                    'report_id'  => null,
-                    'results'    => null,
-                    'report_zip' => null,
-                ];
-                $this->stats['evidata_results'][$name] = $result;
-                $this->evidataFailedFiles[] = $name;   // skip in ingestion
-                $this->log("  ✗ {$name} — {$errMsg}");
-                $this->writeError('evidata', "{$name}: {$errMsg}");
-                $this->persistEvidataArtifacts($name, $result);
-
-                // Drop this file from the remote-check set by basename.
-                foreach (array_keys($qisByPath) as $p) {
-                    if (basename($p) === $name) {
-                        unset($qisByPath[$p]);
-                    }
-                }
-            }
+            $this->recordLocalQiFailures($qiErrors, $qisByPath);
         }
 
         // If local validation knocked out every file, there is nothing
@@ -623,27 +749,7 @@ class ClinicalPipeline
         // ── Process each file's result, persist artifacts ───────────
         // A file is INGESTED only if overall_passed=true. A false
         // verdict OR an error (no verdict) marks it failed -> skipped.
-        foreach ($results as $name => $r) {
-            $this->stats['evidata_files_checked']++;
-            if ($r['passed']) {
-                $this->stats['evidata_files_passed']++;
-                $this->log("  ✓ {$name} (report_id={$r['report_id']})");
-            } else {
-                $this->stats['evidata_files_failed']++;
-                $this->evidataFailedFiles[] = $name;   // skip in ingestion
-                $detail = $r['error'] !== null
-                    ? "ERROR: {$r['error']}"
-                    : "overall_passed=false (report_id={$r['report_id']})";
-                $this->log("  ✗ {$name} — {$detail}");
-                $this->writeError('evidata', "{$name}: {$detail}");
-            }
-            $this->stats['evidata_results'][$name] = $r;
-
-            $written = $this->persistEvidataArtifacts($name, $r);
-            foreach ($written as $path) {
-                $this->log("    artifact: " . basename($path));
-            }
-        }
+        $this->recordRemoteEvidataResults($results);
 
         $this->evidataFailedFiles = array_values(array_unique($this->evidataFailedFiles));
         $allPassed = empty($this->evidataFailedFiles);
@@ -683,6 +789,145 @@ class ClinicalPipeline
             return 'all_failed';
         }
         return 'partial';
+    }
+
+    /**
+     * Resolve the QI list for every file up front.
+     *
+     * In ALL-HEADERS mode ($qisConfig === null) each file's headers are
+     * read and pruned against exclude_qis; otherwise the explicit config
+     * is resolved and any configured QI absent from that file is dropped
+     * with a report. A file whose QI list cannot be resolved at all is
+     * returned in the error map rather than throwing, so one broken file
+     * never stops the others being checked.
+     *
+     * @param array<string>       $csvFiles   absolute paths
+     * @param array|null          $qisConfig  explicit config, or null for all-headers
+     * @param array<string,true>  $excludeSet lowercased exclude set
+     * @return array{0: array<string,array<string>>, 1: array<string,string>}
+     *         [path => QI list, basename => error message]
+     */
+    private function resolveQisByPath(array $csvFiles, ?array $qisConfig, array $excludeSet): array
+    {
+        $qisByPath    = [];
+        $qiResolveErr = [];
+
+        foreach ($csvFiles as $path) {
+            try {
+                if ($qisConfig === null) {
+                    // ALL-HEADERS mode (privacy-policy approved default)
+                    $qisByPath[$path] = $this->resolveAllHeaderQis(
+                        $path, $excludeSet, basename($path)
+                    );
+                    continue;
+                }
+
+                // Explicit qis config: resolve the configured list, then
+                // drop any column that isn't actually in THIS file. A
+                // configured QI absent from the file is reported and
+                // skipped — the file is still checked against the QIs
+                // that ARE present. Only an empty remainder is fatal.
+                $resolved = $this->resolveQisForFile($qisConfig, basename($path));
+
+                if ($resolved === [self::QIS_ALL_HEADERS]) {
+                    // Per-file all-headers sentinel ("*"): this file uses
+                    // every header (minus exclude_qis), exactly like
+                    // project-wide all-headers mode, even though other
+                    // files in the same project use explicit lists.
+                    $qisByPath[$path] = $this->resolveAllHeaderQis(
+                        $path, $excludeSet, basename($path)
+                    );
+                } else {
+                    $qisByPath[$path] = $this->pruneMissingQis(
+                        $path, $resolved, basename($path)
+                    );
+                }
+            } catch (\RuntimeException $e) {
+                $qiResolveErr[basename($path)] = $e->getMessage();
+            }
+        }
+
+        return [$qisByPath, $qiResolveErr];
+    }
+
+    /**
+     * Record files that failed LOCAL QI validation (unreadable, missing
+     * configured QI columns, or a resolve error) as failed, and remove
+     * them from the remote-check set so they are never sent to EviData.
+     *
+     * @param array<string,array<string>> $qiErrors  basename => missing/marker
+     * @param array<string,array<string>> $qisByPath modified in place
+     */
+    private function recordLocalQiFailures(array $qiErrors, array &$qisByPath): void
+    {
+        foreach ($qiErrors as $name => $missing) {
+            $this->stats['evidata_files_checked']++;
+            $this->stats['evidata_files_failed']++;
+
+            if (isset($missing['__resolve_error__'])) {
+                $errMsg = $missing['__resolve_error__'];
+            } elseif ($missing === ['__unreadable__']) {
+                $errMsg = 'CSV unreadable';
+            } else {
+                $errMsg = 'Configured QI columns missing in CSV: '
+                    . implode(', ', $missing);
+            }
+
+            $result = [
+                'passed'     => false,
+                'error'      => $errMsg,
+                'report_id'  => null,
+                'results'    => null,
+                'report_zip' => null,
+            ];
+            $this->stats['evidata_results'][$name] = $result;
+            $this->evidataFailedFiles[] = $name;   // skip in ingestion
+            $this->log("  ✗ {$name} — {$errMsg}");
+            $this->writeError('evidata', "{$name}: {$errMsg}");
+            $this->persistEvidataArtifacts($name, $result);
+
+            // Drop this file from the remote-check set by basename.
+            foreach (array_keys($qisByPath) as $p) {
+                if (basename($p) === $name) {
+                    unset($qisByPath[$p]);
+                }
+            }
+        }
+    }
+
+    /**
+     * Tally each file's remote verdict, persist its artifacts, and record
+     * the failures so ingestion skips them.
+     *
+     * A file is INGESTED only if overall_passed=true. A false verdict OR
+     * an error (no verdict) marks it failed.
+     *
+     * @param array<string,array> $results basename => EviData result
+     */
+    private function recordRemoteEvidataResults(array $results): void
+    {
+        foreach ($results as $name => $r) {
+            $this->stats['evidata_files_checked']++;
+
+            if ($r['passed']) {
+                $this->stats['evidata_files_passed']++;
+                $this->log("  ✓ {$name} (report_id={$r['report_id']})");
+            } else {
+                $this->stats['evidata_files_failed']++;
+                $this->evidataFailedFiles[] = $name;   // skip in ingestion
+                $detail = $r['error'] !== null
+                    ? "ERROR: {$r['error']}"
+                    : "overall_passed=false (report_id={$r['report_id']})";
+                $this->log("  ✗ {$name} — {$detail}");
+                $this->writeError('evidata', "{$name}: {$detail}");
+            }
+
+            $this->stats['evidata_results'][$name] = $r;
+
+            foreach ($this->persistEvidataArtifacts($name, $r) as $path) {
+                $this->log("    artifact: " . basename($path));
+            }
+        }
     }
 
     /**
@@ -732,8 +977,7 @@ class ClinicalPipeline
         }
 
         // Privacy-policy approved default: no qis defined anywhere ->
-        // use every CSV header as a QI, minus exclude_qis and minus
-        // unique-per-row identifier columns.
+        // use every CSV header as a QI, minus exclude_qis.
         return [null, 'ALL HEADERS (no qis defined)'];
     }
 
@@ -762,11 +1006,11 @@ class ClinicalPipeline
 
     /**
      * Resolve QIs for ONE file in ALL-HEADERS mode: every column header,
-     * minus the configured exclude_qis, minus unique-per-row columns
-     * (identifiers / pseudonyms / timestamps). EviData's own report
-     * recommends unselecting unique-per-row columns, as they force
-     * maximum re-identification risk. Logs exactly what was used and
-     * excluded so every all-headers run is auditable.
+     * minus the configured exclude_qis. Nothing else is pruned — the file
+     * is assessed as it stands, and what counts as a quasi-identifier is
+     * a configuration decision (evidata.qis to include, exclude_qis to
+     * drop), not something inferred from the values. Logs exactly what
+     * was used and excluded so every all-headers run is auditable.
      *
      * @param array<string,true> $excludeSet  lowercased exclude set.
      * @return array  QI column names (original casing) to send.
@@ -774,23 +1018,13 @@ class ClinicalPipeline
      */
     private function resolveAllHeaderQis(string $path, array $excludeSet, string $basename): array
     {
-        $delim   = str_ends_with(strtolower($path), '.tsv') ? "\t" : ',';
-        $fh      = @fopen($path, 'r');
-        if ($fh === false) {
+        $headers = $this->readHeaderRow($path, $this->delimiterForPath($path));
+        if ($headers === null) {
             throw new \RuntimeException("CSV unreadable: {$basename}");
         }
-        $headers = fgetcsv($fh, 0, $delim);
-        fclose($fh);
-        if (!is_array($headers) || $headers === []) {
-            throw new \RuntimeException("CSV unreadable: {$basename}");
-        }
-        $headers = array_map(fn($h) => (string)$h, $headers);
-
-        $uniqueCols = $this->detectUniquePerRowColumns($path);
 
         $kept = [];
         $excludedByConfig = [];
-        $excludedAsUnique = [];
         foreach ($headers as $h) {
             $key = strtolower(trim($h));
             if ($key === '') {
@@ -798,24 +1032,17 @@ class ClinicalPipeline
             }
             if (isset($excludeSet[$key])) {
                 $excludedByConfig[] = $h;
-            } elseif (isset($uniqueCols[$key])) {
-                $excludedAsUnique[] = $h;
             } else {
                 $kept[] = $h;
             }
         }
 
         $this->log(sprintf(
-            "    %s — ALL HEADERS: %d of %d columns used"
-            . " (excluded %d by config, %d unique-per-row)",
-            $basename, count($kept), count($headers),
-            count($excludedByConfig), count($excludedAsUnique)
+            "    %s — ALL HEADERS: %d of %d columns used (excluded %d by config)",
+            $basename, count($kept), count($headers), count($excludedByConfig)
         ));
         if ($excludedByConfig) {
             $this->log("      excluded (config): " . implode(', ', $excludedByConfig));
-        }
-        if ($excludedAsUnique) {
-            $this->log("      excluded (unique-per-row): " . implode(', ', $excludedAsUnique));
         }
 
         if ($kept === []) {
@@ -825,58 +1052,6 @@ class ClinicalPipeline
             );
         }
         return array_values($kept);
-    }
-
-    /**
-     * Identify columns whose every populated value is distinct across
-     * all rows (unique-per-row) — almost always identifiers/pseudonyms/
-     * timestamps. Returns a lowercased set of such column names. Needs
-     * at least 2 rows for the notion to be meaningful.
-     *
-     * @return array<string,true>
-     */
-    private function detectUniquePerRowColumns(string $path): array
-    {
-        $delim = str_ends_with(strtolower($path), '.tsv') ? "\t" : ',';
-        $fh    = @fopen($path, 'r');
-        if ($fh === false) {
-            return [];
-        }
-        $headers = fgetcsv($fh, 0, $delim);
-        if (!is_array($headers)) {
-            fclose($fh);
-            return [];
-        }
-
-        $n        = count($headers);
-        $seen     = array_fill(0, $n, []);
-        $nonEmpty = array_fill(0, $n, 0);
-        $rowCount = 0;
-
-        while (($row = fgetcsv($fh, 0, $delim)) !== false) {
-            $rowCount++;
-            for ($i = 0; $i < $n; $i++) {
-                $v = isset($row[$i]) ? trim((string)$row[$i]) : '';
-                if ($v === '') {
-                    continue;
-                }
-                $nonEmpty[$i]++;
-                $seen[$i][$v] = true;
-            }
-        }
-        fclose($fh);
-
-        if ($rowCount < 2) {
-            return [];
-        }
-
-        $unique = [];
-        for ($i = 0; $i < $n; $i++) {
-            if ($nonEmpty[$i] === $rowCount && count($seen[$i]) === $rowCount) {
-                $unique[strtolower(trim((string)$headers[$i]))] = true;
-            }
-        }
-        return $unique;
     }
 
     /**
@@ -1004,14 +1179,8 @@ class ClinicalPipeline
      */
     private function pruneMissingQis(string $path, array $qis, string $basename): array
     {
-        $delim   = str_ends_with(strtolower($path), '.tsv') ? "\t" : ',';
-        $fh      = @fopen($path, 'r');
-        if ($fh === false) {
-            throw new \RuntimeException("CSV unreadable: {$basename}");
-        }
-        $headers = fgetcsv($fh, 0, $delim);
-        fclose($fh);
-        if (!is_array($headers) || $headers === []) {
+        $headers = $this->readHeaderRow($path, $this->delimiterForPath($path));
+        if ($headers === null) {
             throw new \RuntimeException("CSV unreadable: {$basename}");
         }
 
@@ -1066,15 +1235,8 @@ class ClinicalPipeline
     {
         $bad = [];
         foreach ($qisByPath as $path => $qis) {
-            $delim   = str_ends_with(strtolower($path), '.tsv') ? "\t" : ',';
-            $fh      = @fopen($path, 'r');
-            if ($fh === false) {
-                $bad[basename($path)] = ['__unreadable__'];
-                continue;
-            }
-            $headers = fgetcsv($fh, 0, $delim);
-            fclose($fh);
-            if (!is_array($headers)) {
+            $headers = $this->readHeaderRow($path, $this->delimiterForPath($path));
+            if ($headers === null) {
                 $bad[basename($path)] = ['__unreadable__'];
                 continue;
             }
@@ -1538,78 +1700,10 @@ class ClinicalPipeline
         $subject     = "PRIVACY CHECK FAILED: {$projectName} Clinical Pipeline";
         $body        = $this->buildEvidataFailureBody($projectName, $clientErrorOverride);
 
-        $attachments = [];
-        $totalBytes  = 0;
-        $attachTier  = 'none';   // 'full' | 'summary' | 'none'
-        if ($clientErrorOverride === null && $this->evidataLogDir !== null) {
-            // Graceful fallback ladder for attachments. The email size
-            // limit applies to the WHOLE message, so the decision is
-            // made on each batch's TOTAL size, not per file:
-            //   1. full report.pdf set — attach as-is if the total fits;
-            //      if the total exceeds the cap, compress the whole set
-            //      and use it if the compressed total now fits.
-            //   2. summary_letter.pdf set — same rule (as-is if it fits,
-            //      else compress and re-check).
-            //   3. nothing — tell the recipient to contact the team.
-            // EviData's report.zip bundles both report.pdf (full) and
-            // summary_letter.pdf (summary) per file.
-            [$fullAtt,    $fullBytes]    = $this->collectEvidataPdfs('report.pdf', '_report.pdf', '_evidata_report.pdf');
-            [$summaryAtt, $summaryBytes] = $this->collectEvidataPdfs('summary_letter.pdf', '_summary.pdf', '_evidata_summary.pdf');
-
-            // Per-host attachment ceiling, derived from the MTA limit in
-            // config (post-base64 headroom already applied).
-            $maxBytes = $this->maxAttachBytes();
-            $capMb    = $maxBytes / 1024 / 1024;
-
-            // ── Tier 1: full reports ────────────────────────────────
-            if (!empty($fullAtt)) {
-                if ($fullBytes <= $maxBytes) {
-                    // Already fits — no compression needed.
-                    $attachments = $fullAtt;
-                    $totalBytes  = $fullBytes;
-                    $attachTier  = 'full';
-                } else {
-                    // Batch total is over the cap — compress the whole set.
-                    $this->log(sprintf(
-                        "  EviData attachments: full report batch is %.1f MB, "
-                        . "exceeds the %.1f MB email cap — compressing the batch",
-                        $fullBytes / 1024 / 1024, $capMb
-                    ));
-                    [$fullC, $fullCBytes] = $this->compressAttachmentBatch($fullAtt);
-                    if ($fullCBytes <= $maxBytes) {
-                        $attachments = $fullC;
-                        $totalBytes  = $fullCBytes;
-                        $attachTier  = 'full';
-                    }
-                }
-            }
-
-            // ── Tier 2: summaries (only if tier 1 didn't land) ──────
-            if ($attachTier === 'none' && !empty($summaryAtt)) {
-                if ($summaryBytes <= $maxBytes) {
-                    $attachments = $summaryAtt;
-                    $totalBytes  = $summaryBytes;
-                    $attachTier  = 'summary';
-                } else {
-                    $this->log(sprintf(
-                        "  EviData attachments: summary batch is %.1f MB, "
-                        . "exceeds the %.1f MB email cap — compressing the batch",
-                        $summaryBytes / 1024 / 1024, $capMb
-                    ));
-                    [$sumC, $sumCBytes] = $this->compressAttachmentBatch($summaryAtt);
-                    if ($sumCBytes <= $maxBytes) {
-                        $attachments = $sumC;
-                        $totalBytes  = $sumCBytes;
-                        $attachTier  = 'summary';
-                    }
-                }
-            }
-
-            // ── Tier 3: nothing fits ────────────────────────────────
-            if ($attachTier === 'none') {
-                $attachments = [];
-            }
-        }
+        [$attachments, $totalBytes, $attachTier] =
+            ($clientErrorOverride === null && $this->evidataLogDir !== null)
+                ? $this->selectEvidataAttachments()
+                : [[], 0, 'none'];
 
         $ceilingMb = $this->maxAttachBytes() / 1024 / 1024;
         if ($attachTier === 'full') {
@@ -1667,6 +1761,71 @@ class ClinicalPipeline
             }
         }
         $this->evidataNotificationSent = true;
+    }
+
+    /**
+     * Choose which PDFs to attach to the failure email.
+     *
+     * Graceful fallback ladder. The MTA size limit applies to the WHOLE
+     * message, so the decision is made on each batch's TOTAL size, not
+     * per file:
+     *   1. full report.pdf set — attach as-is if the total fits; if it
+     *      exceeds the cap, compress the whole set and use it if the
+     *      compressed total now fits.
+     *   2. summary_letter.pdf set — same rule.
+     *   3. nothing — the caller tells the recipient to contact the team.
+     *
+     * EviData's report.zip bundles both report.pdf (full) and
+     * summary_letter.pdf (summary) per file.
+     *
+     * @return array{0: array<array{path:string,name:string}>, 1: int, 2: string}
+     *         [attachments, totalBytes, tier] where tier is
+     *         'full' | 'summary' | 'none'.
+     */
+    private function selectEvidataAttachments(): array
+    {
+        [$fullAtt,    $fullBytes]    = $this->collectEvidataPdfs('report.pdf', '_report.pdf', '_evidata_report.pdf');
+        [$summaryAtt, $summaryBytes] = $this->collectEvidataPdfs('summary_letter.pdf', '_summary.pdf', '_evidata_summary.pdf');
+
+        // Per-host attachment ceiling, derived from the MTA limit in
+        // config (post-base64 headroom already applied).
+        $maxBytes = $this->maxAttachBytes();
+        $capMb    = $maxBytes / 1024 / 1024;
+
+        // ── Tier 1: full reports ────────────────────────────────────
+        if (!empty($fullAtt)) {
+            if ($fullBytes <= $maxBytes) {
+                return [$fullAtt, $fullBytes, 'full'];   // fits as-is
+            }
+            $this->log(sprintf(
+                "  EviData attachments: full report batch is %.1f MB, "
+                . "exceeds the %.1f MB email cap — compressing the batch",
+                $fullBytes / 1024 / 1024, $capMb
+            ));
+            [$fullC, $fullCBytes] = $this->compressAttachmentBatch($fullAtt);
+            if ($fullCBytes <= $maxBytes) {
+                return [$fullC, $fullCBytes, 'full'];
+            }
+        }
+
+        // ── Tier 2: summaries ───────────────────────────────────────
+        if (!empty($summaryAtt)) {
+            if ($summaryBytes <= $maxBytes) {
+                return [$summaryAtt, $summaryBytes, 'summary'];
+            }
+            $this->log(sprintf(
+                "  EviData attachments: summary batch is %.1f MB, "
+                . "exceeds the %.1f MB email cap — compressing the batch",
+                $summaryBytes / 1024 / 1024, $capMb
+            ));
+            [$sumC, $sumCBytes] = $this->compressAttachmentBatch($summaryAtt);
+            if ($sumCBytes <= $maxBytes) {
+                return [$sumC, $sumCBytes, 'summary'];
+            }
+        }
+
+        // ── Tier 3: nothing fits ────────────────────────────────────
+        return [[], 0, 'none'];
     }
 
     private function sendEvidataMailWithAttachments(
@@ -1892,6 +2051,7 @@ class ClinicalPipeline
                     $this->stats['dd_installed']++;
                     $this->client->clearInstrumentCache();
                 }
+                $this->verifyRedcapDictionary($filePath, $filename, $type);
                 return;
             }
 
@@ -1899,6 +2059,7 @@ class ClinicalPipeline
                 $this->log("    Already installed ({$elapsed}s)");
                 $this->installResults[$filename] = ['status' => 'exists', 'type' => $type, 'time' => $elapsed];
                 $this->stats['dd_already_existed']++;
+                $this->verifyRedcapDictionary($filePath, $filename, $type);
                 return;
             }
 
@@ -1913,6 +2074,7 @@ class ClinicalPipeline
                 $this->log("    Already installed");
                 $this->installResults[$filename] = ['status' => 'exists', 'type' => $type];
                 $this->stats['dd_already_existed']++;
+                $this->verifyRedcapDictionary($filePath, $filename, $type);
                 return;
             }
             $this->log("    EXCEPTION: {$emsg}");
@@ -1920,6 +2082,145 @@ class ClinicalPipeline
             $this->installResults[$filename] = ['status' => 'failed', 'type' => $type, 'error' => $emsg];
             $this->stats['dd_failed']++;
         }
+    }
+
+    /**
+     * Confirm that a REDCap dictionary reported as installed actually
+     * produced instruments this project can use.
+     *
+     * "Already installed" is normally the right answer and the pipeline
+     * treats it as success. It is NOT always true. An instrument has to
+     * exist in three places, and the install can report success while
+     * only the first is satisfied:
+     *
+     *   1. the instruments directory  — the generated instrument file
+     *   2. test_names                 — the registry row LORIS looks up
+     *   3. test_battery               — active for this project + visit
+     *
+     * A stale or empty file in the instruments directory is enough for
+     * LORIS to answer "already exists" and skip the work, leaving no
+     * test_names row behind it. Every subsequent run then reports a
+     * clean install, skips again, and the data files that target those
+     * instruments fail much later with a message that says nothing about
+     * the dictionary.
+     *
+     * This closes that loop: read the dictionary's own Form Name column
+     * and check each form against the project's instrument list. Costs
+     * one header-and-column read of a file already on disk plus a set
+     * comparison against a list the run fetches anyway.
+     *
+     * REDCap dictionaries only. A .linst declares its instrument name
+     * inside the file in a form this method does not parse, and a BIDS
+     * .json maps to instruments differently; both are skipped rather
+     * than guessed at.
+     *
+     * Reported as a NOTE, never as a failure. The pipeline can only see
+     * the project's instrument list, and an instrument can be correctly
+     * installed yet absent from it because it has not been added to the
+     * test battery. The genuine error - a data file targeting a form
+     * that is not available - is reported by processOneDataFile() when
+     * that file is processed, by name.
+     */
+    private function verifyRedcapDictionary(string $filePath, string $filename, string $type): void
+    {
+        if ($type !== 'redcap') {
+            return;
+        }
+
+        $forms = $this->redcapDictionaryForms($filePath);
+        if ($forms === []) {
+            $this->log("    NOTE: could not read a 'Form Name' column from {$filename}"
+                . " - skipping post-install verification");
+            return;
+        }
+
+        // The install may have just created instruments; make sure the
+        // list is fetched fresh rather than served from an earlier probe.
+        $this->client->clearInstrumentCache();
+        $available = $this->client->getInstalledInstruments($this->lorisProjectName);
+
+        $missing = array_values(array_diff($forms, $available));
+
+        if ($missing === []) {
+            $this->log("    ✓ verified: all " . count($forms)
+                . " form(s) available to this project");
+            return;
+        }
+
+        $projectLabel = $this->lorisProjectName ?? '(project not configured)';
+        $shown        = implode(', ', array_slice($missing, 0, 15));
+        $suffix       = count($missing) > 15
+            ? ' ... and ' . (count($missing) - 15) . ' more'
+            : '';
+
+        // NOT reported as a failure. The list the pipeline can see is the
+        // project's instrument list; an instrument can be correctly
+        // installed - present in test_names, file on disk - and still be
+        // absent from it because nobody has added it to the test battery
+        // yet. That is a separate, deliberate step, not a fault in the
+        // dictionary or its installation.
+        //
+        // The genuine error surfaces later and precisely: if a data file
+        // targets one of these forms, processOneDataFile() reports it by
+        // name and fails that file. Failing the install here as well would
+        // report the same fact twice, once wrongly.
+        $this->log(sprintf(
+            "    NOTE: %s installed. %d of %d form(s) it defines are not in"
+            . " project %s's instrument list: %s%s",
+            $filename, count($missing), count($forms), $projectLabel, $shown, $suffix
+        ));
+        $this->log("    That is expected if they have not been added to the test"
+            . " battery yet - installing a dictionary registers its instruments,"
+            . " it does not activate them for a project. Only an issue if a data"
+            . " file targets one of these forms, which is reported separately"
+            . " when that file is processed.");
+    }
+
+    /**
+     * Distinct form names declared by a REDCap data dictionary.
+     *
+     * Matches the 'Form Name' column case-insensitively and tolerates
+     * the underscored variant some exports use.
+     *
+     * @return array<string>
+     */
+    private function redcapDictionaryForms(string $filePath): array
+    {
+        $fh = @fopen($filePath, 'r');
+        if ($fh === false) {
+            return [];
+        }
+
+        $headers = fgetcsv($fh, 0, ',');
+        if (!is_array($headers)) {
+            fclose($fh);
+            return [];
+        }
+
+        $idx = null;
+        foreach ($headers as $i => $h) {
+            $key = strtolower(trim((string)$h));
+            if ($key === 'form name' || $key === 'form_name') {
+                $idx = $i;
+                break;
+            }
+        }
+        if ($idx === null) {
+            fclose($fh);
+            return [];
+        }
+
+        $forms = [];
+        while (($row = fgetcsv($fh, 0, ',')) !== false) {
+            $name = isset($row[$idx]) ? trim((string)$row[$idx]) : '';
+            if ($name !== '' && !in_array($name, $forms, true)) {
+                $forms[] = $name;
+            }
+        }
+        fclose($fh);
+
+        // Forms the pipeline never ingests carry no signal here either.
+        return array_values(array_diff($forms, self::DEFAULT_EXCLUDE_FORMS));
     }
 
     // ══════════════════════════════════════════════════════════════════
@@ -2167,8 +2468,42 @@ class ClinicalPipeline
             return;
         }
 
-        $uploadPath = $this->normalizeDatesInFile($sourcePath, $format);
-        $usingTemp  = ($uploadPath !== $sourcePath);
+        // Ambiguous two-number dates (5/6/2024) are resolved with the
+        // project's declared order; unambiguous ones (5/23/2024) are
+        // resolved from the data regardless. Default 'mdy' matches the
+        // date_mdy validation REDCap dictionaries normally declare.
+        $dateOrder = strtolower((string)($project['date_input_format'] ?? 'mdy'));
+
+        // Date normalisation writes into processed/clinical/ rather than a
+        // temp file, so the processed copy IS the file that was uploaded -
+        // defaults stamped, sex normalised, dates corrected. When a row is
+        // rejected for a bad date or a missing site/cohort, the operator
+        // can open that file and see the value LORIS actually received.
+        $processedDir  = rtrim(
+                $project['data_access']['mount_path'] ?? $project['_projectPath'],
+                '/'
+            ) . '/processed/clinical';
+        $processedPath = "{$processedDir}/{$filename}";
+
+        if (!is_dir($processedDir) && !@mkdir($processedDir, 0755, true)
+            && !is_dir($processedDir)
+        ) {
+            $this->log("    WARNING: {$processedDir} is not writable - date"
+                . " normalisation will use a temp file and the processed copy"
+                . " will NOT reflect what was uploaded");
+            $processedPath = null;
+        }
+
+        $uploadPath = $this->normalizeDatesInFile(
+            $sourcePath, $format, $dateOrder, $processedPath
+        );
+
+        // The processed copy is a deliverable, not scratch - never unlinked.
+        $usingTemp = ($uploadPath !== $sourcePath && $uploadPath !== $processedPath);
+
+        if ($uploadPath === $processedPath) {
+            $this->log("    Processed copy (as uploaded): processed/clinical/{$filename}");
+        }
 
         // Narrow the upload to the new/changed rows. Done AFTER enrichment
         // and date normalisation, both of which rewrite row-for-row in
@@ -2191,8 +2526,39 @@ class ClinicalPipeline
             }
         }
 
+        // Last gate before the API. The file has been enriched as far as
+        // the pipeline can take it; anything still invalid would be
+        // rejected by LORIS row by row, with no row numbers and no
+        // context. Fail here instead, naming every problem at once.
+        $problems = $this->preflightRows($uploadPath, $format, $project);
+        if ($problems !== []) {
+            $this->log("    FAILED validation - not sent to ARCHIMEDES:");
+            foreach ($problems as $pb) {
+                $this->log("      - {$pb}");
+            }
+            $this->writeError($filename,
+                "Validation failed before upload, nothing was sent: "
+                . implode(' | ', $problems)
+            );
+            $this->dataResults[$filename] = [
+                'status'        => 'failed',
+                'reason'        => 'failed validation before upload',
+                'instruments'   => [],
+                'rows'          => $rows,
+                'change_status' => $changeStatus,
+            ];
+            $this->stats['data_failed']++;
+            if ($usingTemp && file_exists($uploadPath)) {
+                @unlink($uploadPath);
+            }
+            return;
+        }
+
         try {
-            if ($this->client->instrumentExists($baseName)) {
+            // Shortcut: a file named after a single instrument uploads
+            // straight to it. A miss here is expected for any file holding
+            // more than one instrument's data, and is not reported.
+            if ($this->client->instrumentExists($baseName, $this->lorisProjectName)) {
                 $this->log("    Instrument: {$baseName} (matched by filename)");
                 $result = $this->doSingleUpload($baseName, $uploadPath, $format, $rows);
                 $this->dataResults[$filename] = array_merge($result, [
@@ -2206,11 +2572,62 @@ class ClinicalPipeline
                 if ($result['status'] === 'success') {
                     $this->updateTracking($filename, $filePath, $result, $rowPlan['current'] ?? null);
                     $this->archiveSnapshot($project, $filePath);
+                } elseif (($result['reason'] ?? '') === 'ingestion not confirmed (rows may already exist)') {
+                    // Nothing to archive - nothing was written. Record the hash
+                    // anyway: LORIS returns this same empty response every time
+                    // the rows already exist, so without tracking the file would
+                    // be re-sent on every run for ever.
+                    $this->updateTracking($filename, $filePath, [], $rowPlan['current'] ?? null);
                 }
                 return;
             }
 
-            $instruments = $this->detectInstrumentsFromHeaders($uploadPath, $format);
+            $detected    = $this->detectInstrumentsFromHeaders($uploadPath, $format);
+            $instruments = $detected['available'];
+
+            if ($instruments === [] && $detected['named'] !== []) {
+                // The file DOES declare its instruments via _complete
+                // columns — they are simply not available to this
+                // project. Field matching cannot help: it iterates the
+                // very same project instrument list that just rejected
+                // them. Fail immediately, naming them, instead of
+                // spending an HTTP call per installed instrument to
+                // reach the same answer.
+                $missing = implode(', ', $detected['named']);
+                $this->log("    FAILED - the file targets " . count($detected['named'])
+                    . " instrument(s) that are NOT available to this project: {$missing}");
+                $this->log("    The data dictionary may be installed without the"
+                    . " instruments having been added to the project's test battery."
+                    . " Check the LORIS Test Battery module for this project.");
+                $this->writeError($filename,
+                    "Instruments named by _complete columns are not available to this "
+                    . "project: {$missing}. Installing the data dictionary registers an "
+                    . "instrument; it does not add it to the project's test battery. "
+                    . "Add them to the battery for the visit label(s) being ingested."
+                );
+                $this->dataResults[$filename] = [
+                    'status'        => 'failed',
+                    'reason'        => 'instruments not in project battery',
+                    'instruments'   => [],
+                    'rows'          => $rows,
+                    'change_status' => $changeStatus,
+                ];
+                $this->stats['data_failed']++;
+                return;
+            }
+
+            if ($instruments === []) {
+                // The file does not name its instruments via <form>_complete
+                // columns. That is not a problem and not a REDCap
+                // requirement: RedcapCSVParser never reads those columns,
+                // and getEssentialHeaders() asks only for study_id and
+                // redcap_event_name. They are simply a convenient shortcut
+                // when present. Resolve the target instrument(s) by matching
+                // each available instrument's field list against the file's
+                // columns instead.
+                $this->log("    Matching instruments by field name");
+                $instruments = $this->detectInstrumentsFromFields($uploadPath, $format);
+            }
 
             if (empty($instruments)) {
                 $this->log("    FAILED - no matching instruments found in headers");
@@ -2246,6 +2663,9 @@ class ClinicalPipeline
             if ($result['status'] === 'success') {
                 $this->updateTracking($filename, $filePath, $result, $rowPlan['current'] ?? null);
                 $this->archiveSnapshot($project, $filePath);
+            } elseif (($result['reason'] ?? '') === 'ingestion not confirmed (rows may already exist)') {
+                // See above: record the hash so an unchanged file is not re-sent.
+                $this->updateTracking($filename, $filePath, [], $rowPlan['current'] ?? null);
             }
         } finally {
             if ($usingTemp && file_exists($uploadPath)) {
@@ -2265,6 +2685,16 @@ class ClinicalPipeline
      *   - column present, cell blank    -> filled from config
      *   - column present, cell populated-> left alone (the file wins)
      * A key absent from candidate_defaults never stamps.
+     *
+     * ALSO normalises the sex column, when the file has one, into the
+     * Male/Female/Other vocabulary LORIS requires - see SEX_VALUE_MAP.
+     * This is a REWRITE of existing values, not a stamp of a configured
+     * one: a blank cell stays blank (candidate_defaults.sex is not
+     * applied here, since stamping an unknown sex would fabricate data)
+     * and an unrecognised encoding is left untouched and logged, so it
+     * surfaces as a LORIS rejection rather than a silent wrong answer.
+     * Both operations share this one pass so the processed copy is
+     * written once.
      *
      * A file that needs nothing gets no processed copy: the original path
      * is returned and ingestion reads it directly. In practice only the
@@ -2292,11 +2722,19 @@ class ClinicalPipeline
                 $apply[$col] = (string)$defaults[$key];
             }
         }
-        if ($apply === []) {
-            return $srcPath;
-        }
+        // NOTE: no early return on an empty $apply. A file may need no
+        // stamped defaults but still carry sex values in a form LORIS
+        // rejects (M/F), so the header has to be read before deciding
+        // whether a processed copy is needed at all. The decision is
+        // made below, once both $apply and $sexIdx are known.
 
-        $delimiter = ($format === 'BIDS_TSV') ? "\t" : ',';
+        // Per-project overrides merged over the baseline vocabulary.
+        $sexMap = array_change_key_case(
+            array_merge(self::SEX_VALUE_MAP, $project['sex_mappings'] ?? []),
+            CASE_LOWER
+        );
+
+        $delimiter = $this->delimiterForFormat($format);
         $basename  = basename($srcPath);
 
         $in = fopen($srcPath, 'r');
@@ -2328,6 +2766,24 @@ class ClinicalPipeline
             }
         }
 
+        // Locate the sex column, if the file has one. First name in
+        // SEX_COLUMN_NAMES that appears in the header wins.
+        $sexIdx = null;
+        foreach (self::SEX_COLUMN_NAMES as $sexCol) {
+            $i = array_search($sexCol, $headersLower, true);
+            if ($i !== false) {
+                $sexIdx = $i;
+                break;
+            }
+        }
+
+        // Nothing to stamp AND no sex column to normalise - the copy
+        // would be byte-identical to the original, so skip it entirely.
+        if ($apply === [] && $sexIdx === null) {
+            fclose($in);
+            return $srcPath;
+        }
+
         $outDir = rtrim($project['data_access']['mount_path'] ?? $project['_projectPath'], '/')
             . '/processed/clinical';
         if (!is_dir($outDir) && !mkdir($outDir, 0755, true)) {
@@ -2345,8 +2801,10 @@ class ClinicalPipeline
         }
         fputcsv($out, $headers, $delimiter);
 
-        $filled = array_fill_keys(array_keys($fillIndex), 0);
-        $rows   = 0;
+        $filled         = array_fill_keys(array_keys($fillIndex), 0);
+        $rows           = 0;
+        $sexNormalized  = 0;
+        $sexUnmapped    = [];   // raw value => occurrences
         while (($row = fgetcsv($in, 0, $delimiter)) !== false) {
             $rows++;
             $row = array_pad($row, $origCount, '');
@@ -2356,6 +2814,28 @@ class ClinicalPipeline
                     $filled[$column]++;
                 }
             }
+
+            // Rewrite sex into the vocabulary LORIS accepts. A blank is
+            // left blank (candidate_defaults.sex is NOT applied here -
+            // stamping a sex we do not know would fabricate data). An
+            // unrecognised value is also left untouched and reported:
+            // it surfaces as a LORIS rejection to investigate rather
+            // than being silently coerced into a wrong answer.
+            if ($sexIdx !== null && isset($row[$sexIdx])) {
+                $raw = trim((string)$row[$sexIdx]);
+                $key = strtolower($raw);
+                if ($raw !== '') {
+                    if (isset($sexMap[$key])) {
+                        if ($sexMap[$key] !== $raw) {
+                            $row[$sexIdx] = $sexMap[$key];
+                            $sexNormalized++;
+                        }
+                    } else {
+                        $sexUnmapped[$raw] = ($sexUnmapped[$raw] ?? 0) + 1;
+                    }
+                }
+            }
+
             foreach ($appended as $column) {
                 $row[] = $apply[$column];
             }
@@ -2364,10 +2844,19 @@ class ClinicalPipeline
         fclose($in);
         fclose($out);
 
-        // Nothing was missing - the copy matches the original, so discard
-        // it and ingest the original. Only files that actually needed a
-        // default reach processed/clinical/.
-        if ($appended === [] && array_sum($filled) === 0) {
+        // Unrecognised sex values are reported whether or not a copy is
+        // kept - they will be rejected by LORIS either way, and the
+        // operator needs to know which value to add to sex_mappings.
+        foreach ($sexUnmapped as $value => $n) {
+            $this->log("    WARNING: unrecognised sex value '{$value}' in {$n} row(s) of "
+                . "{$basename} - left as-is and LORIS will reject it. Add it to "
+                . "project.json -> sex_mappings, or correct the source export.");
+        }
+
+        // Nothing was missing and no sex value changed - the copy matches
+        // the original, so discard it and ingest the original. Only files
+        // that actually needed a change reach processed/clinical/.
+        if ($appended === [] && array_sum($filled) === 0 && $sexNormalized === 0) {
             @unlink($outPath);
             $this->log("    candidate_defaults: {$basename} already carries every target column - using file as-is");
             return $srcPath;
@@ -2381,6 +2870,9 @@ class ClinicalPipeline
             if ($n > 0) {
                 $parts[] = "{$column}={$apply[$column]} ({$n}/{$rows} blank cell(s) filled)";
             }
+        }
+        if ($sexNormalized > 0) {
+            $parts[] = "sex normalised to Male/Female/Other ({$sexNormalized}/{$rows} value(s) rewritten)";
         }
         $this->log("    candidate_defaults applied from project.json: " . implode(', ', $parts));
         $this->log("    Processed copy: processed/clinical/{$basename}");
@@ -2507,7 +2999,7 @@ class ClinicalPipeline
      */
     private function computeRowHashes(string $path, string $format, array $cols): array
     {
-        $delimiter = ($format === 'BIDS_TSV') ? "\t" : ',';
+        $delimiter = $this->delimiterForFormat($format);
 
         $keys   = [];   // row index (0-based, data rows only) => key
         $hashes = [];   // key => md5 of the row
@@ -2568,15 +3060,8 @@ class ClinicalPipeline
         string $filePath,
         string $format
     ): ?array {
-        $delimiter = ($format === 'BIDS_TSV') ? "\t" : ',';
-
-        $fh = @fopen($filePath, 'r');
-        if ($fh === false) {
-            return null;
-        }
-        $headers = fgetcsv($fh, 0, $delimiter);
-        fclose($fh);
-        if (!is_array($headers) || $headers === []) {
+        $headers = $this->readHeaderRow($filePath, $this->delimiterForFormat($format));
+        if ($headers === null) {
             return null;
         }
 
@@ -2663,7 +3148,7 @@ class ClinicalPipeline
      */
     private function filterRowsByIndex(string $path, array $keepIndices, string $format): ?string
     {
-        $delimiter = ($format === 'BIDS_TSV') ? "\t" : ',';
+        $delimiter = $this->delimiterForFormat($format);
         $keep      = array_flip($keepIndices);
 
         $in = @fopen($path, 'r');
@@ -2702,33 +3187,199 @@ class ClinicalPipeline
         return $tmp;
     }
 
+    /**
+     * Instruments named by the file's REDCap <form>_complete columns.
+     *
+     * Returns BOTH sets, because "no instruments" has two very different
+     * causes and the caller must distinguish them:
+     *
+     *   'named'     every instrument the file declares via a _complete
+     *               column, excluding DEFAULT_EXCLUDE_FORMS. Non-empty
+     *               means the file IS a REDCap export and we already
+     *               know what it targets.
+     *   'available' the subset LORIS will accept — i.e. present in the
+     *               project's instrument list.
+     *
+     * Previously only 'available' was returned, so a file naming eight
+     * instruments that are installed but absent from the project's test
+     * battery was indistinguishable from a file with no _complete
+     * columns at all. The caller then logged "No *_complete column(s)"
+     * and ran a field-match that could not possibly succeed.
+     *
+     * @return array{named: array<string>, available: array<string>}
+     */
     private function detectInstrumentsFromHeaders(string $filePath, string $format): array
     {
-        $delimiter = ($format === 'BIDS_TSV') ? "\t" : ',';
+        $headers = $this->readHeaderRow($filePath, $this->delimiterForFormat($format));
+        if ($headers === null) {
+            return ['named' => [], 'available' => []];
+        }
 
-        $fh         = fopen($filePath, 'r');
+        $named = $available = [];
+
+        foreach ($headers as $col) {
+            if (!preg_match('/^(.+)_complete$/', trim($col), $m)) {
+                continue;
+            }
+            $inst = $m[1];
+            if (in_array($inst, self::DEFAULT_EXCLUDE_FORMS, true)) {
+                continue;
+            }
+            $named[] = $inst;
+            if ($this->client->instrumentExists($inst, $this->lorisProjectName)) {
+                $available[] = $inst;
+            }
+        }
+
+        return [
+            'named'     => array_values(array_unique($named)),
+            'available' => array_values(array_unique($available)),
+        ];
+    }
+
+    /**
+     * Fallback instrument detection for files with NO *_complete columns.
+     *
+     * detectInstrumentsFromHeaders() relies on REDCap's per-form
+     * <form>_complete column. That column is a convenient marker, NOT a
+     * LORIS requirement: RedcapCSVParser::getEssentialHeaders() lists
+     * only study_id / dob / sex / project / site / redcap_event_name /
+     * cohort as structural, and the instrument name is passed to the
+     * upload endpoint explicitly rather than inferred. So a file with no
+     * _complete columns is perfectly ingestible — the pipeline just has
+     * to work out which instrument(s) it targets.
+     *
+     * Each installed instrument's expected header line is fetched from
+     * LORIS (getInstrumentDataHeaders returns RedcapCSVParser::
+     * getCSVHeaders() output) and its DATA fields — structural columns,
+     * LINST metadata and _complete removed — are compared against the
+     * file's columns. An instrument matches when the file carries ANY of
+     * its fields.
+     *
+     * "Any" rather than "all" or a threshold, because that is LORIS's
+     * own rule: the pipeline uploads with strict=false, so
+     * InstrumentDataParser::parseData() validates against
+     * getEssentialHeaders() alone and every instrument field absent from
+     * the file is simply stored as NULL. Requiring more than LORIS does
+     * would reject files LORIS would happily ingest. Missing fields are
+     * logged as a warning so a partially-populated instrument is
+     * visible, not silent.
+     *
+     * Templates are cached per run — one HTTP call per instrument, not
+     * per file.
+     *
+     * @return array<string> Matching instrument names, or [] if none.
+     */
+    private function detectInstrumentsFromFields(string $filePath, string $format): array
+    {
+        $delimiter = $this->delimiterForFormat($format);
+
+        $fh = @fopen($filePath, 'r');
+        if ($fh === false) {
+            return [];
+        }
         $headerLine = fgets($fh);
         fclose($fh);
-
         if ($headerLine === false) {
             return [];
         }
 
-        $columns     = array_map('trim', str_getcsv(trim($headerLine), $delimiter));
-        $instruments = [];
+        $fileCols = array_flip(array_map(
+            fn($h) => strtolower(trim((string)$h)),
+            str_getcsv(trim($headerLine), $delimiter)
+        ));
+        $structural = array_flip(self::STRUCTURAL_COLUMNS);
 
-        foreach ($columns as $col) {
-            if (preg_match('/^(.+)_complete$/', $col, $m)) {
-                $inst = $m[1];
-                if (!in_array($inst, self::DEFAULT_EXCLUDE_FORMS, true)
-                    && $this->client->instrumentExists($inst)
-                ) {
-                    $instruments[] = $inst;
+        $matched = [];
+        foreach ($this->client->getInstalledInstruments($this->lorisProjectName) as $inst) {
+            if (in_array($inst, self::DEFAULT_EXCLUDE_FORMS, true)) {
+                continue;
+            }
+
+            $dataFields = $this->instrumentDataFields($inst, $format, $delimiter, $structural);
+            if ($dataFields === []) {
+                continue;   // template unavailable, or no data fields
+            }
+
+            $present = array_values(array_filter(
+                $dataFields,
+                fn($c) => isset($fileCols[$c])
+            ));
+            $missing = array_values(array_filter(
+                $dataFields,
+                fn($c) => !isset($fileCols[$c])
+            ));
+
+            // LORIS's own rule, not a pipeline-invented threshold: the
+            // upload runs with strict=false, so InstrumentDataParser
+            // validates against getEssentialHeaders() only and any
+            // instrument field absent from the file is stored as null.
+            // A file therefore targets an instrument as soon as it
+            // carries ANY of that instrument's fields; the missing ones
+            // are reported, never used to veto the match.
+            if ($present !== []) {
+                $matched[] = $inst;
+                $this->log(sprintf(
+                    "      ✓ %s — %d of %d field(s) present",
+                    $inst, count($present), count($dataFields)
+                ));
+                if ($missing !== []) {
+                    $shown = array_slice($missing, 0, 10);
+                    $this->log(sprintf(
+                        "        WARNING: %d field(s) absent from the file, will "
+                        . "be stored as NULL: %s%s",
+                        count($missing),
+                        implode(', ', $shown),
+                        count($missing) > 10
+                            ? ' ... and ' . (count($missing) - 10) . ' more'
+                            : ''
+                    ));
                 }
             }
         }
 
-        return array_unique($instruments);
+        return $matched;
+    }
+
+    /**
+     * An instrument's own data-field names, lowercased, with structural
+     * and _complete columns removed. Cached per run: the template is a
+     * property of the instrument, not of the file being matched.
+     *
+     * @param array<string,int> $structural Flipped STRUCTURAL_COLUMNS.
+     * @return array<string>
+     */
+    private function instrumentDataFields(
+        string $instrument,
+        string $format,
+        string $delimiter,
+        array $structural
+    ): array {
+        if (isset($this->instrumentFieldCache[$instrument])) {
+            return $this->instrumentFieldCache[$instrument];
+        }
+
+        $template = $this->client->getInstrumentDataHeaders(
+            $instrument,
+            'CREATE_SESSIONS',
+            $format
+        );
+        if ($template === null || trim($template) === '') {
+            return $this->instrumentFieldCache[$instrument] = [];
+        }
+
+        $fields = array_values(array_filter(
+            array_map(
+                fn($h) => strtolower(trim((string)$h)),
+                str_getcsv(trim($template), $delimiter)
+            ),
+            fn($c) => $c !== ''
+                && !isset($structural[$c])
+                && !in_array($c, self::LINST_METADATA_COLUMNS, true)
+                && !str_ends_with($c, '_complete')
+        ));
+
+        return $this->instrumentFieldCache[$instrument] = $fields;
     }
 
     // ══════════════════════════════════════════════════════════════════
@@ -2749,6 +3400,11 @@ class ClinicalPipeline
 
             if ($result['success'] ?? false) {
                 $ui = $this->extractUploadInfo($result);
+
+                if ($this->uploadUnconfirmed($ui)) {
+                    return $this->unconfirmedUploadResult($instrument, $filePath, $elapsed, $ui);
+                }
+
                 $this->logUploadSuccess($elapsed, $ui);
                 $this->tallyUploadSuccess($ui);
                 return array_merge(['status' => 'success', 'reason' => 'uploaded', 'elapsed' => $elapsed], $ui);
@@ -2785,6 +3441,11 @@ class ClinicalPipeline
 
             if ($result['success'] ?? false) {
                 $ui = $this->extractUploadInfo($result);
+
+                if ($this->uploadUnconfirmed($ui)) {
+                    return $this->unconfirmedUploadResult('multi-instrument', $filePath, $elapsed, $ui);
+                }
+
                 $this->logUploadSuccess($elapsed, $ui, $count);
                 $this->tallyUploadSuccess($ui);
                 return array_merge(['status' => 'success', 'reason' => 'uploaded', 'elapsed' => $elapsed], $ui);
@@ -2834,6 +3495,200 @@ class ClinicalPipeline
         }
 
         return $info;
+    }
+
+    /**
+     * Did LORIS report any evidence that the upload ingested anything?
+     *
+     * A successful response normally carries "Saved X out of Y" and/or an
+     * idMapping. Neither present means we cannot CONFIRM anything was
+     * written — it does NOT prove nothing was. LORIS can complete real
+     * work and return a bare OK, so this is deliberately named as a lack
+     * of confirmation rather than a lack of ingestion, and the message
+     * tells the operator to check rather than asserting an outcome.
+     *
+     * Treated as a failure so the run does not report success, and so
+     * tracking is not written: the file is retried next run, which is
+     * harmless because LORIS skips rows that already exist.
+     */
+    private function uploadUnconfirmed(array $ui): bool
+    {
+        return ($ui['rows_total'] ?? null) === null
+            && ($ui['pairs'] ?? 0) === 0;
+    }
+
+    /**
+     * The result recorded when LORIS accepts an upload but returns no row
+     * counts and no idMapping.
+     *
+     * This is NOT proof that nothing was written. A re-upload of rows
+     * that already exist produces exactly the same response: LORIS has
+     * nothing to insert, so there is nothing to report. Treating that as
+     * a failure marks a correct no-op as an error.
+     *
+     * Recorded as a SKIP with its own reason, so it is visible in the
+     * summary and the email without failing the run. Tracking is still
+     * written, so an unchanged file is not re-sent on every subsequent
+     * run.
+     *
+     * Note on <form>_complete: it plays no part in this. The REDCap CSV
+     * parser never reads those columns — getEssentialHeaders() requires
+     * only study_id and redcap_event_name — so their presence or absence
+     * is irrelevant to whether rows are ingested.
+     */
+    private function unconfirmedUploadResult(
+        string $context,
+        string $filePath,
+        float $elapsed,
+        array $ui
+    ): array {
+        $this->log(sprintf(
+            "    UNCONFIRMED (%.2fs) - LORIS accepted the upload but returned no row"
+            . " counts and no candidate/session mapping",
+            $elapsed
+        ));
+        $this->log("    This is the expected response when every row already exists."
+            . " If these rows are NEW, verify in ARCHIMEDES: check the visit label,"
+            . " site, project and cohort values against those configured on the"
+            . " platform, and that the instrument is in this project's test battery.");
+
+        $this->stats['data_skipped']++;
+
+        return [
+            'status'  => 'skipped',
+            'reason'  => 'ingestion not confirmed (rows may already exist)',
+            'elapsed' => $elapsed,
+        ];
+    }
+
+    /**
+     * Validate the enriched file BEFORE anything is sent to LORIS.
+     *
+     * Runs after candidate_defaults stamping, sex mapping and date
+     * normalisation, so it sees the values LORIS would actually receive -
+     * not what the user wrote. Anything still wrong at this point is
+     * something the pipeline could not fix, and LORIS will reject it.
+     *
+     * Reporting it here instead of after upload matters for three
+     * reasons: the operator gets the row number and the offending value
+     * rather than a per-row rejection with no context; nothing is written
+     * to ARCHIMEDES from a file with known-bad rows; and a large file
+     * fails in milliseconds rather than after minutes of server work.
+     *
+     * Checks only what the pipeline cannot repair. A M/D/YYYY date or an
+     * "F" for sex is not reported, because both are corrected upstream.
+     *
+     * @return array<string> Human-readable problems, empty when clean.
+     */
+    private function preflightRows(string $path, string $format, array $project): array
+    {
+        $delimiter = $this->delimiterForFormat($format);
+
+        $fh = @fopen($path, 'r');
+        if ($fh === false) {
+            return ["file could not be opened for validation: {$path}"];
+        }
+        $headers = fgetcsv($fh, 0, $delimiter);
+        if (!is_array($headers)) {
+            fclose($fh);
+            return ['file has no header row'];
+        }
+
+        $idx = [];
+        foreach ($headers as $i => $h) {
+            $idx[strtolower(trim((string)$h))] = $i;
+        }
+
+        $dobIdx  = $idx['dob'] ?? $idx['date_of_birth'] ?? $idx['birth_date'] ?? null;
+        $sexIdx  = null;
+        foreach (self::SEX_COLUMN_NAMES as $c) {
+            if (isset($idx[$c])) { $sexIdx = $idx[$c]; break; }
+        }
+
+        // Structural columns LORIS needs to place the candidate. Absent
+        // entirely is a different failure (caught by validateColumns);
+        // here we look for cells that are still blank after stamping.
+        $structural = [];
+        foreach (['project', 'site', 'cohort'] as $c) {
+            if (isset($idx[$c])) {
+                $structural[$c] = $idx[$c];
+            }
+        }
+
+        $badDob = $badSex = [];
+        $blank  = [];
+        $line   = 1;
+
+        while (($row = fgetcsv($fh, 0, $delimiter)) !== false) {
+            $line++;
+            if ($row === [null] || $row === []) {
+                continue;
+            }
+
+            if ($dobIdx !== null) {
+                $v = trim((string)($row[$dobIdx] ?? ''));
+                // Blank is allowed here - LORIS decides whether DoB is
+                // mandatory. Only a populated value in the wrong shape is
+                // reported, because that one is certain to be rejected.
+                if ($v !== '' && !preg_match('/^\d{4}-\d{2}-\d{2}$/', $v)) {
+                    $badDob[] = "line {$line}: '{$v}'";
+                }
+            }
+
+            if ($sexIdx !== null) {
+                $v = trim((string)($row[$sexIdx] ?? ''));
+                if ($v !== '' && !in_array($v, ['Male', 'Female', 'Other'], true)) {
+                    $badSex[] = "line {$line}: '{$v}'";
+                }
+            }
+
+            foreach ($structural as $name => $i) {
+                if (trim((string)($row[$i] ?? '')) === '') {
+                    $blank[$name][] = "line {$line}";
+                }
+            }
+        }
+        fclose($fh);
+
+        $problems = [];
+
+        if ($badDob !== []) {
+            $problems[] = sprintf(
+                "%d row(s) have a date of birth the pipeline could not convert to "
+                . "YYYY-MM-01: %s%s. Accepted at source: YYYY-MM-DD, YYYY-MM, YYYY, "
+                . "M/D/YYYY, D/M/YYYY. Correct these at source, or set "
+                . "date_input_format in project.json if the day/month order is "
+                . "being read the wrong way round.",
+                count($badDob),
+                implode(', ', array_slice($badDob, 0, 10)),
+                count($badDob) > 10 ? ' ... and ' . (count($badDob) - 10) . ' more' : ''
+            );
+        }
+
+        if ($badSex !== []) {
+            $problems[] = sprintf(
+                "%d row(s) have a sex value the pipeline could not map to "
+                . "Male/Female/Other: %s%s. Add the encoding to sex_mappings in "
+                . "project.json, or correct it at source.",
+                count($badSex),
+                implode(', ', array_slice($badSex, 0, 10)),
+                count($badSex) > 10 ? ' ... and ' . (count($badSex) - 10) . ' more' : ''
+            );
+        }
+
+        foreach ($blank as $name => $lines) {
+            $problems[] = sprintf(
+                "%d row(s) have an empty '%s' after candidate_defaults were "
+                . "applied: %s%s. Set candidate_defaults.%s in project.json, or "
+                . "populate the column at source.",
+                count($lines), $name,
+                implode(', ', array_slice($lines, 0, 10)),
+                count($lines) > 10 ? ' ... and ' . (count($lines) - 10) . ' more' : '',
+                $name
+            );
+        }
+
+        return $problems;
     }
 
     private function logUploadSuccess(float $elapsed, array $ui, ?int $instCount = null): void
@@ -3015,13 +3870,24 @@ class ClinicalPipeline
         $this->saveTrackingFile();
     }
 
+    /**
+     * Keep a dated copy of the file that was just ingested.
+     *
+     * Called ONLY after a successful upload. A failure here does not
+     * fail the file — the data is already in ARCHIMEDES — but it is
+     * reported rather than swallowed: a missing dated directory with a
+     * successful tracking entry is otherwise impossible to explain
+     * after the fact.
+     */
     private function archiveSnapshot(array $project, string $src): void
     {
         $dest = rtrim($project['data_access']['mount_path'] ?? '', '/')
             . '/processed/clinical/' . date('Y-m-d');
 
-        if (!is_dir($dest)) {
-            mkdir($dest, 0755, true);
+        if (!is_dir($dest) && !@mkdir($dest, 0755, true) && !is_dir($dest)) {
+            $this->log("    WARNING: snapshot directory could not be created: {$dest}"
+                . " - the ingested file was NOT archived");
+            return;
         }
 
         $target = "{$dest}/" . basename($src);
@@ -3029,10 +3895,15 @@ class ClinicalPipeline
             $target = "{$dest}/" . time() . '_' . basename($src);
         }
 
-        if (copy($src, $target)) {
+        if (@copy($src, $target)) {
             $this->log("    Snapshot archived -> processed/clinical/"
                 . date('Y-m-d') . "/" . basename($target));
+            return;
         }
+
+        $this->log("    WARNING: snapshot copy failed: {$src} -> {$target}"
+            . " - the ingested file was NOT archived (check permissions"
+            . " and free space on the mount)");
     }
 
     // ══════════════════════════════════════════════════════════════════
@@ -3216,21 +4087,7 @@ class ClinicalPipeline
         if (empty($this->dataResults)) {
             $this->log("    (no data files)");
         } else {
-            $firstUpload = $reingested = $failed = $skipped = [];
-
-            foreach ($this->dataResults as $file => $r) {
-                switch ($r['status']) {
-                    case 'success':
-                        if (($r['change_status'] ?? '') === 'reingestion') {
-                            $reingested[] = $file;
-                        } else {
-                            $firstUpload[] = $file;
-                        }
-                        break;
-                    case 'failed':  $failed[]  = $file; break;
-                    case 'skipped': $skipped[] = $file; break;
-                }
-            }
+            [$firstUpload, $reingested, $failed, $skipped] = $this->partitionDataResults();
 
             if (!empty($firstUpload)) {
                 $this->log("    First upload (" . count($firstUpload) . "):");
@@ -3383,33 +4240,18 @@ class ClinicalPipeline
     //  Clinical-channel email notification
     // ══════════════════════════════════════════════════════════════════
 
+    /**
+     * Send the clinical-channel outcome email.
+     *
+     * Orchestration only: status, recipients, dispatch. The body is
+     * assembled by buildClinicalNotificationBody() and its section
+     * helpers, so this method stays readable and each section can be
+     * changed without scrolling through the others.
+     */
     private function sendNotification(array $project): void
     {
-        $name = $project['project_common_name'] ?? 'Unknown';
-        $s    = $this->stats;
-
-        // Heading rule (SUCCESS / SUMMARY / FAILURE) is based on the
-        // OVERALL outcome of the run, counting any of:
-        //   - EviData skips (file did not pass the privacy check)
-        //   - install/ingest errors (DD or data upload failure)
-        // as "errors". Hash-unchanged skips and config-excluded files
-        // are NOT errors (steady-state runs stay SUCCESS).
-        $eviPassed   = $s['evidata_files_passed']  ?? 0;
-        $eviFailed   = $s['evidata_files_failed']  ?? 0;
-        $ingestOk    = $s['data_uploaded']         ?? 0;
-        $ingestFail  = $s['data_failed']           ?? 0;
-        $ddFail      = $s['dd_failed']             ?? 0;
-
-        $successCount = $eviPassed + $ingestOk;   // anything that went right
-        $errorCount   = $eviFailed + $ingestFail + $ddFail;
-
-        if ($errorCount === 0) {
-            $status = 'SUCCESS';
-        } elseif ($successCount === 0) {
-            $status = 'FAILURE';
-        } else {
-            $status = 'SUMMARY';
-        }
+        $name   = $project['project_common_name'] ?? 'Unknown';
+        $status = $this->notificationStatus();
 
         // Anything other than a clean SUCCESS goes to the error list.
         $successEmails = $project['notification_emails']['clinical']['on_success'] ?? [];
@@ -3424,187 +4266,7 @@ class ClinicalPipeline
         }
 
         $subject = "{$status}: {$name} Clinical Ingestion";
-
-        $body  = "Project: {$name}\n";
-        $body .= "Modality: clinical\n";
-        $body .= "Timestamp: " . date('Y-m-d H:i:s') . "\n";
-        $body .= "Run: {$this->runTimestamp}\n";
-        if ($this->force) {
-            $body .= "Mode: FORCE (hash check bypassed)\n";
-        }
-        $body .= "\n";
-
-        if (($s['evidata_files_checked'] ?? 0) > 0) {
-            $body .= "EviData Pre-flight:\n";
-            $body .= "  Files checked: {$s['evidata_files_checked']}, "
-                . "passed: {$s['evidata_files_passed']}, "
-                . "failed: {$s['evidata_files_failed']}\n";
-            if (!empty($this->evidataFailedFiles)) {
-                $body .= "  Skipped (did not pass EviData, not ingested): "
-                    . implode(', ', $this->evidataFailedFiles) . "\n";
-            }
-            if ($this->evidataLogDir !== null) {
-                $body .= "  Artifacts: {$this->evidataLogDir}\n";
-            }
-            $body .= "\n";
-        }
-
-        $body .= "Instrument Installation:\n";
-
-        $installByStatus = ['installed' => [], 'exists' => [], 'failed' => [], 'dry_run' => []];
-        foreach ($this->installResults as $file => $r) {
-            $installByStatus[$r['status']][] = $file;
-        }
-
-        if (count($this->installResults) === 0) {
-            $body .= "  (no DD files found)\n";
-        } else {
-            if (!empty($installByStatus['installed'])) {
-                $count = count($installByStatus['installed']);
-                $body .= "  ✔ Installed: {$count} (" . implode(', ', $installByStatus['installed']) . ")\n";
-            }
-            if (!empty($installByStatus['exists'])) {
-                $count = count($installByStatus['exists']);
-                $body .= "  ● Already existed: {$count} (" . implode(', ', $installByStatus['exists']) . ")\n";
-            }
-            if (!empty($installByStatus['failed'])) {
-                $failedByReason = [];
-                foreach ($installByStatus['failed'] as $file) {
-                    $reason = $this->installResults[$file]['error'] ?? 'unknown';
-                    $failedByReason[$reason][] = $file;
-                }
-                $count = count($installByStatus['failed']);
-                $failedParts = [];
-                foreach ($failedByReason as $reason => $files) {
-                    $failedParts[] = implode(', ', $files) . " [{$reason}]";
-                }
-                $body .= "  ✗ Failed: {$count} (" . implode('; ', $failedParts) . ")\n";
-            }
-        }
-
-        $body .= "\n";
-
-        $body .= "Data Ingestion:\n";
-
-        $firstUpload = $reingested = $failed = $skipped = [];
-        foreach ($this->dataResults as $file => $r) {
-            switch ($r['status']) {
-                case 'success':
-                    if (($r['change_status'] ?? '') === 'reingestion') {
-                        $reingested[] = $file;
-                    } else {
-                        $firstUpload[] = $file;
-                    }
-                    break;
-                case 'failed':  $failed[]  = $file; break;
-                case 'skipped': $skipped[] = $file; break;
-            }
-        }
-
-        if (count($this->dataResults) === 0) {
-            $body .= "  (no data files found)\n";
-        } else {
-            if (!empty($firstUpload)) {
-                $body .= "  ✔ First upload (" . count($firstUpload) . "):\n";
-                foreach ($firstUpload as $file) {
-                    $body .= "     " . $this->formatDataResultLine($file) . "\n";
-                }
-            }
-            if (!empty($reingested)) {
-                $body .= "  ↺ Re-ingested - file changed, new rows only (" . count($reingested) . "):\n";
-                foreach ($reingested as $file) {
-                    $body .= "     " . $this->formatDataResultLine($file) . "\n";
-                }
-            }
-            if (!empty($failed)) {
-                $failedByReason = [];
-                foreach ($failed as $file) {
-                    $reason = $this->dataResults[$file]['reason'] ?? 'error';
-                    $failedByReason[$reason][] = $file;
-                }
-                $count = count($failed);
-                $failedParts = [];
-                foreach ($failedByReason as $reason => $files) {
-                    $failedParts[] = implode(', ', $files) . " [{$reason}]";
-                }
-                $body .= "  ✗ Failed: {$count} (" . implode('; ', $failedParts) . ")\n";
-            }
-            if (!empty($skipped)) {
-                $skippedByReason = [];
-                foreach ($skipped as $file) {
-                    $reason = $this->dataResults[$file]['reason'] ?? 'unknown';
-                    $skippedByReason[$reason][] = $file;
-                }
-                $count = count($skipped);
-                $skippedParts = [];
-                foreach ($skippedByReason as $reason => $files) {
-                    $skippedParts[] = implode(', ', $files) . " [{$reason}]";
-                }
-                $body .= "  ⚠ Skipped: {$count} (" . implode('; ', $skippedParts) . ")\n";
-            }
-        }
-
-        $body .= "\n";
-
-        $body .= str_repeat('-', 50) . "\n";
-        $body .= "Totals:\n";
-        $body .= "  DD files: {$s['dd_files_found']} found, {$s['dd_installed']} installed, "
-            . "{$s['dd_already_existed']} existed, {$s['dd_failed']} failed\n";
-        $body .= "  Data files: {$s['data_files_found']} found, {$s['data_uploaded']} processed, "
-            . "{$s['data_failed']} failed, {$s['data_skipped']} skipped\n";
-
-        if ($s['rows_existed'] > 0) {
-            $body .= "  Rows existed (skipped ARCHIMEDES): {$s['rows_existed']}\n";
-        }
-        if ($s['pairs_processed'] > 0) {
-            $body .= "  Candidate-session pairs touched: {$s['pairs_processed']}\n";
-        }
-
-        $body .= "\n";
-
-        $nc = $this->computeNewCandidates();
-        if (!empty($nc['total_candids'])) {
-            $body .= "Candidates:\n";
-            if ($nc['available']) {
-                $body .= "  New candidates created:        {$nc['new_count']}\n";
-                if ($nc['existing_count'] > 0) {
-                    $body .= "  Existing candidates refreshed: {$nc['existing_count']}\n";
-                }
-            } else {
-                $body .= "  Total candidates touched: " . count($nc['total_candids'])
-                    . " (new/existing split unavailable)\n";
-            }
-            $body .= "\n";
-        }
-
-        if ($status === 'SUMMARY') {
-            $body .= "⚠ Partial ingestion. Files that passed EviData were ingested; "
-                . "files that failed or errored were skipped (not ingested) and "
-                . "will be retried next run.\n";
-            $body .= "See the EviData section above for the skipped files, and the "
-                . "attached/linked report(s) for why they failed.\n";
-        } elseif ($status === 'FAILURE' && ($s['evidata_files_checked'] ?? 0) > 0
-            && ($s['evidata_files_passed'] ?? 0) === 0) {
-            $body .= "✗ No files passed the EviData privacy check — nothing was ingested.\n";
-            $body .= "See the attached/linked report(s) for details.\n";
-        } elseif ($status === 'FAILURE') {
-            $body .= "⚠ Some instruments failed to install or ingest.\n";
-            $body .= "Check logs for details.\n";
-        } elseif ($s['data_uploaded'] > 0) {
-            $body .= "✔ Ingestion completed successfully.\n";
-        } elseif ($s['data_skipped'] > 0 && $s['data_uploaded'] === 0) {
-            $body .= "✔ Ingestion completed. All files skipped - no content changes detected (hash match).\n";
-        } else {
-            $body .= "✔ Ingestion completed. No data files to process.\n";
-        }
-
-        $body .= "\n";
-        if ($this->runLogPath) {
-            $body .= "Run log: {$this->runLogPath}\n";
-        }
-        if ($this->errorLogPath) {
-            $body .= "Error log: {$this->errorLogPath}\n";
-        }
+        $body    = $this->buildClinicalNotificationBody($name, $status);
 
         $this->log("  Sending notification to: " . implode(', ', $emailsToSend));
 
@@ -3621,6 +4283,253 @@ class ClinicalPipeline
                 $this->writeError('notification', "Failed to send to {$to}: " . $e->getMessage());
             }
         }
+    }
+
+    /**
+     * SUCCESS / SUMMARY / FAILURE for the run as a whole.
+     *
+     * Counts EviData skips (file did not pass the privacy check) and
+     * install/ingest errors as errors. Hash-unchanged skips and
+     * config-excluded files are NOT errors, so steady-state runs stay
+     * SUCCESS.
+     */
+    private function notificationStatus(): string
+    {
+        $s = $this->stats;
+
+        $successCount = ($s['evidata_files_passed'] ?? 0) + ($s['data_uploaded'] ?? 0);
+        $errorCount   = ($s['evidata_files_failed'] ?? 0)
+            + ($s['data_failed'] ?? 0)
+            + ($s['dd_failed'] ?? 0);
+
+        if ($errorCount === 0) {
+            return 'SUCCESS';
+        }
+        if ($successCount === 0) {
+            return 'FAILURE';
+        }
+        return 'SUMMARY';
+    }
+
+    /** Assemble the notification body from its sections. */
+    private function buildClinicalNotificationBody(string $name, string $status): string
+    {
+        $body  = "Project: {$name}\n";
+        $body .= "Modality: clinical\n";
+        $body .= "Timestamp: " . date('Y-m-d H:i:s') . "\n";
+        $body .= "Run: {$this->runTimestamp}\n";
+        if ($this->force) {
+            $body .= "Mode: FORCE (hash check bypassed)\n";
+        }
+        $body .= "\n";
+
+        $body .= $this->notificationEvidataSection();
+        $body .= $this->notificationInstallSection();
+        $body .= $this->notificationDataSection();
+        $body .= $this->notificationTotalsSection();
+        $body .= $this->notificationCandidateSection();
+        $body .= $this->notificationOutcomeLine($status);
+
+        $body .= "\n";
+        if ($this->runLogPath) {
+            $body .= "Run log: {$this->runLogPath}\n";
+        }
+        if ($this->errorLogPath) {
+            $body .= "Error log: {$this->errorLogPath}\n";
+        }
+
+        return $body;
+    }
+
+    private function notificationEvidataSection(): string
+    {
+        $s = $this->stats;
+        if (($s['evidata_files_checked'] ?? 0) === 0) {
+            return '';
+        }
+
+        $body  = "EviData Pre-flight:\n";
+        $body .= "  Files checked: {$s['evidata_files_checked']}, "
+            . "passed: {$s['evidata_files_passed']}, "
+            . "failed: {$s['evidata_files_failed']}\n";
+        if (!empty($this->evidataFailedFiles)) {
+            $body .= "  Skipped (did not pass EviData, not ingested): "
+                . implode(', ', $this->evidataFailedFiles) . "\n";
+        }
+        if ($this->evidataLogDir !== null) {
+            $body .= "  Artifacts: {$this->evidataLogDir}\n";
+        }
+        return $body . "\n";
+    }
+
+    private function notificationInstallSection(): string
+    {
+        $body = "Instrument Installation:\n";
+
+        $byStatus = ['installed' => [], 'exists' => [], 'failed' => [], 'dry_run' => []];
+        foreach ($this->installResults as $file => $r) {
+            $byStatus[$r['status']][] = $file;
+        }
+
+        if (count($this->installResults) === 0) {
+            return $body . "  (no DD files found)\n\n";
+        }
+
+        if (!empty($byStatus['installed'])) {
+            $count = count($byStatus['installed']);
+            $body .= "  ✔ Installed: {$count} (" . implode(', ', $byStatus['installed']) . ")\n";
+        }
+        if (!empty($byStatus['exists'])) {
+            $count = count($byStatus['exists']);
+            $body .= "  ● Already existed: {$count} (" . implode(', ', $byStatus['exists']) . ")\n";
+        }
+        if (!empty($byStatus['failed'])) {
+            $count = count($byStatus['failed']);
+            $body .= "  ✗ Failed: {$count} ("
+                . $this->groupByReason(
+                    $byStatus['failed'], $this->installResults, 'error', 'unknown'
+                ) . ")\n";
+        }
+
+        return $body . "\n";
+    }
+
+    private function notificationDataSection(): string
+    {
+        $body = "Data Ingestion:\n";
+
+        [$firstUpload, $reingested, $failed, $skipped] = $this->partitionDataResults();
+
+        if (count($this->dataResults) === 0) {
+            return $body . "  (no data files found)\n\n";
+        }
+
+        if (!empty($firstUpload)) {
+            $body .= "  ✔ First upload (" . count($firstUpload) . "):\n";
+            foreach ($firstUpload as $file) {
+                $body .= "     " . $this->formatDataResultLine($file) . "\n";
+            }
+        }
+        if (!empty($reingested)) {
+            $body .= "  ↺ Re-ingested - file changed, new rows only (" . count($reingested) . "):\n";
+            foreach ($reingested as $file) {
+                $body .= "     " . $this->formatDataResultLine($file) . "\n";
+            }
+        }
+        if (!empty($failed)) {
+            $count = count($failed);
+            $body .= "  ✗ Failed: {$count} ("
+                . $this->groupByReason($failed, $this->dataResults, 'reason', 'error')
+                . ")\n";
+        }
+        if (!empty($skipped)) {
+            $count = count($skipped);
+            $body .= "  ⚠ Skipped: {$count} ("
+                . $this->groupByReason($skipped, $this->dataResults, 'reason', 'unknown')
+                . ")\n";
+        }
+
+        return $body . "\n";
+    }
+
+    private function notificationTotalsSection(): string
+    {
+        $s = $this->stats;
+
+        $body  = str_repeat('-', 50) . "\n";
+        $body .= "Totals:\n";
+        $body .= "  DD files: {$s['dd_files_found']} found, {$s['dd_installed']} installed, "
+            . "{$s['dd_already_existed']} existed, {$s['dd_failed']} failed\n";
+        $body .= "  Data files: {$s['data_files_found']} found, {$s['data_uploaded']} processed, "
+            . "{$s['data_failed']} failed, {$s['data_skipped']} skipped\n";
+
+        if ($s['rows_existed'] > 0) {
+            $body .= "  Rows existed (skipped ARCHIMEDES): {$s['rows_existed']}\n";
+        }
+        if ($s['pairs_processed'] > 0) {
+            $body .= "  Candidate-session pairs touched: {$s['pairs_processed']}\n";
+        }
+
+        return $body . "\n";
+    }
+
+    private function notificationCandidateSection(): string
+    {
+        $nc = $this->computeNewCandidates();
+        if (empty($nc['total_candids'])) {
+            return '';
+        }
+
+        $body = "Candidates:\n";
+        if ($nc['available']) {
+            $body .= "  New candidates created:        {$nc['new_count']}\n";
+            if ($nc['existing_count'] > 0) {
+                $body .= "  Existing candidates refreshed: {$nc['existing_count']}\n";
+            }
+        } else {
+            $body .= "  Total candidates touched: " . count($nc['total_candids'])
+                . " (new/existing split unavailable)\n";
+        }
+        return $body . "\n";
+    }
+
+    private function notificationOutcomeLine(string $status): string
+    {
+        $s = $this->stats;
+
+        if ($status === 'SUMMARY') {
+            return "⚠ Partial ingestion. Files that passed EviData were ingested; "
+                . "files that failed or errored were skipped (not ingested) and "
+                . "will be retried next run.\n"
+                . "See the EviData section above for the skipped files, and the "
+                . "attached/linked report(s) for why they failed.\n";
+        }
+        if ($status === 'FAILURE'
+            && ($s['evidata_files_checked'] ?? 0) > 0
+            && ($s['evidata_files_passed'] ?? 0) === 0
+        ) {
+            return "✗ No files passed the EviData privacy check — nothing was ingested.\n"
+                . "See the attached/linked report(s) for details.\n";
+        }
+        if ($status === 'FAILURE') {
+            return "⚠ Some instruments failed to install or ingest.\n"
+                . "Check logs for details.\n";
+        }
+        if ($s['data_uploaded'] > 0) {
+            return "✔ Ingestion completed successfully.\n";
+        }
+        if ($s['data_skipped'] > 0 && $s['data_uploaded'] === 0) {
+            return "✔ Ingestion completed. All files skipped - no content changes detected (hash match).\n";
+        }
+        return "✔ Ingestion completed. No data files to process.\n";
+    }
+
+    /**
+     * Split dataResults into the four buckets both the run summary and
+     * the notification email report on, so the two can never disagree
+     * about which file went where.
+     *
+     * @return array{0:array<string>,1:array<string>,2:array<string>,3:array<string>}
+     */
+    private function partitionDataResults(): array
+    {
+        $firstUpload = $reingested = $failed = $skipped = [];
+
+        foreach ($this->dataResults as $file => $r) {
+            switch ($r['status']) {
+                case 'success':
+                    if (($r['change_status'] ?? '') === 'reingestion') {
+                        $reingested[] = $file;
+                    } else {
+                        $firstUpload[] = $file;
+                    }
+                    break;
+                case 'failed':  $failed[]  = $file; break;
+                case 'skipped': $skipped[] = $file; break;
+            }
+        }
+
+        return [$firstUpload, $reingested, $failed, $skipped];
     }
 
     // ══════════════════════════════════════════════════════════════════
@@ -3656,9 +4565,22 @@ class ClinicalPipeline
     //  Date normalization (DoB and DoD)
     // ══════════════════════════════════════════════════════════════════
 
-    private function normalizeDatesInFile(string $srcPath, string $format): string
-    {
-        $delimiter = ($format === 'BIDS_TSV') ? "\t" : ',';
+    /**
+     * @param string $outPath Where the normalised copy is written. Pass
+     *        the processed/clinical/ path so that what LORIS receives is
+     *        the file an operator can open and inspect, rather than a
+     *        temp file deleted before anyone can look at it. Dates are
+     *        the field most often wrong at source, so the processed copy
+     *        showing the corrected value is what makes a rejection
+     *        traceable afterwards.
+     */
+    private function normalizeDatesInFile(
+        string $srcPath,
+        string $format,
+        string $dateOrder = 'mdy',
+        ?string $outPath = null
+    ): string {
+        $delimiter = $this->delimiterForFormat($format);
 
         $in = fopen($srcPath, 'r');
         if ($in === false) {
@@ -3684,8 +4606,27 @@ class ClinicalPipeline
             return $srcPath;
         }
 
-        $tmpPath = tempnam(sys_get_temp_dir(), 'clinical_dates_') . '_' . basename($srcPath);
-        $out     = fopen($tmpPath, 'w');
+        // Write beside the enriched copy when a destination is given, so
+        // processed/clinical/ holds exactly what was uploaded. Fall back
+        // to a temp file only when no destination is available.
+        //
+        // CRITICAL: never open $srcPath for writing. applyCandidateDefaults()
+        // usually returns the processed copy, which is the very path passed
+        // in as $outPath - opening it with 'w' would truncate the file this
+        // loop is still reading. Write to a sibling and rename over the
+        // destination once the handle is closed. The rename is atomic on the
+        // same filesystem, so a reader never sees a half-written file.
+        $finalPath = $outPath;
+        $writePath = ($outPath === null)
+            ? tempnam(sys_get_temp_dir(), 'clinical_dates_') . '_' . basename($srcPath)
+            : $outPath . '.writing';
+
+        $out = @fopen($writePath, 'w');
+        if ($out === false) {
+            fclose($in);
+            $this->log("    WARNING: cannot write {$writePath} - dates left unnormalised");
+            return $srcPath;
+        }
         fputcsv($out, $headers, $delimiter);
 
         $changedPerCol = array_fill_keys(array_keys($dateCols), 0);
@@ -3696,7 +4637,7 @@ class ClinicalPipeline
             foreach ($dateCols as $idx => $_label) {
                 if (array_key_exists($idx, $row)) {
                     $orig = (string)$row[$idx];
-                    $norm = $this->normalizeDateValue($orig);
+                    $norm = $this->normalizeDateValue($orig, $dateOrder);
                     if ($norm !== $orig) {
                         $changedPerCol[$idx]++;
                     }
@@ -3709,6 +4650,18 @@ class ClinicalPipeline
         fclose($in);
         fclose($out);
 
+        // Both handles are closed - now it is safe to replace the source.
+        $resultPath = $writePath;
+        if ($finalPath !== null) {
+            if (!@rename($writePath, $finalPath)) {
+                @unlink($writePath);
+                $this->log("    WARNING: cannot replace {$finalPath}"
+                    . " - dates left unnormalised");
+                return $srcPath;
+            }
+            $resultPath = $finalPath;
+        }
+
         $parts = [];
         foreach ($dateCols as $idx => $label) {
             $parts[] = "{$label} {$changedPerCol[$idx]}/{$total}";
@@ -3716,10 +4669,40 @@ class ClinicalPipeline
         $this->log("    Date columns normalized: " . implode(', ', $parts)
             . " row(s) rewritten to YYYY-MM-01");
 
-        return $tmpPath;
+        return $resultPath;
     }
 
-    private function normalizeDateValue(string $value): string
+    /**
+     * Normalise one date cell to YYYY-MM-01.
+     *
+     * The day is deliberately discarded (privacy: DoB is stored to
+     * month precision) — so only the YEAR and MONTH have to be
+     * recovered correctly from whatever the source supplied.
+     *
+     * Accepted inputs:
+     *   YYYY-MM-DD / YYYY-MM / YYYY        unambiguous, taken as-is
+     *   YYYY/MM/DD                         leading 4-digit year
+     *   M/D/YYYY or D/M/YYYY               resolved as described below
+     *   separators - / .                   all treated alike
+     *
+     * Resolving the two-number forms:
+     *   - one part > 12  -> that part MUST be the day, the other the
+     *                       month. Order is determined by the data, not
+     *                       by configuration.
+     *   - both parts <=12 -> genuinely ambiguous (5/6/2024 is May 6th or
+     *                       June 5th). $order decides: 'mdy' (default,
+     *                       matching REDCap's date_mdy) or 'dmy', set
+     *                       per project via project.json ->
+     *                       date_input_format.
+     *
+     * Anything unrecognised is returned UNCHANGED, so a malformed value
+     * reaches LORIS and is rejected there rather than being silently
+     * turned into a plausible-looking wrong date.
+     *
+     * @param string $order 'mdy' or 'dmy' — used only for the ambiguous
+     *                      case.
+     */
+    private function normalizeDateValue(string $value, string $order = 'mdy'): string
     {
         $value = trim($value);
         if ($value === '') {
@@ -3734,6 +4717,34 @@ class ClinicalPipeline
         }
         if (preg_match('/^(\d{4})$/', $value, $m)) {
             return "{$m[1]}-01-01";
+        }
+
+        // Year-first with / or . separators: YYYY/M/D, YYYY.MM.DD
+        if (preg_match('/^(\d{4})[\/.](\d{1,2})(?:[\/.](\d{1,2}))?$/', $value, $m)) {
+            $month = (int)$m[2];
+            return ($month >= 1 && $month <= 12)
+                ? sprintf('%s-%02d-01', $m[1], $month)
+                : $value;
+        }
+
+        // Two numbers then a 4-digit year: M/D/YYYY or D/M/YYYY,
+        // separated by / - or .
+        if (preg_match('/^(\d{1,2})[\/\-.](\d{1,2})[\/\-.](\d{4})$/', $value, $m)) {
+            $a    = (int)$m[1];
+            $b    = (int)$m[2];
+            $year = $m[3];
+
+            if ($a > 12 && $b >= 1 && $b <= 12) {
+                $month = $b;              // first part must be the day
+            } elseif ($b > 12 && $a >= 1 && $a <= 12) {
+                $month = $a;              // second part must be the day
+            } elseif ($a >= 1 && $a <= 12 && $b >= 1 && $b <= 12) {
+                $month = ($order === 'dmy') ? $b : $a;   // ambiguous
+            } else {
+                return $value;            // neither part is a valid month
+            }
+
+            return sprintf('%s-%02d-01', $year, $month);
         }
 
         return $value;

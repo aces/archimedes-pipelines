@@ -100,6 +100,13 @@ $evidataEnvFile = (function (string $configPath): string {
 // 'scope' key in evidata_config.json.
 $defaultScope = 'openid profile email';
 
+// Sent on every request. PHP cURL omits User-Agent by default, and the
+// reverse proxy fronting EviData rejects UA-less requests (405 on POST,
+// 403 on GET) before they reach the application — which surfaces as an
+// nginx HTML error page rather than a Keycloak/EviData JSON response.
+// Must match EviDataClient::USER_AGENT.
+$userAgent = 'archimedes-pipelines/1.0';
+
 echo "── EviData connection test ──\n";
 echo "Time         : " . date('Y-m-d H:i:s T') . "\n";
 echo "Host         : " . gethostname() . "\n";
@@ -250,6 +257,7 @@ $healthUrl = "{$apiBase}/health";
 $ch = curl_init($healthUrl);
 curl_setopt_array($ch, [
     CURLOPT_RETURNTRANSFER => true,
+    CURLOPT_USERAGENT      => $userAgent,
     CURLOPT_TIMEOUT        => 15,
     CURLOPT_CONNECTTIMEOUT => 5,
 ]);
@@ -292,6 +300,7 @@ curl_setopt_array($ch, [
         'scope'         => $scope,
     ]),
     CURLOPT_HTTPHEADER     => ['Content-Type: application/x-www-form-urlencoded'],
+    CURLOPT_USERAGENT      => $userAgent,
     CURLOPT_TIMEOUT        => 30,
 ]);
 $tokBody = curl_exec($ch);
@@ -378,6 +387,7 @@ $ch = curl_init("{$apiBase}/datasets");
 curl_setopt_array($ch, [
     CURLOPT_RETURNTRANSFER => true,
     CURLOPT_HTTPHEADER     => ["Authorization: Bearer {$token}"],
+    CURLOPT_USERAGENT      => $userAgent,
     CURLOPT_TIMEOUT        => 15,
 ]);
 $dsBody = curl_exec($ch);
@@ -414,6 +424,7 @@ curl_setopt_array($ch, [
     CURLOPT_POST           => true,
     CURLOPT_POSTFIELDS     => json_encode(['username' => $user, 'password' => $pass]),
     CURLOPT_HTTPHEADER     => ['Content-Type: application/json'],
+    CURLOPT_USERAGENT      => $userAgent,
     CURLOPT_COOKIEFILE     => '',   // enable in-memory cookie engine
     CURLOPT_TIMEOUT        => 15,
 ]);

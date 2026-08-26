@@ -68,6 +68,17 @@ class EviDataClient
     private const HTTP_TIMEOUT = 120;
 
     /**
+     * Sent on every request. PHP cURL omits User-Agent by default, and
+     * the reverse proxy fronting EviData rejects UA-less requests
+     * before they reach the application — HTTP 405 on POST and 403 on
+     * GET, returned as an nginx HTML error page rather than a Keycloak
+     * or EviData JSON response. Not config-driven: this identifies the
+     * client software, not the deployment, so it is the same value on
+     * every host. Kept in sync with scripts/test_evidata_connection.php.
+     */
+    private const USER_AGENT = 'archimedes-pipelines/1.0';
+
+    /**
      * OAuth2 scope requested in the token grant. The EviData API
      * requires the 'openid' scope on the bearer token; a token issued
      * without it is rejected with HTTP 401 "Failed to authenticate
@@ -444,7 +455,9 @@ class EviDataClient
      *
      * Uses the low-level cURL path directly because the response is
      * binary, not JSON — the standard http()/raw() decode path doesn't
-     * apply.
+     * apply. USER_AGENT is set here too: this handle bypasses raw(),
+     * so it would otherwise go out UA-less and be rejected by the
+     * proxy.
      */
     private function downloadReportZip(string $reportId): string
     {
@@ -456,6 +469,7 @@ class EviDataClient
             CURLOPT_CUSTOMREQUEST  => 'GET',
             CURLOPT_RETURNTRANSFER => true,
             CURLOPT_HTTPHEADER     => ["Authorization: Bearer {$this->token}"],
+            CURLOPT_USERAGENT      => self::USER_AGENT,
             CURLOPT_TIMEOUT        => self::HTTP_TIMEOUT,
             CURLOPT_FOLLOWLOCATION => true,   // matches `-L` in the cURL examples
         ]);
@@ -524,6 +538,7 @@ class EviDataClient
             CURLOPT_CUSTOMREQUEST  => $method,
             CURLOPT_RETURNTRANSFER => true,
             CURLOPT_HTTPHEADER     => $headers,
+            CURLOPT_USERAGENT      => self::USER_AGENT,
             CURLOPT_TIMEOUT        => self::HTTP_TIMEOUT,
             CURLOPT_CONNECTTIMEOUT => 10,
         ]);
