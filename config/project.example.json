@@ -125,10 +125,24 @@
   "_comment_evidata": "EviData QI policy for THIS project (per-project override of the global evidata_config.json -> qis). Resolution: if 'qis' here is non-empty -> used as-is; if empty/absent -> falls back to global; if global also empty -> ALL-HEADERS mode (every CSV column becomes a QI, minus exclude_qis, minus unique-per-row identifier columns).",
   "_comment_evidata_qis_shapes": "Two shapes are accepted: (a) flat array applied to every clinical CSV in the project (e.g. ['Candidate_Age','Sex']), or (b) map with '_default' + per-filename overrides (e.g. {'_default':['Sex'], 'redcap_data.csv':['dob','sex']}). EviData's server-side QI validation is CASE-SENSITIVE — spell every QI exactly as it appears in that file's CSV header. Set qis to [] (or omit) to deliberately use the all-headers default for this project.",
   "_comment_evidata_exclude_qis": "Optional. Column names to DROP in all-headers mode (ignored when an explicit qis list is in effect). CASE-INSENSITIVE matching. Use it to remove known non-identifying columns or identifier columns (study IDs, visit labels, comment fields) from the all-headers set, on top of the automatic unique-per-row removal.",
+  "_comment_imaging": "REQUIRED to run the DICOM check. Each modality is enabled separately - there is no inheritance from evidata.enabled above, so turning EviData on for clinical never starts dumping DICOM headers. Absent or false means off. scan_mode: 'full' dumps every DICOM file (default, and what you want when the CSV goes to EviData for assessment); 'sample' dumps one per leaf directory for a quick look.",
+  "_comment_clinical": "REQUIRED to run the clinical check, on the same terms. Absent or false means off.",
   "evidata": {
-    "qis":         [],
-    "exclude_qis": ["<ColumnName1>", "<ColumnName2>", "<ColumnName3>"]
-  },
+    "enabled": true,
+    "imaging": {
+      "enabled": true,
+      "scan_mode": "full"
+    },
+    "clinical": {
+      "enabled": true
+    },
+  "qis": [],
+  "exclude_qis": [
+    "<ColumnName1>",
+    "<ColumnName2>",
+    "<ColumnName3>"
+  ]
+},
 
   "_comment_logging": "Per-project logging. log_path defaults to <mount_path>/logs when omitted; level is one of DEBUG / INFO / WARNING / ERROR.",
   "logging": {
