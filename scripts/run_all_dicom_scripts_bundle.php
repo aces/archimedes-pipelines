@@ -144,6 +144,13 @@ function resolveTargets(array $config, array $options): array
         usage();
     }
 
+    // Collection and project names are identifiers, not data, so match them
+    // case-insensitively. --collection=ARCHIMEDES finding nothing because the
+    // config says "archimedes" is a frustrating way to spend ten minutes.
+    $matches = static function (?string $wanted, string $actual): bool {
+        return $wanted === null || strcasecmp($wanted, $actual) === 0;
+    };
+
     foreach ($config['collections'] ?? [] as $collection) {
         $collectionName = $collection['name'] ?? null;
 
@@ -151,11 +158,13 @@ function resolveTargets(array $config, array $options): array
             continue;
         }
 
-        if (empty($collection['enabled']) && $wantCollection !== $collectionName) {
+        $collectionWanted = $matches($wantCollection, $collectionName);
+
+        if (empty($collection['enabled']) && !$collectionWanted) {
             continue;
         }
 
-        if (!$wantAll && $wantCollection !== null && $wantCollection !== $collectionName) {
+        if (!$wantAll && $wantCollection !== null && !$collectionWanted) {
             continue;
         }
 
@@ -168,11 +177,13 @@ function resolveTargets(array $config, array $options): array
                 continue;
             }
 
-            if ($wantProject !== null && $wantProject !== $projectName) {
+            $projectWanted = $matches($wantProject, $projectName);
+
+            if ($wantProject !== null && !$projectWanted) {
                 continue;
             }
 
-            if (empty($project['enabled']) && $wantProject !== $projectName) {
+            if (empty($project['enabled']) && !$projectWanted) {
                 continue;
             }
 
@@ -263,7 +274,23 @@ function runStep(string $script, array $args, ?string $logPath = null): int
     stream_set_blocking($pipes[1], false);
     stream_set_blocking($pipes[2], false);
 
-    $buffers = [1 => '', 2 => ''];
+    $buffers  = [1 => '', 2 => ''];
+
+    // Some steps abort before doing any work - unresolvable host, failed
+    // auth, unreachable mount - and still exit 0, because their failure
+    // counters only cover studies they actually examined. Watching the output
+    // for those signatures means the chain stops instead of reporting a
+    // success-shaped run that ingested nothing.
+    $abortSignals = [
+        'Could not resolve host'    => 'the LORIS host name does not resolve',
+        'Connection refused'        => 'the LORIS host refused the connection',
+        'Connection timed out'      => 'the LORIS host did not respond',
+        'SSL certificate problem'   => 'the LORIS TLS certificate was rejected',
+        'Authentication failed'     => 'LORIS authentication failed',
+        'aborting'                  => 'the step aborted',
+    ];
+
+    $abortReason = null;
 
     while (!feof($pipes[1]) || !feof($pipes[2])) {
         $read   = [$pipes[1], $pipes[2]];
@@ -291,6 +318,15 @@ function runStep(string $script, array $args, ?string $logPath = null): int
 
                 fwrite(STDERR, $line . "\n");
                 masterLog($logPath, '  ' . $line);
+
+                if ($abortReason === null) {
+                    foreach ($abortSignals as $needle => $meaning) {
+                        if (stripos($line, $needle) !== false) {
+                            $abortReason = $meaning;
+                            break;
+                        }
+                    }
+                }
             }
         }
     }
@@ -308,6 +344,23 @@ function runStep(string $script, array $args, ?string $logPath = null): int
     $exitCode = proc_close($process);
 
     masterLog($logPath, "=== END {$script} (exit {$exitCode})");
+
+    // A step that reported an abort but exited 0 is worse than one that
+    // failed loudly: the chain continues and the run summary claims success.
+    // Treat the message as authoritative over the exit code.
+    if ($exitCode === EXIT_OK && $abortReason !== null) {
+        fwrite(STDERR, sprintf(
+            "\n  %s reported an abort (%s) but exited 0 - treating as failed.\n",
+            $script,
+            $abortReason
+        ));
+        masterLog(
+            $logPath,
+            "OVERRIDE {$script} exited 0 but aborted: {$abortReason}"
+        );
+
+        return EXIT_FAILURE;
+    }
 
     return $exitCode;
 }
@@ -389,11 +442,11 @@ function confirmCommand(array $argv): string
     return 'php ' . $argv[0] . ' ' . implode(' ', array_map(
         // Quote anything outside the plain set, so a path with a space in it
         // still produces a line that can be pasted and run.
-        static fn (string $a): string => preg_match('~^[A-Za-z0-9=_./-]+$~', $a) === 1
-            ? $a
-            : escapeshellarg($a),
-        $args
-    ));
+            static fn (string $a): string => preg_match('~^[A-Za-z0-9=_./-]+$~', $a) === 1
+                ? $a
+                : escapeshellarg($a),
+            $args
+        ));
 }
 
 // -----------------------------------------------------------------------------
@@ -518,8 +571,74 @@ try {
 $targets = resolveTargets($config, $options);
 
 if (empty($targets)) {
-    fwrite(STDERR, "No enabled projects matched the selection.\n");
+    fwrite(STDERR, "No enabled projects matched the selection.\n\n");
+
+    // Say what IS available. A bare "no match" with no hint is the most
+    // common way to lose time to a typo or a disabled flag.
+    $available = [];
+
+    foreach ($config['collections'] ?? [] as $collection) {
+        $name     = $collection['name'] ?? '?';
+        $enabled  = !empty($collection['enabled']) ? '' : '  [collection disabled]';
+        $projects = [];
+
+        foreach ($collection['projects'] ?? [] as $project) {
+            $projects[] = ($project['name'] ?? '?')
+                . (!empty($project['enabled']) ? '' : ' [disabled]');
+        }
+
+        $available[] = sprintf(
+            "  --collection=%s%s\n      projects: %s",
+            $name,
+            $enabled,
+            empty($projects) ? '(none)' : implode(', ', $projects)
+        );
+    }
+
+    if (empty($available)) {
+        fwrite(STDERR, "No collections are defined in {$configPath}.\n");
+    } else {
+        fwrite(STDERR, "Available:\n" . implode("\n", $available) . "\n\n");
+        fwrite(STDERR, "Names are matched case-insensitively.\n");
+    }
+
     exit(EXIT_USAGE);
+}
+
+// --- Reachability preflight ------------------------------------------------
+// Every step that talks to LORIS will fail the same way if the host is wrong,
+// each after its own DNS or connect timeout. Checking once here turns a
+// multi-minute run that ends in a confusing "0 studies found" into a two
+// second failure that names the problem.
+$lorisUrl = $config['loris']['base_url'] ?? $config['api']['base_url'] ?? null;
+
+if ($lorisUrl !== null && $lorisUrl !== '') {
+    $host = parse_url($lorisUrl, PHP_URL_HOST);
+
+    if ($host === null || $host === false) {
+        fwrite(STDERR, "ERROR loris.base_url is not a valid URL: {$lorisUrl}\n");
+        exit(EXIT_USAGE);
+    }
+
+    // A literal IP needs no resolution; gethostbyname returns the input
+    // unchanged when it cannot resolve, which is how a failure is detected.
+    if (filter_var($host, FILTER_VALIDATE_IP) === false
+        && gethostbyname($host) === $host
+    ) {
+        fwrite(STDERR, "ERROR Cannot resolve the LORIS host '{$host}'.\n\n");
+        fwrite(STDERR, "  loris.base_url is {$lorisUrl}\n");
+        fwrite(STDERR, "  Nothing that talks to LORIS can work until this "
+            . "resolves:\n");
+        fwrite(STDERR, "  candidate lookup, candidate creation, session "
+            . "creation and the import.\n\n");
+        fwrite(STDERR, "  Check:\n");
+        fwrite(STDERR, "    hostname -f\n");
+        fwrite(STDERR, "    getent hosts {$host}\n");
+        fwrite(STDERR, "    grep -n base_url " . $configPath . "\n\n");
+        fwrite(STDERR, "  If LORIS is on this machine, https://localhost is "
+            . "usually right.\n");
+        exit(EXIT_USAGE);
+    }
 }
 
 if (!$confirm) {
@@ -642,7 +761,7 @@ foreach ($targets as $target) {
 
         if ($code !== EXIT_OK) {
             fwrite(STDERR, "\n  STOP participant sync failed - skipping {$label}\n");
-        masterLog($masterLogPath, "STOP participant sync failed");
+            masterLog($masterLogPath, "STOP participant sync failed");
             $exitCode = EXIT_FAILURE;
             continue;
         }
@@ -662,7 +781,7 @@ foreach ($targets as $target) {
 
         if ($code !== EXIT_OK) {
             fwrite(STDERR, "\n  STOP reidentifier failed - skipping {$label}\n");
-        masterLog($masterLogPath, "STOP reidentifier failed");
+            masterLog($masterLogPath, "STOP reidentifier failed");
             $exitCode = EXIT_FAILURE;
             continue;
         }
@@ -674,7 +793,7 @@ foreach ($targets as $target) {
         $why = $counts['total'] === $counts['phantom']
             ? 'all studies are phantoms'
             : 'no linked studies (no participants.tsv, unorganised delivery, '
-                . 'or no matching rows)';
+            . 'or no matching rows)';
 
         foreach (['participant sync', 'reidentifier'] as $step) {
             fwrite(STDERR, "  SKIP {$step} - {$why}\n");
@@ -746,7 +865,12 @@ foreach ($targets as $target) {
         }
     }
 
-    // --- Step 4: the actual ingestion --------------------------------------------
+    // --- Step 4: the actual ingestion ----------------------------------------
+    // Relabelled studies live in deidentified-lorisid/, unlinked ones stay in
+    // processed/. Importing from the raw delivery would archive the original
+    // files with the site identifier still in PatientName, silently discarding
+    // the relabelling - so the source is chosen per group, and the importer is
+    // invoked once for each that has studies.
     if (!$stepEnabled('import')) {
         fwrite(STDERR, "  SKIP import (disabled) - nothing ingested\n");
         masterLog($masterLogPath, 'SKIP import (disabled) - nothing ingested');
@@ -755,12 +879,57 @@ foreach ($targets as $target) {
         continue;
     }
 
-    $code = runStep('run_dicom_import.php', $withForce, $masterLogPath);
+    $sources = [];
 
-    if ($code !== EXIT_OK) {
-        fwrite(STDERR, "\n  STOP import failed for {$label}\n");
-        masterLog($masterLogPath, "STOP import failed");
-        $exitCode = EXIT_FAILURE;
+    if ($counts['linked'] > 0 && $stepEnabled('reidentify')) {
+        $sources['deidentified-lorisid/imaging/dicoms'] = sprintf(
+            '%d relabelled',
+            $counts['linked']
+        );
+    } elseif ($counts['linked'] > 0) {
+        // Relabelling was skipped, so linked studies were never copied to
+        // deidentified-lorisid/ - they are still in processed/.
+        $sources['processed/imaging/dicoms'] = sprintf(
+            '%d linked (relabel skipped)',
+            $counts['linked']
+        );
+    }
+
+    if ($unlinkedTotal > 0) {
+        $key = 'processed/imaging/dicoms';
+        $sources[$key] = isset($sources[$key])
+            ? $sources[$key] . sprintf(' + %d unlinked/phantom', $unlinkedTotal)
+            : sprintf('%d unlinked/phantom', $unlinkedTotal);
+    }
+
+    if (empty($sources)) {
+        fwrite(STDERR, "\n  nothing to import\n");
+        masterLog($masterLogPath, 'nothing to import');
+        continue;
+    }
+
+    $importFailed = false;
+
+    foreach ($sources as $subdir => $what) {
+        fwrite(STDERR, "\n  importing {$what} from {$subdir}\n");
+        masterLog($masterLogPath, "import source {$subdir} ({$what})");
+
+        $code = runStep(
+            'run_dicom_import.php',
+            array_merge($withForce, ['--source-subdir=' . $subdir]),
+            $masterLogPath
+        );
+
+        if ($code !== EXIT_OK) {
+            fwrite(STDERR, "\n  STOP import failed for {$label} ({$subdir})\n");
+            masterLog($masterLogPath, "STOP import failed: {$subdir}");
+            $exitCode     = EXIT_FAILURE;
+            $importFailed = true;
+            break;
+        }
+    }
+
+    if ($importFailed) {
         continue;
     }
 
