@@ -86,6 +86,12 @@ class BidsImportPipeline
     /** Tracking file name — stored in {projectPath}/processed/bids/ */
     private const TRACK_FILE = '.bids_import_processed.json';
 
+    /** Shared tracking-file handler, built on first use. */
+    private ?FingerprintTracker $fingerprintTracker = null;
+
+    /** Path the cached tracker was built for. */
+    private ?string $fingerprintTrackerPath = null;
+
     /**
      * Persisted copy of the enriched participants.tsv handed to bidsimport,
      * stored in {projectPath}/processed/bids/. Kept for audit so an operator
@@ -451,7 +457,8 @@ class BidsImportPipeline
         string $projectPath,
         array &$tracking,
         string $status,
-        string $detail = ''
+        string $detail = '',
+        string $bidsPath = ''
     ): void {
         $tracking['last_run'] = [
             'status'     => $status,
@@ -460,6 +467,21 @@ class BidsImportPipeline
             'scans_found' => $this->stats['scans_found'],
         ];
         $this->_saveTracking($projectPath, $tracking);
+
+        // The fingerprint is stored ONLY on success, so a stored hash always
+        // means "this dataset was imported" and never "we looked at it". A
+        // failed run leaves the previous hashes alone and is retried in full.
+        if ($status === 'success' && $bidsPath !== '' && is_dir($bidsPath)) {
+            $this->_tracker($projectPath)->succeeded(
+                'last_run',
+                $bidsPath,
+                [
+                    'status'      => $status,
+                    'detail'      => $detail,
+                    'scans_found' => $this->stats['scans_found'],
+                ]
+            );
+        }
     }
 
     private function _countNewScans(string $bidsPath, array $tracking): int
@@ -469,6 +491,58 @@ class BidsImportPipeline
         $currentCount = count(glob("{$bidsPath}/sub-*", GLOB_ONLYDIR) ?: []);
         $trackedCount = (int) ($tracking['last_run']['scans_found'] ?? 0);
         return max(0, $currentCount - $trackedCount);
+    }
+
+    /**
+     * Has the dataset changed since the last successful import?
+     *
+     * Replaces the sub-* count as the decision, which only ever noticed
+     * subjects being *added*. A new session under an existing subject, a
+     * corrected NIfTI, an edited participants.tsv, or one subject swapped for
+     * another all leave the count unchanged, and the dataset was skipped.
+     *
+     * Same two-tier scheme the DICOM pipelines use, via the shared
+     * StudyFingerprint: the manifest tier is stat-only and runs every time; the
+     * bytes are read only when the manifest already differs.
+     *
+     * The unit is the whole dataset, not a subject, because bidsimport runs on
+     * the whole directory — there is nothing finer to act on.
+     *
+     * @param string $bidsPath Dataset root.
+     *
+     * @return array StudyFingerprint::compare() result.
+     */
+    private function _datasetComparison(
+        string $projectPath,
+        string $bidsPath
+    ): array {
+        return $this->_tracker($projectPath)->check('last_run', $bidsPath);
+    }
+
+    /**
+     * Shared tracking-file handler.
+     *
+     * FingerprintTracker owns reading and writing the tracking JSON, refreshing
+     * hashes on a skip, and the rule that a fingerprint is stored only after a
+     * success — the same rules the DICOM pipelines follow, stated once.
+     *
+     * @param string $projectPath Project root.
+     *
+     * @return FingerprintTracker
+     */
+    private function _tracker(string $projectPath): FingerprintTracker
+    {
+        $path = rtrim($projectPath, '/') . '/processed/bids/' . self::TRACK_FILE;
+
+        // Cached per path so a run does not re-read the file for each call.
+        if ($this->fingerprintTracker === null
+            || $this->fingerprintTrackerPath !== $path
+        ) {
+            $this->fingerprintTracker     = new FingerprintTracker($path, $this->logger);
+            $this->fingerprintTrackerPath = $path;
+        }
+
+        return $this->fingerprintTracker;
     }
 
     // =========================================================================
@@ -840,10 +914,23 @@ class BidsImportPipeline
             . ($lastRun ? "last run {$lastTs} — {$lastStatus}" : "no previous run"));
 
         if ($lastStatus === 'success') {
-            $newScans = $this->_countNewScans($bidsPath, $tracking);
-            if ($newScans === 0) {
+            // Fingerprint, not the sub-* count. The count only ever noticed
+            // subjects being added; a new session, a corrected NIfTI or an
+            // edited participants.tsv all left it unchanged and the dataset was
+            // skipped. Kept alongside for the log line, which reads better as
+            // "N new subject(s)" than as a hash state.
+            $comparison = $this->_datasetComparison($projectPath, $bidsPath);
+            $newScans   = $this->_countNewScans($bidsPath, $tracking);
+
+            if (!$comparison['reprocess']) {
                 $this->_log("  ✓ Already imported successfully (last run: {$lastTs})"
-                    . " — no new scans found. Skipping.");
+                    . " — dataset unchanged ({$comparison['reason']}). Skipping.");
+
+                // Refresh the stored hashes even when skipping, so a dataset
+                // that was re-copied does not force a full byte read every run.
+                $this->_tracker($projectPath)->skipped(
+                    'last_run', $bidsPath, $comparison
+                );
                 $this->_log("  To reimport, delete:"
                     . " {$projectPath}/processed/bids/.bids_import_processed.json");
                 $this->stats['scans_skipped']    = $this->stats['scans_found'];
@@ -854,7 +941,9 @@ class BidsImportPipeline
                 $this->_closeAllLogs();
                 return $this->stats;
             }
-            $this->_log("  {$newScans} new scan(s) found since last run — importing");
+            $this->_log("  Dataset changed since last run ({$comparison['reason']})"
+                . ($newScans > 0 ? ", {$newScans} new subject(s)" : "")
+                . " — importing");
         }
 
         if ($options['dry_run'] ?? false) {
@@ -986,7 +1075,7 @@ class BidsImportPipeline
                     $this->_log(
                         "  ✓ SUCCESS (exit code file cleaned up after successful run) ({$elapsed}s)"
                     );
-                    $this->_markTracked($projectPath, $tracking, 'success');
+                    $this->_markTracked($projectPath, $tracking, 'success', '', $bidsPath);
                     $this->stats['scans_processed'] = $this->stats['scans_found'];
                     $this->_logInventoryDetails();
                     $this->_closeAllLogs();
@@ -1067,7 +1156,7 @@ class BidsImportPipeline
 
                     $this->_markTracked($projectPath, $tracking, 'success',
                         "summary: {$imported} imported, {$errored} file issue(s) "
-                        . "job_id={$jobId}");
+                        . "job_id={$jobId}", $bidsPath);
 
                     $this->stats['scans_processed']  = $this->stats['scans_found'];
                     $this->stats['summary_status']   = true;
@@ -1084,7 +1173,7 @@ class BidsImportPipeline
                     . ($imported > 0
                         ? " — {$imported} file(s) imported"
                         : " — all files already registered (no-op)"));
-                $this->_markTracked($projectPath, $tracking, 'success');
+                $this->_markTracked($projectPath, $tracking, 'success', '', $bidsPath);
                 $this->stats['scans_processed'] = $this->stats['scans_found'];
                 $this->_logInventoryDetails();
                 $this->_closeAllLogs();

@@ -43,6 +43,14 @@ class DicomImportPipeline
     private bool $verbose;
     private string $token = '';
 
+    /**
+     * Set when the run aborts before examining any study — failed auth, fatal
+     * exception. Distinct from studies_failed, which counts only studies the
+     * run actually reached: an abort leaves that at 0, so without this a run
+     * that never started reports SUCCESS.
+     */
+    private ?string $abortReason = null;
+
     private string $runTimestamp;
 
     /** @var resource|null */
@@ -56,6 +64,12 @@ class DicomImportPipeline
     private ?string $logDir = null;
 
     private const TRACK_FILE   = '.dicom_import_processed.json';
+
+    /** Shared tracking-file handler, built on first use. */
+    private ?FingerprintTracker $fingerprintTracker = null;
+
+    /** Path the cached tracker was built for. */
+    private ?string $fingerprintTrackerPath = null;
     private const TRACK_SUBDIR = 'processed/imaging';
 
     /** Seconds between SPM job status poll requests */
@@ -128,9 +142,11 @@ class DicomImportPipeline
         bool   $retryFailed  = true,
         array  $flags        = ['insert', 'verbose'],
         string $profile      = 'database_config.py',
-        array  $forceStudies = []
+        array  $forceStudies = [],
+        string $sourceSubdir = 'deidentified-raw/imaging/dicoms'
     ): array {
         $this->importResults = [];
+        $this->abortReason   = null;
         $this->stats = [
             'studies_found'         => 0,
             'studies_processed'     => 0,
@@ -169,29 +185,47 @@ class DicomImportPipeline
         try {
             if (!$this->dryRun) {
                 if (!$this->authenticate()) {
+                    $this->abortReason = 'Authentication failed';
                     $this->writeError("AUTH", "Authentication failed — aborting.");
                     $this->sendNotification($projectDir);
                     $this->closeAllLogs();
-                    return $this->stats;
+                    return $this->_finalStats();
                 }
             }
 
             $this->processProject(
-                $projectDir, $force, $retryFailed, $flags, $profile, $forceStudies
+                $projectDir, $force, $retryFailed, $flags, $profile,
+                $forceStudies, $sourceSubdir
             );
             $this->writeProjectSummary(basename($projectDir));
             $this->sendNotification($projectDir);
             $this->closeAllLogs();
 
-            return $this->stats;
+            return $this->_finalStats();
 
         } catch (\Exception $e) {
+            $this->abortReason = 'Fatal: ' . $e->getMessage();
             $this->writeError("FATAL", $e->getMessage());
             $this->logger->debug($e->getTraceAsString());
             $this->sendNotification($projectDir);
             $this->closeAllLogs();
-            return $this->stats;
+            return $this->_finalStats();
         }
+    }
+
+    /**
+     * Stats plus the abort flag, for the caller's exit code.
+     *
+     * @return array
+     */
+    private function _finalStats(): array
+    {
+        $stats = $this->stats;
+
+        $stats['aborted']      = $this->abortReason !== null;
+        $stats['abort_reason'] = $this->abortReason;
+
+        return $stats;
     }
 
     // ──────────────────────────────────────────────────────────────────
@@ -204,12 +238,13 @@ class DicomImportPipeline
         bool   $retryFailed,
         array  $flags,
         string $profile,
-        array  $forceStudies
+        array  $forceStudies,
+        string $sourceSubdir = 'deidentified-raw/imaging/dicoms'
     ): void {
         $this->log("");
         $this->log("──── STEP 1: SCAN DICOM DIRECTORIES ────");
 
-        $studies = $this->findStudyDirectories($projectDir);
+        $studies = $this->findStudyDirectories($projectDir, $sourceSubdir);
         $this->stats['studies_found'] = count($studies);
 
         if (empty($studies)) {
@@ -230,7 +265,12 @@ class DicomImportPipeline
             $name       = basename($studyPath);
             $isForced   = in_array($name, $forceStudies, true);
             $prev       = $processed[$name] ?? null;
-            $prevStatus = $prev['status'] ?? null;
+            $prevStatus     = $prev['status'] ?? null;
+            $contentChanged = false;
+
+            // Set by the skip block when it ran; reused at the success exits so
+            // a changed study is never walked or hashed twice.
+            $comparison = null;
 
             // ── Skip / retry logic ─────────────────────────────────────────────
             if (!$force && !$isForced && $prev !== null) {
@@ -240,24 +280,51 @@ class DicomImportPipeline
                         . $this->_truncateForLog($prev['detail'] ?? 'unknown'));
                     // fall through to import
                 } else {
-                    $this->log("  [{$name}] SKIPPED — {$prevStatus} ({$prev['timestamp']})");
-                    $this->importResults[$name] = [
-                        'status' => 'skipped',
-                        'reason' => "already {$prevStatus}",
-                    ];
-                    if ($prevStatus === 'already_exists') {
-                        $this->stats['studies_already_exist']++;
+                    // Name-based tracking alone answers only "has this name
+                    // succeeded before", so a study re-delivered with a new
+                    // series or corrected files was skipped forever. The
+                    // manifest hash is stat-only and runs every time; the bytes
+                    // are read only when it differs, which in steady state is
+                    // never.
+                    $comparison = $this->_tracker($projectDir)->check($name, $studyPath);
+
+                    if ($comparison['reprocess']) {
+                        $contentChanged = true;
+                        $this->log("  [{$name}] CHANGED — {$comparison['reason']}"
+                            . " — re-importing with --update --overwrite");
+                        // fall through to import
                     } else {
-                        $this->stats['studies_skipped']++;
+                        $this->log("  [{$name}] SKIPPED — {$prevStatus}"
+                            . " ({$prev['timestamp']}), {$comparison['reason']}");
+
+                        // Refresh the stored hashes even when skipping, so a
+                        // study that was renamed or re-copied does not force a
+                        // full byte read on every future run.
+                        $this->_tracker($projectDir)->skipped(
+                            $name, $studyPath, $comparison
+                        );
+                        $processed = $this->_tracker($projectDir)->all();
+
+                        $this->importResults[$name] = [
+                            'status' => 'skipped',
+                            'reason' => "already {$prevStatus}",
+                        ];
+                        if ($prevStatus === 'already_exists') {
+                            $this->stats['studies_already_exist']++;
+                        } else {
+                            $this->stats['studies_skipped']++;
+                        }
+                        continue;
                     }
-                    continue;
                 }
             }
 
             $this->log("  [{$name}]");
 
             if ($this->dryRun) {
-                $effectiveFlags = $this->_resolveFlags($flags, $force, $isForced, $prevStatus);
+                $effectiveFlags = $this->_resolveFlags(
+                    $flags, $force, $isForced, $prevStatus, $contentChanged
+                );
                 $this->log("    DRY RUN — would POST importdicomstudy (async via SPM)");
                 $this->log("    source={$studyPath}");
                 $this->log("    flags: " . implode(', ', $effectiveFlags));
@@ -272,10 +339,15 @@ class DicomImportPipeline
             // to safely overwrite without creating a duplicate tarchive row.
             // Normal first-run studies use --insert; if the script replies "already
             // inserted", _importOneStudy() automatically retries with --update --overwrite.
-            $effectiveFlags = $this->_resolveFlags($flags, $force, $isForced, $prevStatus);
+            $effectiveFlags = $this->_resolveFlags(
+                $flags, $force, $isForced, $prevStatus, $contentChanged
+            );
 
+            // The file list and comparison are handed down when the skip block
+            // already built them, so a changed study is not walked twice.
             $this->importOneStudy(
-                $name, $studyPath, $projectDir, $processed, $effectiveFlags, $profile
+                $name, $studyPath, $projectDir, $processed, $effectiveFlags,
+                $profile, false, $comparison
             );
         }
     }
@@ -306,9 +378,17 @@ class DicomImportPipeline
         array   $baseFlags,
         bool    $force,
         bool    $isForced,
-        ?string $prevStatus
+        ?string $prevStatus,
+        bool    $contentChanged = false
     ): array {
-        $useOverwrite = $force || ($isForced && $prevStatus !== null);
+        // A study whose bytes changed is already in the DB, exactly like a
+        // forced one. Without this it would go out with --insert, fail with
+        // "already inserted", and take the auto-retry — which works, but costs
+        // a wasted round trip per study and writes a misleading error into the
+        // log and the notification email.
+        $useOverwrite = $force
+            || ($isForced && $prevStatus !== null)
+            || $contentChanged;
 
         if ($useOverwrite) {
             // Strip insert, ensure update + overwrite
@@ -356,8 +436,14 @@ class DicomImportPipeline
         array  &$processed,
         array   $flags,
         string  $profile,
-        bool    $isRetry = false  // true when auto-retrying after ALREADY_EXISTS
+        bool    $isRetry = false, // true when auto-retrying after ALREADY_EXISTS
+        ?array  $comparison = null
     ): void {
+        // Fingerprint computed once per study and reused at every success-shaped
+        // exit. Deferred until here so a launch failure costs nothing, and the
+        // file list is reused from the skip block when it already walked.
+        $fingerprint = null;
+
         try {
             $t0     = microtime(true);
             $launch = $this->_launchAsync($studyPath, $flags, $profile);
@@ -460,7 +546,12 @@ class DicomImportPipeline
                     if ($wasRunning) {
                         $this->log("    SUCCESS (exit code file cleaned up after successful run)"
                             . " ({$elapsed}s)");
-                        $this->markProcessed($projectDir, $processed, $name, 'success');
+                        $fingerprint ??= $this->_fingerprintFor(
+                            $projectDir, $studyPath, $comparison
+                        );
+                        $this->markProcessed(
+                            $projectDir, $processed, $name, 'success', '', $fingerprint
+                        );
                         $this->importResults[$name] = [
                             'status'  => 'success',
                             'elapsed' => $elapsed,
@@ -490,7 +581,12 @@ class DicomImportPipeline
 
                 if ($state === 'SUCCESS') {
                     $this->log("    SUCCESS ({$elapsed}s)");
-                    $this->markProcessed($projectDir, $processed, $name, 'success');
+                    $fingerprint ??= $this->_fingerprintFor(
+                        $projectDir, $studyPath, $comparison
+                    );
+                    $this->markProcessed(
+                        $projectDir, $processed, $name, 'success', '', $fingerprint
+                    );
                     $this->importResults[$name] = [
                         'status'  => 'success',
                         'elapsed' => $elapsed,
@@ -510,7 +606,8 @@ class DicomImportPipeline
                     $this->log("    Already inserted — retrying with --update --overwrite ({$elapsed}s)");
                     $retryFlags = $this->_buildRetryFlags($flags);
                     $this->importOneStudy(
-                        $name, $studyPath, $projectDir, $processed, $retryFlags, $profile, true
+                        $name, $studyPath, $projectDir, $processed, $retryFlags,
+                        $profile, true, $comparison
                     );
                     return;
                 }
@@ -518,7 +615,12 @@ class DicomImportPipeline
                 // On retry ALREADY_EXISTS means a genuine conflict — mark as already_exists
                 if ($isRetry && preg_match(self::ALREADY_INSERTED_PATTERN, $errorDetail)) {
                     $this->log("    Already inserted (confirmed) — marking done ({$elapsed}s)");
-                    $this->markProcessed($projectDir, $processed, $name, 'already_exists');
+                    $fingerprint ??= $this->_fingerprintFor(
+                        $projectDir, $studyPath, $comparison
+                    );
+                    $this->markProcessed(
+                        $projectDir, $processed, $name, 'already_exists', '', $fingerprint
+                    );
                     $this->importResults[$name] = [
                         'status'  => 'already_exists',
                         'elapsed' => $elapsed,
@@ -553,6 +655,58 @@ class DicomImportPipeline
             $this->importResults[$name] = ['status' => 'failed', 'reason' => $e->getMessage()];
             $this->stats['studies_failed']++;
         }
+    }
+
+    /**
+     * Shared tracking-file handler.
+     *
+     * FingerprintTracker owns the tracking JSON and the rules around it -
+     * refresh on skip, store only after success, walk each directory once.
+     * The same instance serves BidsImportPipeline; only the key differs.
+     *
+     * @param string $projectDir Project root.
+     *
+     * @return FingerprintTracker
+     */
+    private function _tracker(string $projectDir): FingerprintTracker
+    {
+        $path = $this->_trackingFilePath($projectDir);
+
+        if ($this->fingerprintTracker === null
+            || $this->fingerprintTrackerPath !== $path
+        ) {
+            $this->fingerprintTracker     = new FingerprintTracker($path, $this->logger);
+            $this->fingerprintTrackerPath = $path;
+        }
+
+        return $this->fingerprintTracker;
+    }
+
+    /**
+     * Fingerprint to store for a study that reached LORIS.
+     *
+     * Computed at most once per study. The file list comes from the tracker's
+     * cache, so the directory is walked once per run however many times this is
+     * called, and a comparison from the skip block is reused rather than the
+     * bytes being read a second time.
+     *
+     * @param string     $projectDir Project root, to reach the tracker.
+     * @param string     $studyPath  Study directory.
+     * @param array|null $comparison compare() result, if already computed.
+     *
+     * @return array manifest_hash, content_hash, hashed_at.
+     */
+    private function _fingerprintFor(
+        string $projectDir,
+        string $studyPath,
+        ?array $comparison = null
+    ): array {
+        $tracker = $this->_tracker($projectDir);
+        $files   = $tracker->filesIn($studyPath);
+
+        $comparison ??= StudyFingerprint::compare(null, $files, $studyPath);
+
+        return StudyFingerprint::toTracking($comparison, $files, $studyPath);
     }
 
     // ──────────────────────────────────────────────────────────────────
@@ -726,13 +880,21 @@ class DicomImportPipeline
         array  &$processed,
         string  $studyName,
         string  $status,
-        string  $detail = ''
+        string  $detail = '',
+        array   $extra  = []
     ): void {
-        $processed[$studyName] = [
-            'status'    => $status,
-            'detail'    => $detail,
-            'timestamp' => date('c'),
-        ];
+        // $extra carries the fingerprint, and is passed only at success-shaped
+        // exits. A stored fingerprint must always mean "this reached LORIS",
+        // never "we looked at it" — so failure paths deliberately omit it and
+        // the study is retried in full next run.
+        $processed[$studyName] = array_merge(
+            [
+                'status'    => $status,
+                'detail'    => $detail,
+                'timestamp' => date('c'),
+            ],
+            $extra
+        );
         $this->saveProcessed($projectDir, $processed);
     }
 
@@ -740,9 +902,16 @@ class DicomImportPipeline
     // Find study dirs
     // ──────────────────────────────────────────────────────────────────
 
-    private function findStudyDirectories(string $projectDir): array
-    {
-        $dicomRoot = rtrim($projectDir, '/') . '/deidentified-raw/imaging/dicoms';
+    private function findStudyDirectories(
+        string $projectDir,
+        string $sourceSubdir = 'deidentified-raw/imaging/dicoms'
+    ): array {
+        $dicomRoot = rtrim($projectDir, '/') . '/' . trim($sourceSubdir, '/');
+
+        // With three possible sources — the raw delivery, the organised output
+        // and the relabelled output — "no studies found" is ambiguous unless
+        // the directory actually scanned is in the log.
+        $this->log("  Source: {$dicomRoot}");
 
         if (!is_dir($dicomRoot)) {
             $this->log("  Directory not found: {$dicomRoot}");
@@ -956,7 +1125,13 @@ class DicomImportPipeline
         $this->log("  Failed:                 {$s['studies_failed']}");
         if ($this->runLogPath)   $this->log("  Run log:   {$this->runLogPath}");
         if ($this->errorLogPath) $this->log("  Error log: {$this->errorLogPath}");
-        $this->log("  Result: " . ($s['studies_failed'] > 0 ? 'COMPLETED WITH ERRORS' : 'COMPLETED SUCCESSFULLY'));
+        $this->log("  Result: " . (
+            $this->abortReason !== null
+                ? 'ABORTED — ' . $this->abortReason
+                : ($s['studies_failed'] > 0
+                    ? 'COMPLETED WITH ERRORS'
+                    : 'COMPLETED SUCCESSFULLY')
+        ));
         $this->log("========================================");
     }
 
@@ -974,6 +1149,11 @@ class DicomImportPipeline
         $projectName = basename($projectDir);
         $s           = $this->stats;
         $hasFailures = $s['studies_failed'] > 0;
+
+        // An abort happens before any study is examined, so studies_failed is 0
+        // and this would otherwise report SUCCESS to the on_success list. A run
+        // that could not start is a failure, not an empty delivery.
+        $hasFailures = $hasFailures || $this->abortReason !== null;
 
         $projectJson = rtrim($projectDir, '/') . '/project.json';
         $projectData = file_exists($projectJson)
@@ -1018,7 +1198,12 @@ class DicomImportPipeline
             $byStatus[$r['status']][] = $study;
         }
 
-        if (empty($this->importResults)) {
+        if ($this->abortReason !== null) {
+            $body .= "  RUN ABORTED: {$this->abortReason}\n";
+            $body .= "  No studies were examined. The counters below are zero\n";
+            $body .= "  because the run did not start, not because the delivery\n";
+            $body .= "  was empty.\n";
+        } elseif (empty($this->importResults)) {
             $body .= "  (no studies found)\n";
         } else {
             if (!empty($byStatus['success'])) {

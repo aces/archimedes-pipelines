@@ -53,6 +53,7 @@ $options = getopt('', [
     'project:',
     'config:',
     'profile:',
+    'source-subdir:',
     'confirm',
     'force',
     'update',
@@ -74,6 +75,8 @@ Scope:
 Options:
   --config=FILE     Config file (default: config/loris_client_config.json)
   --profile=NAME    Python config name (default: database_config.py)
+  --source-subdir=P Directory to scan, relative to the project root
+                    (default: deidentified-raw/imaging/dicoms)
   --confirm         Execute (default: dry run)
   --force           Reprocess already-done studies
   --update          --update flag (default: --insert)
@@ -93,6 +96,11 @@ $useUpdate    = isset($options['update']);
 $useSession   = isset($options['session']);
 $useOverwrite = isset($options['overwrite']);
 $profile      = $options['profile'] ?? 'database_config.py';
+
+// Where to look for study directories, relative to the project root. Defaults
+// to the raw delivery so existing callers are unaffected; the bundle passes
+// the organised or relabelled directory explicitly.
+$sourceSubdir = $options['source-subdir'] ?? 'deidentified-raw/imaging/dicoms';
 
 // ── Load config ────────────────────────────────────────────────────────
 
@@ -160,10 +168,11 @@ foreach ($projectDirs as $info) {
     $pipeline = new DicomImportPipeline($config, $dryRun, $verbose);
 
     $stats = $pipeline->run(
-        projectDir: $info['path'],
-        force:      $force,
-        flags:      $flags,
-        profile:    $profile
+        projectDir:   $info['path'],
+        force:        $force,
+        flags:        $flags,
+        profile:      $profile,
+        sourceSubdir: $sourceSubdir
     );
 
     foreach ($totalStats as $key => &$val) {
@@ -173,6 +182,14 @@ foreach ($projectDirs as $info) {
 
     if (($stats['studies_failed'] ?? 0) > 0) {
         $anyFailed = true;
+    }
+
+    // A run that aborted did not fail any study — it never reached one. Without
+    // this the exit code is 0 and cron reports success on a run that ingested
+    // nothing.
+    if (!empty($stats['aborted'])) {
+        $anyFailed = true;
+        fwrite(STDERR, "ABORTED: " . ($stats['abort_reason'] ?? 'unknown') . "\n");
     }
 }
 
