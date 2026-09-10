@@ -160,6 +160,102 @@ class BidsParticipantSync
         }
     }
 
+    /**
+     * Check that each sub-* directory contains only its own subject's files.
+     *
+     * Two failures are reported, both non-fatal - this is a report, not a gate,
+     * so an operator decides what to do rather than a partially-correct
+     * delivery being blocked:
+     *
+     *   1. a sub-* file whose subject prefix is not the directory it sits in
+     *   2. a sub-* directory nested inside another sub-* directory
+     *
+     * @param string        $bidsDir     BIDS root being validated.
+     * @param array<string> $subjectDirs sub-* directory names found in it.
+     */
+    private function _checkSubjectContainment(string $bidsDir, array $subjectDirs): void
+    {
+        $mismatched = 0;
+        $nested     = 0;
+
+        foreach ($subjectDirs as $subject) {
+            $root = rtrim($bidsDir, '/') . '/' . $subject;
+
+            if (!is_dir($root)) {
+                continue;
+            }
+
+            $iterator = new \RecursiveIteratorIterator(
+                new \RecursiveDirectoryIterator(
+                    $root,
+                    \FilesystemIterator::SKIP_DOTS
+                ),
+                \RecursiveIteratorIterator::SELF_FIRST
+            );
+
+            foreach ($iterator as $entry) {
+                /** @var \SplFileInfo $entry */
+                $name = $entry->getFilename();
+
+                if (!str_starts_with($name, 'sub-')) {
+                    continue;
+                }
+
+                if ($entry->isDir()) {
+                    $nested++;
+                    $this->_error('NESTED_SUBJECT_DIR', sprintf(
+                        '%s contains a nested subject directory: %s.'
+                        . ' A sub-* directory inside another sub-* directory is'
+                        . ' usually a copy that landed one level too deep.',
+                        $subject,
+                        $this->_relativeTo($root, $entry->getPathname())
+                    ));
+                    continue;
+                }
+
+                // Filenames are sub-<id>_<rest>; compare the prefix only.
+                $prefix = explode('_', $name)[0];
+
+                if ($prefix !== $subject) {
+                    $mismatched++;
+                    $this->_error('SUBJECT_MISMATCH', sprintf(
+                        "%s contains a file belonging to %s: %s."
+                        . ' Reidentification renames directories, not file'
+                        . ' contents, so this would import one subject\'s data'
+                        . ' against another candidate.',
+                        $subject,
+                        $prefix,
+                        $this->_relativeTo($root, $entry->getPathname())
+                    ));
+                }
+            }
+        }
+
+        if ($mismatched === 0 && $nested === 0) {
+            $this->_log('  ✓ All sub-* directories contain only their own files');
+            return;
+        }
+
+        $this->_log(sprintf(
+            '  !! %d mismatched file(s), %d nested subject directory/directories'
+            . ' — fix the source tree before reidentifying',
+            $mismatched,
+            $nested
+        ));
+    }
+
+    /**
+     * Path relative to a base directory, for readable log lines.
+     */
+    private function _relativeTo(string $base, string $path): string
+    {
+        $base = rtrim($base, '/') . '/';
+
+        return str_starts_with($path, $base)
+            ? substr($path, strlen($base))
+            : $path;
+    }
+
     private function _warn(string $context, string $msg): void
     {
         $this->logger->warning("[{$context}] {$msg}");
@@ -874,6 +970,14 @@ class BidsParticipantSync
         ) {
             $this->_log("  ✓ All sub-* directories match participants.tsv");
         }
+
+        // ── Subject containment ───────────────────────────────────────────────
+        // Cross-referencing above compares directory NAMES against the TSV. It
+        // says nothing about what is inside them, so a tree where one subject's
+        // files sit in another subject's directory passes it unchanged and is
+        // carried through reidentification and import into candidate records
+        // that attribute one participant's imaging to another.
+        $this->_checkSubjectContainment($bidsDir, $bidsSubjects);
 
         // ── Process participants ───────────────────────────────────────────────
         $this->_log("───────────────────────────────────────────────────────────");

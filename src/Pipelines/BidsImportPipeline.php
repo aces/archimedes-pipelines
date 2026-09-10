@@ -281,6 +281,115 @@ class BidsImportPipeline
         $this->logger->info($msg);
     }
 
+    /**
+     * Refuse an import that would put wrong data in the database.
+     *
+     * Reports every fault found rather than stopping at the first, so one run
+     * tells the operator everything to fix.
+     *
+     * @return bool true to proceed, false to refuse.
+     */
+    private function _preflight(string $bidsPath): bool
+    {
+        $faults = [];
+
+        // Nothing to import. bidsimport exits non-zero on an empty dataset
+        // after roughly a minute of polling; saying so now costs nothing.
+        if (($this->scanInventory['totals']['scans'] ?? 0) === 0) {
+            $faults[] = 'no scan files found in the BIDS directory';
+            $this->_writeError('PREFLIGHT',
+                "No scan files under {$bidsPath}. Nothing to import - check that"
+                . ' the reidentifier has run and wrote its output here.');
+        }
+
+        foreach ($this->_containmentFaults($bidsPath) as $fault) {
+            $faults[] = $fault['summary'];
+            $this->_writeError($fault['context'], $fault['message']);
+        }
+
+        if (empty($faults)) {
+            $this->_log('  ✓ Preflight: tree is internally consistent');
+            return true;
+        }
+
+        $this->_log('  !! Preflight FAILED — nothing was imported:');
+        foreach ($faults as $fault) {
+            $this->_log("       - {$fault}");
+        }
+        $this->_log('     Fix the source tree and re-run. Refusing here avoids'
+            . ' a manual database clean-up afterwards.');
+
+        return false;
+    }
+
+    /**
+     * Subject files that do not belong to the directory they sit in.
+     *
+     * Reidentification renames directories, not file contents, so a file
+     * carrying another subject's prefix is imported against the wrong
+     * candidate. A sub-* directory nested inside another sub-* directory is
+     * the same fault one level deeper, usually a copy that landed too deep.
+     *
+     * @return array<int, array{context: string, summary: string, message: string}>
+     */
+    private function _containmentFaults(string $bidsPath): array
+    {
+        $faults = [];
+
+        foreach (glob(rtrim($bidsPath, '/') . '/sub-*', GLOB_ONLYDIR) ?: [] as $root) {
+            $subject = basename($root);
+
+            $iterator = new \RecursiveIteratorIterator(
+                new \RecursiveDirectoryIterator(
+                    $root,
+                    \FilesystemIterator::SKIP_DOTS
+                ),
+                \RecursiveIteratorIterator::SELF_FIRST
+            );
+
+            foreach ($iterator as $entry) {
+                /** @var \SplFileInfo $entry */
+                $name = $entry->getFilename();
+
+                if (!str_starts_with($name, 'sub-')) {
+                    continue;
+                }
+
+                $relative = ltrim(
+                    substr($entry->getPathname(), strlen($root)),
+                    '/'
+                );
+
+                if ($entry->isDir()) {
+                    $faults[] = [
+                        'context' => 'NESTED_SUBJECT_DIR',
+                        'summary' => "{$subject} contains a nested subject directory ({$name})",
+                        'message' => "{$subject}/{$relative} is a subject directory"
+                            . ' inside another subject directory. Importing this'
+                            . " would register {$name}'s files against {$subject}.",
+                    ];
+                    continue;
+                }
+
+                // Filenames are sub-<id>_<rest>; compare the prefix only.
+                $prefix = explode('_', $name)[0];
+
+                if ($prefix !== $subject) {
+                    $faults[] = [
+                        'context' => 'SUBJECT_MISMATCH',
+                        'summary' => "{$subject} contains a file belonging to {$prefix}"
+                            . " ({$relative})",
+                        'message' => "{$subject}/{$relative} belongs to {$prefix}."
+                            . " Importing it would attribute {$prefix}'s imaging"
+                            . " to the candidate for {$subject}.",
+                    ];
+                }
+            }
+        }
+
+        return $faults;
+    }
+
     private function _writeError(string $context, string $msg): void
     {
         $this->logger->error("[{$context}] {$msg}");
@@ -901,6 +1010,21 @@ class BidsImportPipeline
             . "{$totals['sessions']} session(s), "
             . "{$totals['scans']} scan file(s)"
             . (empty($modParts) ? '' : " — " . implode(', ', $modParts)));
+
+        // ── Preflight ─────────────────────────────────────────────────────────
+        // Last point where stopping is free. Past the launch below, bidsimport
+        // writes rows into files/parameter_file and copies the tree into
+        // bids_imports/, and undoing that is a manual database delete plus a
+        // filesystem clean-up. Anything detectable from the tree is refused
+        // here rather than reported after the fact. Runs before the tracking
+        // check, so a bad tree is refused whether or not it looks unchanged,
+        // and in dry run, so the refusal is visible before a live attempt.
+        if (!$this->_preflight($bidsPath)) {
+            $this->stats['scans_failed'] = $this->stats['scans_found'];
+            $this->sendNotification(false);
+            $this->_closeAllLogs();
+            return $this->stats;
+        }
 
         // Load tracking — skip if already successfully imported
         // To reimport, delete the tracking file:

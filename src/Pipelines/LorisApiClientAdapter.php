@@ -212,7 +212,17 @@ class LorisApiClientAdapter implements LorisApiClientInterface
             [$externalId]
         );
 
+        // Every "not found" below is also a possible "lookup is broken".
+        // Undifferentiated they look identical to the caller, which creates a
+        // duplicate candidate and reports success. Each path says which
+        // condition it hit and what came back.
         if ($response['status'] !== 200) {
+            $this->warn(sprintf(
+                "Mapper lookup for '%s': HTTP %d (treating as not found). Body: %s",
+                $externalId,
+                $response['status'],
+                $this->snippet($response['raw'])
+            ));
             return null;
         }
 
@@ -220,18 +230,50 @@ class LorisApiClientAdapter implements LorisApiClientInterface
         $lines = explode("\n", trim($response['raw']));
 
         if (count($lines) < 2) {
+            $this->warn(sprintf(
+                "Mapper lookup for '%s': expected a header line plus at least "
+                . 'one data line, got %d line(s) (treating as not found). Body: %s',
+                $externalId,
+                count($lines),
+                $this->snippet($response['raw'])
+            ));
             return null;
         }
 
         $parts = str_getcsv($lines[1]);
 
         if (count($parts) < 2) {
+            $this->warn(sprintf(
+                "Mapper lookup for '%s': data line has %d field(s), expected at "
+                . 'least 2 (ExtID,PSCID) (treating as not found). Line: %s',
+                $externalId,
+                count($parts),
+                $this->snippet($lines[1])
+            ));
             return null;
         }
 
         $pscid = trim($parts[1]);
 
-        if ($pscid === '' || $pscid === 'unauthorized_access') {
+        if ($pscid === '') {
+            $this->warn(sprintf(
+                "Mapper lookup for '%s': PSCID field is empty (treating as not "
+                . 'found). Line: %s',
+                $externalId,
+                $this->snippet($lines[1])
+            ));
+            return null;
+        }
+
+        if ($pscid === 'unauthorized_access') {
+            // Not a missing candidate: the API user cannot see it. Creating one
+            // would duplicate a record that already exists.
+            $this->warn(sprintf(
+                "Mapper lookup for '%s': mapper returned unauthorized_access. "
+                . 'This is a permissions problem, not a missing candidate - the '
+                . 'API user may lack access to the site or project.',
+                $externalId
+            ));
             return null;
         }
 
@@ -370,7 +412,7 @@ class LorisApiClientAdapter implements LorisApiClientInterface
                 $externalId,
                 $this->projectExternalName !== null
                     ? ", or deploy the CandidatesPlus accept-Project-name change so "
-                      . "'{$this->projectExternalName}' can be used instead"
+                    . "'{$this->projectExternalName}' can be used instead"
                     : ''
             ));
         }
@@ -649,7 +691,7 @@ class LorisApiClientAdapter implements LorisApiClientInterface
     private function raw(
         string $method,
         string $url,
-        $payload = null,
+               $payload = null,
         bool $multipart = false,
         bool $authenticated = true
     ): array {
@@ -780,5 +822,21 @@ class LorisApiClientAdapter implements LorisApiClientInterface
         if ($this->logger !== null) {
             $this->logger->warning($message);
         }
+    }
+
+    /**
+     * Trim a response body down to something safe to put in a log line.
+     */
+    private function snippet(string $raw, int $limit = 200): string
+    {
+        $clean = trim(preg_replace('/\s+/', ' ', $raw) ?? '');
+
+        if ($clean === '') {
+            return '(empty)';
+        }
+
+        return strlen($clean) > $limit
+            ? substr($clean, 0, $limit) . '...'
+            : $clean;
     }
 }
