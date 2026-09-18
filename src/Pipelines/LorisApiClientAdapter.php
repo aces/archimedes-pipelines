@@ -34,6 +34,7 @@ declare(strict_types=1);
 
 namespace LORIS\Pipelines;
 
+use LORIS\Utils\Dob;
 use RuntimeException;
 
 class LorisApiClientAdapter implements LorisApiClientInterface
@@ -67,6 +68,9 @@ class LorisApiClientAdapter implements LorisApiClientInterface
      * candidate_defaults.project_external_name overrides it when they differ.
      */
     private ?string $projectExternalName = null;
+
+    /** Ambiguous-date order for DoB ('mdy'|'dmy'), from date_input_format. */
+    private string $dateOrder = Dob::DEFAULT_ORDER;
 
     /**
      * Latches false once CandidatesPlus 404s, so the rest of the run goes
@@ -122,6 +126,8 @@ class LorisApiClientAdapter implements LorisApiClientInterface
     public function resolveProject(array $projectConfig, array $config = []): void
     {
         $defaults = $projectConfig['candidate_defaults'] ?? [];
+
+        $this->dateOrder = Dob::dateOrder($projectConfig);
 
         // Same single source as _getProjectExternalName(). Deliberately not a
         // fallback chain: sending a guessed name to CandidatesPlus produces a
@@ -291,7 +297,9 @@ class LorisApiClientAdapter implements LorisApiClientInterface
      *
      * @param string      $pscid      PSCID to assign.
      * @param string      $externalId ExtStudyID to register.
-     * @param string|null $dob        Jittered to YYYY-MM-01 before sending.
+     * @param string|null $dob        Normalised to YYYY-MM-DD before sending
+     *                                (day kept if given, else 01). Required:
+     *                                blank or invalid throws, nothing is sent.
      * @param string|null $sex        Male / Female / Other.
      *
      * @return array{pscid: string, cand_id: string}
@@ -304,6 +312,17 @@ class LorisApiClientAdapter implements LorisApiClientInterface
     ): array {
         $dobValue = $this->normaliseDate($dob ?? '');
         $sexValue = $this->normaliseSex($sex) ?? '';
+
+        // DoB is required to create a candidate (LORIS\Utils\Dob). Fail
+        // before any request; callers already turn this into a rejected
+        // study / failed row.
+        if (($problem = Dob::problem($dobValue)) !== null) {
+            throw new RuntimeException(
+                "{$problem} for {$externalId} - DoB is required to create a"
+                . " candidate (participants.tsv or candidate_defaults.dob;"
+                . " accepted: " . Dob::FORMATS_HINT . ")"
+            );
+        }
 
         // --- Strategy 1: CandidatesPlus with ProjectExternalName -------------
         // Only ProjectExternalName is sent. The endpoint reads nothing else for
@@ -760,39 +779,13 @@ class LorisApiClientAdapter implements LorisApiClientInterface
     // =========================================================================
 
     /**
-     * Jitter a date to YYYY-MM-01, per ARCHIMEDES privacy policy.
-     *
-     * Missing day -> 01, missing month -> 01, year-only -> YYYY-01-01. Empty
-     * stays empty. Unparseable values pass through unchanged so LORIS surfaces
-     * the validation error rather than the pipeline silently mangling it.
+     * DoB via the shared policy (LORIS\Utils\Dob): YYYY-MM-DD, provided
+     * day kept, missing day/month -> 01, invalid left unchanged for the
+     * DoB check in createCandidate().
      */
     private function normaliseDate(string $value): string
     {
-        $value = trim($value);
-
-        if ($value === '') {
-            return '';
-        }
-
-        if (preg_match('/^(\d{4})-(\d{2})-\d{2}$/', $value, $m)) {
-            return $m[1] . '-' . $m[2] . '-01';
-        }
-
-        if (preg_match('/^(\d{4})-(\d{2})$/', $value, $m)) {
-            return $m[1] . '-' . $m[2] . '-01';
-        }
-
-        if (preg_match('/^(\d{4})$/', $value, $m)) {
-            return $m[1] . '-01-01';
-        }
-
-        $timestamp = strtotime($value);
-
-        if ($timestamp !== false) {
-            return date('Y-m', $timestamp) . '-01';
-        }
-
-        return $value;
+        return Dob::normalize($value, $this->dateOrder);
     }
 
     private function normaliseSex(?string $sex): ?string

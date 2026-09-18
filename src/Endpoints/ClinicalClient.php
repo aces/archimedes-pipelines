@@ -841,10 +841,103 @@ PHPCODE;
      *   .linst → linst
      *   .json → bids
      *
+     * REDCap DDs are sent as a whitespace-trimmed copy (see
+     * trimRedcapDictionary()); the source file is never modified.
+     *
      * @param string $filePath  Path to .linst, .csv (REDCap DD), or .json (BIDS)
      * @return array [success, message, method]
      */
     public function installInstrument(string $filePath): array
+    {
+        $trimmed = null;
+        if ($this->detectInstrumentType($filePath) === 'redcap') {
+            $trimmed = $this->trimRedcapDictionary($filePath);
+        }
+
+        try {
+            return $this->installInstrumentFile($trimmed ?? $filePath);
+        } finally {
+            if ($trimmed !== null) {
+                @unlink($trimmed);
+                @rmdir(dirname($trimmed));
+            }
+        }
+    }
+
+    /**
+     * Write a copy of a REDCap DD with trailing whitespace removed from
+     * every cell (header included). Stray trailing spaces in field names,
+     * form names or choices make instrument_manager reject or mis-map the
+     * dictionary.
+     *
+     * Only trailing whitespace is removed; leading whitespace and all
+     * other content are untouched. Returns null (send the original as-is)
+     * when nothing needs trimming or the copy cannot be written, so the
+     * existing install path is unchanged in those cases. The copy keeps
+     * the original basename so the upload looks identical to LORIS.
+     *
+     * @return string|null  Path to the trimmed copy, or null.
+     */
+    private function trimRedcapDictionary(string $filePath): ?string
+    {
+        $in = @fopen($filePath, 'r');
+        if ($in === false) {
+            return null;
+        }
+
+        // escape '' = RFC 4180: backslashes in REDCap text (HTML, regex
+        // validation) must round-trip byte-for-byte.
+        $rows    = [];
+        $changed = 0;
+        while (($row = fgetcsv($in, 0, ',', '"', '')) !== false) {
+            if ($row === [null]) {
+                $rows[] = $row;          // blank line - keep as-is
+                continue;
+            }
+            foreach ($row as $i => $cell) {
+                $t = rtrim((string)$cell);
+                if ($t !== (string)$cell) {
+                    $row[$i] = $t;
+                    $changed++;
+                }
+            }
+            $rows[] = $row;
+        }
+        fclose($in);
+
+        if ($changed === 0) {
+            return null;
+        }
+
+        $dir = sys_get_temp_dir() . '/archi_dd_' . bin2hex(random_bytes(6));
+        if (!@mkdir($dir, 0700)) {
+            $this->logger->warning("    Could not create temp dir for DD trim - sending original");
+            return null;
+        }
+        $outPath = $dir . '/' . basename($filePath);
+        $out     = @fopen($outPath, 'w');
+        if ($out === false) {
+            @rmdir($dir);
+            $this->logger->warning("    Could not write trimmed DD copy - sending original");
+            return null;
+        }
+        foreach ($rows as $row) {
+            if ($row === [null]) {
+                fwrite($out, "\n");
+                continue;
+            }
+            fputcsv($out, $row, ',', '"', '');
+        }
+        fclose($out);
+
+        $this->logger->info("    Trimmed trailing whitespace in {$changed} cell(s) of " . basename($filePath));
+        return $outPath;
+    }
+
+    /**
+     * Send one instrument definition file (API client first, HTTP fallback).
+     */
+    private function installInstrumentFile(string $filePath): array
     {
         $filename = basename($filePath);
         $instrumentType = $this->detectInstrumentType($filePath);

@@ -7,6 +7,7 @@ namespace LORIS\Pipelines;
 use Monolog\Logger;
 use Monolog\Handler\StreamHandler;
 use LORIS\Utils\CleanLogFormatter;
+use LORIS\Utils\Dob;
 
 /**
  * BIDS Participant Sync Pipeline
@@ -19,12 +20,13 @@ use LORIS\Utils\CleanLogFormatter;
  *   bids_sync_run_{timestamp}.log    — full run log
  *   bids_sync_errors_{timestamp}.log — errors only (created on first error)
  *
- * Date normalization (DoB and DoD):
- *   Per ARCHIMEDES privacy policy, DoB and DoD values are jittered to
- *   YYYY-MM-01 before being sent to LORIS. Missing day -> 01, missing
- *   month -> 01, year-only inputs become YYYY-01-01. Empty values stay
- *   empty; unparseable values pass through unchanged so LORIS surfaces
- *   the validation error rather than the pipeline silently mangling it.
+ * DoB (shared policy: LORIS\Utils\Dob, same as clinical and DICOM):
+ *   Source participants.tsv, then candidate_defaults.dob; normalised to
+ *   YYYY-MM-DD (provided day kept, missing day/month -> 01). REQUIRED for
+ *   candidate creation: if neither source gives a valid date the
+ *   participant is NOT created (error logged, participant skipped).
+ *   Participants already in LORIS are unaffected - DoB is only checked
+ *   when a candidate would actually be created.
  *
  * Candidate creation strategy:
  *   1. Try CandidatesPlus endpoint first (POST /cbigr_api/candidatesPlus)
@@ -293,20 +295,6 @@ class BidsParticipantSync
             fclose($this->runLogFh);
             $this->runLogFh = null;
         }
-    }
-
-    // =========================================================================
-    //  DATE NORMALIZATION (DoB and DoD)
-    // =========================================================================
-
-    private function _normalizeDateValue(string $value): string
-    {
-        $value = trim($value);
-        if ($value === '') return $value;
-        if (preg_match('/^(\d{4})-(\d{2})-\d{2}$/', $value, $m)) return "{$m[1]}-{$m[2]}-01";
-        if (preg_match('/^(\d{4})-(\d{2})$/',      $value, $m)) return "{$m[1]}-{$m[2]}-01";
-        if (preg_match('/^(\d{4})$/',              $value, $m)) return "{$m[1]}-01-01";
-        return $value;
     }
 
     // =========================================================================
@@ -993,7 +981,8 @@ class BidsParticipantSync
             $sex        = $this->_extractSex($row);
             $site       = trim($row['site']    ?? $row['Site']    ?? '');
             $project    = trim($row['project'] ?? $row['Project'] ?? '');
-            $dob        = trim($row['dob']     ?? $row['DoB']     ?? $row['date_of_birth'] ?? '');
+            $dobInfo    = Dob::prepare($row, $this->projectDefaults ?? []);
+            $dob        = $dobInfo['raw'];
             $cohort     = trim($row['cohort']  ?? $row['Cohort']  ?? $row['group']         ?? '');
 
             $defaults = $this->projectDefaults['candidate_defaults'] ?? [];
@@ -1005,8 +994,7 @@ class BidsParticipantSync
                     . " Using candidate_defaults.sex from project.json: '{$sex}'."
                 );
             }
-            if (!$dob && !empty($defaults['dob'])) {
-                $dob = trim($defaults['dob']);
+            if ($dobInfo['source'] === 'candidate_defaults') {
                 $this->_warn('DOB_DEFAULT',
                     "{$subjectId} — no 'dob' in participants.tsv."
                     . " Using candidate_defaults.dob from project.json: '{$dob}'."
@@ -1080,9 +1068,8 @@ class BidsParticipantSync
                     . ' or candidate_defaults.site / sites[] to project.json)';
             }
             if (!$dob) {
-                $this->_warn('DOB_MISSING',
-                    "{$subjectId} — no dob; LORIS may reject candidate creation."
-                );
+                // Enforced at creation time (see DoB gate below), so
+                // participants already in LORIS are not flagged.
                 $dob = null;
             }
             if (!$project) {
@@ -1104,10 +1091,9 @@ class BidsParticipantSync
 
             // Date normalization
             if ($dob !== null && $dob !== '') {
-                $dobOriginal = $dob;
-                $dob         = $this->_normalizeDateValue($dob);
-                if ($dob !== $dobOriginal) {
-                    $this->_log("  DoB normalized: {$dobOriginal} → {$dob} (YYYY-MM-01 policy)");
+                $dob = $dobInfo['value'];
+                if ($dob !== $dobInfo['raw']) {
+                    $this->_log("  DoB normalized: {$dobInfo['raw']} → {$dob}");
                 }
             }
 
@@ -1134,6 +1120,20 @@ class BidsParticipantSync
                 $this->_log("  ✓ Candidate cached: CandID={$candID}");
                 $this->stats['already_exists']++;
             } else {
+                // DoB gate: required to create a candidate. Blank or
+                // invalid (after participants.tsv + candidate_defaults)
+                // -> do not create; dry-run reports it too.
+                if (($dobProblem = $dobInfo['problem']) !== null) {
+                    $this->_error('DOB_INVALID',
+                        "{$subjectId} — {$dobProblem}"
+                        . " (checked participants.tsv and candidate_defaults.dob)."
+                        . " DoB is required to create a candidate - accepted: " . Dob::FORMATS_HINT . "."
+                        . "\n    Skipping this participant."
+                    );
+                    $this->stats['external_id_skipped']++;
+                    continue;
+                }
+
                 if ($dryRun) {
                     $this->_log("  [DRY-RUN] Would create candidate: PSCID={$pscid}");
                     $this->stats['created']++;

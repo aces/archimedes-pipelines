@@ -4,7 +4,7 @@ declare(strict_types=1);
 namespace LORIS\Pipelines;
 
 use LORIS\Endpoints\{ClinicalClient, EviDataClient};
-use LORIS\Utils\{Notification, CleanLogFormatter, MountHealthCheck};
+use LORIS\Utils\{Notification, CleanLogFormatter, MountHealthCheck, DateNormalizer, Dob};
 use Monolog\Logger;
 use Monolog\Handler\StreamHandler;
 use Psr\Log\LoggerInterface;
@@ -269,7 +269,7 @@ class ClinicalPipeline
     private const ROW_HASH_SEPARATOR = "\x1F";
 
     private const DATE_COLUMN_NAMES = [
-        'dob', 'date_of_birth', 'birth_date',
+        ...Dob::COLUMN_NAMES,
         'dod', 'date_of_death', 'death_date',
     ];
 
@@ -283,6 +283,9 @@ class ClinicalPipeline
         'project' => 'Project',
         'cohort'  => 'Cohort',
         'site'    => 'Site',
+        // Fills a blank/missing DoB only (see applyCandidateDefaults);
+        // same fallback BIDS and DICOM use via Dob::resolve().
+        Dob::DEFAULT_KEY => 'DoB',
     ];
 
     /**
@@ -983,25 +986,18 @@ class ClinicalPipeline
 
     /**
      * Resolve the exclude_qis list (column names to drop in all-headers
-     * mode). Two-level like qis: project.json overrides global. Returned
-     * as a lowercased set for CASE-INSENSITIVE matching — exclusion is
-     * deliberately liberal.
+     * mode). Global and project lists are UNIONED - project adds to
+     * global, it no longer replaces it. Returned as a lowercased set for
+     * CASE-INSENSITIVE matching - exclusion is deliberately liberal.
      *
      * @return array<string,true>  lowercased-name => true
      */
     private function resolveExcludeQis(array $project, array $evi): array
     {
-        $list = $project['evidata']['exclude_qis']
-            ?? $evi['exclude_qis']
-            ?? [];
-
-        $set = [];
-        foreach ((array)$list as $name) {
-            if (is_string($name) && $name !== '') {
-                $set[strtolower(trim($name))] = true;
-            }
-        }
-        return $set;
+        return EviDataClient::mergeExcludeQis(
+            $evi['exclude_qis'] ?? [],
+            $project['evidata']['exclude_qis'] ?? []
+        );
     }
 
     /**
@@ -2455,7 +2451,12 @@ class ClinicalPipeline
         // Stamp project/cohort/site from project.json candidate_defaults
         // BEFORE anything touches the instrument endpoint. Original stays
         // read-only; ingestion reads the processed copy.
-        $sourcePath = $this->applyCandidateDefaults($project, $filePath, $format);
+        // Phenotype TSVs get no appended DoB column: their candidates come
+        // from participants.tsv. A DoB column they already carry is filled.
+        $sourcePath = $this->applyCandidateDefaults(
+            $project, $filePath, $format,
+            ($fileInfo['source'] ?? 'clinical') !== 'phenotype'
+        );
         if ($sourcePath === null) {
             $this->writeError($filename, "candidate_defaults: processed copy could not be created");
             $this->dataResults[$filename] = [
@@ -2472,7 +2473,7 @@ class ClinicalPipeline
         // project's declared order; unambiguous ones (5/23/2024) are
         // resolved from the data regardless. Default 'mdy' matches the
         // date_mdy validation REDCap dictionaries normally declare.
-        $dateOrder = strtolower((string)($project['date_input_format'] ?? 'mdy'));
+        $dateOrder = Dob::dateOrder($project);
 
         // Date normalisation writes into processed/clinical/ rather than a
         // temp file, so the processed copy IS the file that was uploaded -
@@ -2530,7 +2531,12 @@ class ClinicalPipeline
         // the pipeline can take it; anything still invalid would be
         // rejected by LORIS row by row, with no row numbers and no
         // context. Fail here instead, naming every problem at once.
-        $problems = $this->preflightRows($uploadPath, $format, $project);
+        // DoB is required in every clinical file. BIDS phenotype files are
+        // the exception only when they carry no DoB column: those
+        // candidates are created from participants.tsv (BidsParticipantSync),
+        // which enforces DoB itself.
+        $requireDobColumn = (($fileInfo['source'] ?? 'clinical') !== 'phenotype');
+        $problems = $this->preflightRows($uploadPath, $format, $project, $requireDobColumn);
         if ($problems !== []) {
             $this->log("    FAILED validation - not sent to ARCHIMEDES:");
             foreach ($problems as $pb) {
@@ -2675,9 +2681,11 @@ class ClinicalPipeline
     }
 
     /**
-     * Stamp project/cohort/site from project.json -> candidate_defaults
+     * Stamp project/cohort/site/dob from project.json -> candidate_defaults
      * onto a data file BEFORE it reaches the instrument upload endpoint.
      * Same source of truth as the BIDS participants.tsv enrichment.
+     * DoB matches any Dob::COLUMN_NAMES header; with $appendDob=false a
+     * missing DoB column is not added (blank cells are still filled).
      *
      * Config is a FALLBACK, not an override. For each key in
      * CLINICAL_DEFAULT_COLUMNS present in candidate_defaults:
@@ -2705,8 +2713,12 @@ class ClinicalPipeline
      * nothing needed a default; or null on read/write failure - the
      * caller fails the file rather than ingesting without the defaults.
      */
-    private function applyCandidateDefaults(array $project, string $srcPath, string $format): ?string
-    {
+    private function applyCandidateDefaults(
+        array $project,
+        string $srcPath,
+        string $format,
+        bool $appendDob = true
+    ): ?string {
         $defaults = $project['candidate_defaults'] ?? [];
 
         // Only the keys this pipeline consumes, and only when present.
@@ -2757,9 +2769,15 @@ class ClinicalPipeline
         $fillIndex    = [];   // column => index of the existing column
         $appended     = [];   // columns added to the header
         foreach (array_keys($apply) as $column) {
-            $idx = array_search(strtolower($column), $headersLower, true);
+            // DoB may arrive as dob / date_of_birth / birth_date - fill that
+            // column rather than appending a second DoB column beside it.
+            $idx = Dob::isColumn($column)
+                ? (Dob::columnIndex($headers) ?? false)
+                : array_search(strtolower($column), $headersLower, true);
             if ($idx !== false) {
                 $fillIndex[$column] = $idx;
+            } elseif (Dob::isColumn($column) && !$appendDob) {
+                unset($apply[$column]);
             } else {
                 $appended[] = $column;
                 $headers[]  = $column;
@@ -3578,10 +3596,21 @@ class ClinicalPipeline
      * Checks only what the pipeline cannot repair. A M/D/YYYY date or an
      * "F" for sex is not reported, because both are corrected upstream.
      *
+     * DoB is REQUIRED for candidate creation (policy: LORIS\Utils\Dob).
+     * Runs after candidate_defaults.dob has filled blanks, so a missing
+     * DoB column (when $requireDobColumn), a blank DoB cell, or an
+     * invalid date here means neither source had one - the whole file
+     * fails and nothing is sent.
+     *
+     * @param bool $requireDobColumn Fail when the file has no DoB column.
      * @return array<string> Human-readable problems, empty when clean.
      */
-    private function preflightRows(string $path, string $format, array $project): array
-    {
+    private function preflightRows(
+        string $path,
+        string $format,
+        array $project,
+        bool $requireDobColumn = true
+    ): array {
         $delimiter = $this->delimiterForFormat($format);
 
         $fh = @fopen($path, 'r');
@@ -3599,7 +3628,7 @@ class ClinicalPipeline
             $idx[strtolower(trim((string)$h))] = $i;
         }
 
-        $dobIdx  = $idx['dob'] ?? $idx['date_of_birth'] ?? $idx['birth_date'] ?? null;
+        $dobIdx  = Dob::columnIndex($headers);
         $sexIdx  = null;
         foreach (self::SEX_COLUMN_NAMES as $c) {
             if (isset($idx[$c])) { $sexIdx = $idx[$c]; break; }
@@ -3615,7 +3644,7 @@ class ClinicalPipeline
             }
         }
 
-        $badDob = $badSex = [];
+        $badDob = $badSex = $blankDob = [];
         $blank  = [];
         $line   = 1;
 
@@ -3627,10 +3656,11 @@ class ClinicalPipeline
 
             if ($dobIdx !== null) {
                 $v = trim((string)($row[$dobIdx] ?? ''));
-                // Blank is allowed here - LORIS decides whether DoB is
-                // mandatory. Only a populated value in the wrong shape is
-                // reported, because that one is certain to be rejected.
-                if ($v !== '' && !preg_match('/^\d{4}-\d{2}-\d{2}$/', $v)) {
+                // DoB is required to create a candidate: blank and
+                // invalid (wrong shape or impossible date) both fail.
+                if ($v === '') {
+                    $blankDob[] = "line {$line}";
+                } elseif (!Dob::isValid($v)) {
                     $badDob[] = "line {$line}: '{$v}'";
                 }
             }
@@ -3652,11 +3682,28 @@ class ClinicalPipeline
 
         $problems = [];
 
+        if ($dobIdx === null && $requireDobColumn) {
+            $problems[] = "no date of birth column (" . implode(' / ', Dob::COLUMN_NAMES)
+                . ") and no candidate_defaults.dob. DoB is required to create a "
+                . "candidate - add it to the file.";
+        }
+
+        if ($blankDob !== []) {
+            $problems[] = sprintf(
+                "%d row(s) have an empty date of birth (none in the file or "
+                . "candidate_defaults.dob): %s%s. DoB is required to create a "
+                . "candidate - populate it at source.",
+                count($blankDob),
+                implode(', ', array_slice($blankDob, 0, 10)),
+                count($blankDob) > 10 ? ' ... and ' . (count($blankDob) - 10) . ' more' : ''
+            );
+        }
+
         if ($badDob !== []) {
             $problems[] = sprintf(
-                "%d row(s) have a date of birth the pipeline could not convert to "
-                . "YYYY-MM-01: %s%s. Accepted at source: YYYY-MM-DD, YYYY-MM, YYYY, "
-                . "M/D/YYYY, D/M/YYYY. Correct these at source, or set "
+                "%d row(s) have an invalid date of birth (could not convert to "
+                . "a real YYYY-MM-DD date): %s%s. Accepted at source: " . Dob::FORMATS_HINT
+                . ". Correct these at source, or set "
                 . "date_input_format in project.json if the day/month order is "
                 . "being read the wrong way round.",
                 count($badDob),
@@ -4637,7 +4684,11 @@ class ClinicalPipeline
             foreach ($dateCols as $idx => $_label) {
                 if (array_key_exists($idx, $row)) {
                     $orig = (string)$row[$idx];
-                    $norm = $this->normalizeDateValue($orig, $dateOrder);
+                    // DoB via the shared policy (keeps a provided day);
+                    // DoD stays at month precision.
+                    $norm = Dob::isColumn($_label)
+                        ? Dob::normalize($orig, $dateOrder)
+                        : DateNormalizer::normalize($orig, $dateOrder, false);
                     if ($norm !== $orig) {
                         $changedPerCol[$idx]++;
                     }
@@ -4667,87 +4718,9 @@ class ClinicalPipeline
             $parts[] = "{$label} {$changedPerCol[$idx]}/{$total}";
         }
         $this->log("    Date columns normalized: " . implode(', ', $parts)
-            . " row(s) rewritten to YYYY-MM-01");
+            . " row(s) normalised (DoB: YYYY-MM-DD, DoD: YYYY-MM-01)");
 
         return $resultPath;
-    }
-
-    /**
-     * Normalise one date cell to YYYY-MM-01.
-     *
-     * The day is deliberately discarded (privacy: DoB is stored to
-     * month precision) — so only the YEAR and MONTH have to be
-     * recovered correctly from whatever the source supplied.
-     *
-     * Accepted inputs:
-     *   YYYY-MM-DD / YYYY-MM / YYYY        unambiguous, taken as-is
-     *   YYYY/MM/DD                         leading 4-digit year
-     *   M/D/YYYY or D/M/YYYY               resolved as described below
-     *   separators - / .                   all treated alike
-     *
-     * Resolving the two-number forms:
-     *   - one part > 12  -> that part MUST be the day, the other the
-     *                       month. Order is determined by the data, not
-     *                       by configuration.
-     *   - both parts <=12 -> genuinely ambiguous (5/6/2024 is May 6th or
-     *                       June 5th). $order decides: 'mdy' (default,
-     *                       matching REDCap's date_mdy) or 'dmy', set
-     *                       per project via project.json ->
-     *                       date_input_format.
-     *
-     * Anything unrecognised is returned UNCHANGED, so a malformed value
-     * reaches LORIS and is rejected there rather than being silently
-     * turned into a plausible-looking wrong date.
-     *
-     * @param string $order 'mdy' or 'dmy' — used only for the ambiguous
-     *                      case.
-     */
-    private function normalizeDateValue(string $value, string $order = 'mdy'): string
-    {
-        $value = trim($value);
-        if ($value === '') {
-            return $value;
-        }
-
-        if (preg_match('/^(\d{4})-(\d{2})-\d{2}$/', $value, $m)) {
-            return "{$m[1]}-{$m[2]}-01";
-        }
-        if (preg_match('/^(\d{4})-(\d{2})$/', $value, $m)) {
-            return "{$m[1]}-{$m[2]}-01";
-        }
-        if (preg_match('/^(\d{4})$/', $value, $m)) {
-            return "{$m[1]}-01-01";
-        }
-
-        // Year-first with / or . separators: YYYY/M/D, YYYY.MM.DD
-        if (preg_match('/^(\d{4})[\/.](\d{1,2})(?:[\/.](\d{1,2}))?$/', $value, $m)) {
-            $month = (int)$m[2];
-            return ($month >= 1 && $month <= 12)
-                ? sprintf('%s-%02d-01', $m[1], $month)
-                : $value;
-        }
-
-        // Two numbers then a 4-digit year: M/D/YYYY or D/M/YYYY,
-        // separated by / - or .
-        if (preg_match('/^(\d{1,2})[\/\-.](\d{1,2})[\/\-.](\d{4})$/', $value, $m)) {
-            $a    = (int)$m[1];
-            $b    = (int)$m[2];
-            $year = $m[3];
-
-            if ($a > 12 && $b >= 1 && $b <= 12) {
-                $month = $b;              // first part must be the day
-            } elseif ($b > 12 && $a >= 1 && $a <= 12) {
-                $month = $a;              // second part must be the day
-            } elseif ($a >= 1 && $a <= 12 && $b >= 1 && $b <= 12) {
-                $month = ($order === 'dmy') ? $b : $a;   // ambiguous
-            } else {
-                return $value;            // neither part is a valid month
-            }
-
-            return sprintf('%s-%02d-01', $year, $month);
-        }
-
-        return $value;
     }
 
     // ══════════════════════════════════════════════════════════════════

@@ -333,7 +333,8 @@ foreach ($targets as $target) {
             $projectConfig = readJson($projectPath . '/project.json');
             $roster        = ParticipantsTsv::load(
                 $tsvPath,
-                $projectConfig['candidate_defaults'] ?? []
+                $projectConfig['candidate_defaults'] ?? [],
+                $projectConfig
             );
 
             $participants = $roster->all();

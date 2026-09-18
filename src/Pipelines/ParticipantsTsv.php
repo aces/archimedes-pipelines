@@ -9,7 +9,8 @@
  *
  * Enrichment fills LORIS-internal columns the submitting site has no way to
  * know - site, cohort, project - from project.json candidate_defaults, rather
- * than requiring them in the delivery. This generalises the behaviour already
+ * than requiring them in the delivery. DoB follows the shared policy in
+ * LORIS\Utils\Dob (any DoB column name, then candidate_defaults.dob). This generalises the behaviour already
  * in _enrichParticipantsTsv() on the BIDS side.
  *
  * Pure: no API calls, no writes. Both pipelines wrap it with their own
@@ -25,6 +26,7 @@ declare(strict_types=1);
 
 namespace LORIS\Pipelines;
 
+use LORIS\Utils\Dob;
 use RuntimeException;
 
 class ParticipantsTsv
@@ -72,10 +74,12 @@ class ParticipantsTsv
      *
      * @param string $path             Absolute path to participants.tsv.
      * @param array  $candidateDefaults project.json candidate_defaults block.
+     * @param array  $projectConfig     Full project.json (date_input_format
+     *                                  for DoB); optional.
      *
      * @throws RuntimeException on a missing, empty or malformed file.
      */
-    public static function load(string $path, array $candidateDefaults = []): self
+    public static function load(string $path, array $candidateDefaults = [], array $projectConfig = []): self
     {
         if (!file_exists($path)) {
             throw new RuntimeException("participants.tsv not found: {$path}");
@@ -83,7 +87,7 @@ class ParticipantsTsv
 
         $instance = new self($path);
         $instance->read($path);
-        $instance->enrich($candidateDefaults);
+        $instance->enrich($candidateDefaults, $projectConfig);
 
         return $instance;
     }
@@ -185,7 +189,7 @@ class ParticipantsTsv
      * external_id defaults to participant_id with the sub- prefix stripped,
      * which is what the submission guide tells sites their identifier is.
      */
-    private function enrich(array $candidateDefaults): void
+    private function enrich(array $candidateDefaults, array $projectConfig = []): void
     {
         foreach (self::DEFAULT_MAP as $defaultKey => $column) {
             if (!isset($candidateDefaults[$defaultKey])) {
@@ -208,6 +212,30 @@ class ParticipantsTsv
                     $this->columns[] = $column;
                 }
             }
+        }
+
+        // dob: shared policy (LORIS\Utils\Dob::prepare) - source and
+        // normalisation - written to the canonical 'dob' column the DICOM
+        // callers read. Blank stays blank for the DoB check.
+        $dobCfg  = ['candidate_defaults' => $candidateDefaults] + $projectConfig;
+        $touched = false;
+        foreach ($this->rows as $id => $row) {
+            $info = Dob::prepare($row, $dobCfg);
+            if ($info['raw'] === '') {
+                continue;
+            }
+            $this->rows[$id]['dob'] = $info['value'];
+            if ($info['source'] === 'candidate_defaults') {
+                $touched = true;
+            }
+        }
+        if ($touched) {
+            $this->enriched[] = 'dob';
+        }
+        if (!in_array('dob', $this->columns, true)
+            && array_filter($this->rows, static fn($r) => ($r['dob'] ?? '') !== '') !== []
+        ) {
+            $this->columns[] = 'dob';
         }
 
         // external_id is derived, not configured.

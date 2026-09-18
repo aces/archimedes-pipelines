@@ -372,7 +372,7 @@ foreach ($targets as $target) {
     $defaults = $projectConfig['candidate_defaults'] ?? [];
 
     try {
-        $roster = ParticipantsTsv::load($tsvPath, $defaults);
+        $roster = ParticipantsTsv::load($tsvPath, $defaults, $projectConfig);
     } catch (RuntimeException $e) {
         fwrite(STDERR, '  ERROR ' . $e->getMessage() . "\n\n");
         $exitCode = EXIT_FAILURE;

@@ -28,8 +28,8 @@
  *     }
  *
  * QI resolution follows the same precedence the clinical pipeline uses:
- * project qis -> global qis -> all-columns default. exclude_qis is subtracted
- * from whichever set wins.
+ * project qis -> global qis -> all-columns default. exclude_qis (global +
+ * project, unioned, case-insensitive) is subtracted from whichever set wins.
  *
  * Each modality is enabled separately: the global service switch must be on,
  * the project must not be disabled, and evidata.imaging.enabled must be
@@ -47,6 +47,7 @@ declare(strict_types=1);
 
 namespace LORIS\Pipelines;
 
+use LORIS\Endpoints\EviDataClient;
 use RuntimeException;
 
 class DicomEviDataExtract
@@ -248,10 +249,19 @@ class DicomEviDataExtract
      */
     public static function mergeConfig(array $projectConfig, array $globalConfig): array
     {
-        return array_merge(
+        $merged = array_merge(
             $globalConfig['evidata'] ?? [],
             $projectConfig['evidata'] ?? []
         );
+
+        // exclude_qis is additive, not overridden: array_merge would let a
+        // project list silently drop the global one.
+        $merged['exclude_qis'] = array_keys(EviDataClient::mergeExcludeQis(
+            $globalConfig['evidata']['exclude_qis'] ?? [],
+            $projectConfig['evidata']['exclude_qis'] ?? []
+        ));
+
+        return $merged;
     }
 
     /**
@@ -266,9 +276,13 @@ class DicomEviDataExtract
     {
         $base = !empty($this->qis) ? $this->qis : $this->columns;
 
-        $qis = array_values(array_diff($base, $this->excludeQis, self::NEVER_QI));
+        // Case-insensitive, matching the clinical pipeline.
+        $exclude = EviDataClient::mergeExcludeQis($this->excludeQis, self::NEVER_QI);
 
-        return $qis;
+        return array_values(array_filter(
+            $base,
+            static fn (string $c): bool => !isset($exclude[strtolower(trim($c))])
+        ));
     }
 
     /**

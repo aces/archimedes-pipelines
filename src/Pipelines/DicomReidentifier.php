@@ -45,7 +45,8 @@ interface LorisApiClientInterface
      *
      * @param string      $pscid      PSCID to assign.
      * @param string      $externalId Site identifier, stored as ExtStudyID.
-     * @param string|null $dob        Jittered to YYYY-MM-01 before sending.
+     * @param string|null $dob        Normalised to YYYY-MM-DD before sending
+     *                                (day kept if given, else 01).
      * @param string|null $sex        Male, Female or Other.
      *
      * @return array{pscid: string, cand_id: string}

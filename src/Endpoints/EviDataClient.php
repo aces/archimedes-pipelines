@@ -122,6 +122,32 @@ class EviDataClient
     // ══════════════════════════════════════════════════════════════════
 
     /**
+     * Union of exclude_qis lists (global + project), as a lowercased set.
+     *
+     * Shared by every pipeline that calls EviData (clinical, DICOM, ...)
+     * so exclusion rules can't drift between modalities. Lists are
+     * ADDITIVE: a project list extends the global one rather than
+     * replacing it, so shared identifier exclusions can't be lost by a
+     * project-level entry. Overlap is harmless; names absent from a
+     * file are simply never matched.
+     *
+     * @param mixed ...$lists  exclude_qis values (arrays of names; null ok).
+     * @return array<string,true>  lowercased-name => true
+     */
+    public static function mergeExcludeQis(...$lists): array
+    {
+        $set = [];
+        foreach ($lists as $list) {
+            foreach ((array)$list as $name) {
+                if (is_string($name) && trim($name) !== '') {
+                    $set[strtolower(trim($name))] = true;
+                }
+            }
+        }
+        return $set;
+    }
+
+    /**
      * Check one CSV/TSV against the given quasi-identifier list.
      * Returns true if EviData reports overall_passed=true.
      *
