@@ -34,18 +34,18 @@ declare(strict_types=1);
  * spurious failure. Real environment variables, if already set, win.
  *
  * Usage:
- *   php scripts/test_evidata_connection.php
- *   php scripts/test_evidata_connection.php --config /alt/path/evidata_config.json
+ *   php scripts/test/test_evidata_connection.php
+ *   php scripts/test/test_evidata_connection.php --config /alt/path/evidata_config.json
  *
  * Exits 0 on full success, 1 on any failure.
  */
 
-require_once __DIR__ . '/../vendor/autoload.php';
+require_once __DIR__ . '/../../vendor/autoload.php';
 
 // ── Args ─────────────────────────────────────────────────────────────
 // Default path mirrors run_clinical_pipeline.php's evidata config
 // location so both scripts read the same file.
-$configPath = __DIR__ . '/../config/evidata_config.json';
+$configPath = __DIR__ . '/../../config/evidata_config.json';
 foreach ($argv as $i => $arg) {
     if ($arg === '--config' && isset($argv[$i + 1])) {
         $configPath = $argv[$i + 1];
@@ -140,6 +140,10 @@ $evi = json_decode(file_get_contents($configPath), true);
 if ($evi === null) {
     $check('config is valid JSON', false, json_last_error_msg());
     exit(1);
+}
+// Flat is canonical; a {"evidata": {...}} wrapper is accepted, as the pipelines do.
+if (isset($evi['evidata']) && is_array($evi['evidata']) && !isset($evi['api_base_url'])) {
+    $evi = $evi['evidata'];
 }
 $check('config file exists and parses', true);
 

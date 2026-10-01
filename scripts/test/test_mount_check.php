@@ -6,8 +6,8 @@ declare(strict_types=1);
  * Quick sanity-test for the MountHealthCheck utility.
  *
  * Usage:
- *   php scripts/test_mount_check.php /data/archimedes
- *   php scripts/test_mount_check.php /data/nonexistent
+ *   php scripts/test/test_mount_check.php /data/archimedes
+ *   php scripts/test/test_mount_check.php /data/nonexistent
  *
  * Useful to:
  *   - Confirm timeout(1) is available on this host
@@ -17,7 +17,7 @@ declare(strict_types=1);
  * Exits 0 if responsive, 1 otherwise.
  */
 
-require __DIR__ . '/../vendor/autoload.php';
+require __DIR__ . '/../../vendor/autoload.php';
 
 use LORIS\Utils\MountHealthCheck;
 

@@ -6,7 +6,7 @@
  * Tests authentication for multiple API versions and verifies token.
  */
 
-require __DIR__ . '/../vendor/autoload.php';
+require __DIR__ . '/../../vendor/autoload.php';
 
 use GuzzleHttp\Client;
 
@@ -15,7 +15,7 @@ echo "  LORIS API Authentication Diagnostic Tool\n";
 echo "=================================================\n\n";
 
 // Load config
-$configFile = __DIR__ . '/../config/loris_client_config.json';
+$configFile = __DIR__ . '/../../config/loris_client_config.json';
 if (!file_exists($configFile)) {
     echo "Configuration file not found: {$configFile}\n";
     exit(1);
@@ -97,7 +97,7 @@ foreach ($versions as $version) {
 
         $token = $data['token'];
         echo "  Authentication successful.\n";
-        echo "  Token (first 20 chars): " . substr($token, 0, 20) . "...\n";
+        echo "  Token received (" . strlen($token) . " chars, not shown).\n";
 
         // Step 3: Test token with /candidates
         $candidatesUrl = "{$baseUrl}/{$version}/candidates";
@@ -133,7 +133,7 @@ echo "=================================================\n\n";
 echo "Try manually with curl:\n";
 echo "curl -X POST '{$baseUrl}/api/v0.0.3/login' \\\n";
 echo "  -H 'Content-Type: application/json' \\\n";
-echo "  -d '{\"username\":\"{$username}\",\"password\":\"{$password}\"}' \\\n";
+echo "  -d '{\"username\":\"{$username}\",\"password\":\"<your password>\"}' \\\n";
 echo "  -v\n\n";
 
 exit(1);

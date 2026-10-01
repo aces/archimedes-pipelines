@@ -1,6 +1,6 @@
 <?php
-require __DIR__ . '/../src/Pipelines/StudyFingerprint.php';
-require __DIR__ . '/../src/Pipelines/FingerprintTracker.php';
+require __DIR__ . '/../../src/Pipelines/StudyFingerprint.php';
+require __DIR__ . '/../../src/Pipelines/FingerprintTracker.php';
 use LORIS\Pipelines\{StudyFingerprint, FingerprintTracker};
 
 $pass=0; $fail=0;

@@ -4,31 +4,31 @@
  * Test CBIGR Mapper - Check if ExternalID exists in LORIS
  *
  * Usage:
- *   php test_cbigr_mapper.php MRAC-NORM-003
- *   php test_cbigr_mapper.php MRAC-NORM-003,MRAC-NORM-0023
+ *   php scripts/test/test_cbigr_mapper.php MRAC-NORM-003
+ *   php scripts/test/test_cbigr_mapper.php MRAC-NORM-003,MRAC-NORM-0023
  */
 
 declare(strict_types=1);
 
-require_once __DIR__ . '/../vendor/autoload.php';
+require_once __DIR__ . '/../../vendor/autoload.php';
 
 use GuzzleHttp\Client as GuzzleClient;
 
 // Parse arguments
 if ($argc < 2) {
-    echo "Usage: php test_cbigr_mapper.php <external_id>\n";
-    echo "Example: php test_cbigr_mapper.php MRAC-NORM-003\n";
-    echo "Example: php test_cbigr_mapper.php MRAC-NORM-003,MRAC-NORM-0023\n";
+    echo "Usage: php scripts/test/test_cbigr_mapper.php <external_id>\n";
+    echo "Example: php scripts/test/test_cbigr_mapper.php MRAC-NORM-003\n";
+    echo "Example: php scripts/test/test_cbigr_mapper.php MRAC-NORM-003,MRAC-NORM-0023\n";
     exit(1);
 }
 
 $externalIDs = $argv[1];
 
 // Load config
-$configFile = __DIR__ . '/../config/loris_client_config.json';
+$configFile = __DIR__ . '/../../config/loris_client_config.json';
 if (!file_exists($configFile)) {
     // Try alternative paths
-    $configFile = __DIR__ . '/../loris_client_config.json';
+    $configFile = __DIR__ . '/../../loris_client_config.json';
 }
 if (!file_exists($configFile)) {
     $configFile = '/opt/archimedes-pipelines/config/loris_client_config.json';
@@ -39,8 +39,8 @@ if (!file_exists($configFile)) {
 if (!file_exists($configFile)) {
     fwrite(STDERR, "Configuration file not found.\n");
     fwrite(STDERR, "Tried:\n");
-    fwrite(STDERR, "  - " . __DIR__ . "/../config/loris_client_config.json\n");
-    fwrite(STDERR, "  - " . __DIR__ . "/../loris_client_config.json\n");
+    fwrite(STDERR, "  - " . __DIR__ . "/../../config/loris_client_config.json\n");
+    fwrite(STDERR, "  - " . __DIR__ . "/../../loris_client_config.json\n");
     fwrite(STDERR, "  - /opt/archimedes-pipelines/config/loris_client_config.json\n");
     fwrite(STDERR, "  - /opt/archimedes-pipelines/loris_client_config.json\n");
     exit(1);

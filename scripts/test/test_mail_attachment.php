@@ -15,10 +15,10 @@ declare(strict_types=1);
  * for the EviData failure-notification flow.
  *
  * Usage:
- *   php scripts/test_mail_attachment.php you@example.com
+ *   php scripts/test/test_mail_attachment.php you@example.com
  */
 
-require_once __DIR__ . '/../vendor/autoload.php';
+require_once __DIR__ . '/../../vendor/autoload.php';
 
 // ── Args ─────────────────────────────────────────────────────────────
 if ($argc < 2 || !filter_var($argv[1], FILTER_VALIDATE_EMAIL)) {
