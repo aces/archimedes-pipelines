@@ -41,12 +41,7 @@
     "<instrument_short_name_1>",
     "<instrument_short_name_2>"
   ],
-
-  "_comment_data_access": "Where the pipeline reads from. mount_enabled gates whether the project is processed at all; mount_path is the root for the project on the pipeline host. deidentified-raw/, documentation/, processed/, and logs/ sit under it.",
-  "data_access": {
-    "mount_enabled": true,
-    "mount_path":    "/data/<collection>/<YourProjectName>"
-  },
+  
 
   "_comment_candidate_defaults": "Fallback values used when a candidate row in clinical data is missing one of these fields. Applied at ingestion time on a per-field basis. Keep dob conservative (e.g. 1970-01-01) — it should never be a real DOB.",
   "candidate_defaults": {
