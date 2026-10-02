@@ -41,7 +41,6 @@
     "<instrument_short_name_1>",
     "<instrument_short_name_2>"
   ],
-  
 
   "_comment_candidate_defaults": "Fallback values used when a candidate row in clinical data is missing one of these fields. Applied at ingestion time on a per-field basis. Keep dob conservative (e.g. 1970-01-01) — it should never be a real DOB.",
   "candidate_defaults": {
@@ -131,15 +130,15 @@
     "clinical": {
       "enabled": true
     },
-  "qis": [],
-  "exclude_qis": [
-    "<ColumnName1>",
-    "<ColumnName2>",
-    "<ColumnName3>"
-  ]
-},
+    "qis": [],
+    "exclude_qis": [
+      "<ColumnName1>",
+      "<ColumnName2>",
+      "<ColumnName3>"
+    ]
+  },
 
-  "_comment_logging": "Per-project logging. log_path defaults to <mount_path>/logs when omitted; level is one of DEBUG / INFO / WARNING / ERROR.",
+  "_comment_logging": "Per-project logging. log_path defaults to <collections[].base_path>/<project>/logs when omitted; level is one of DEBUG / INFO / WARNING / ERROR.",
   "logging": {
     "level":    "INFO",
     "log_path": "/data/<collection>/<YourProjectName>/logs"

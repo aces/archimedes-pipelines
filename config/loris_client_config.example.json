@@ -1,45 +1,32 @@
 {
+  "_comment": "Copy to loris_client_config.json and chmod 600. Required: api (base_url, username, password), verify_ssl, notification_defaults, collections. Every other key is optional and shown with its default; delete any you do not change. Project paths come only from collections: each project is <base_path>/<name>.",
+
   "api": {
     "base_url": "https://example-loris-instance.ca/",
     "username": "api_user",
     "password": "secure_password_here",
-    "token_expiry_minutes": 55
+    "api_version": "v0.0.4-dev",
+    "token_expiry_minutes": 55,
+    "timeout_seconds": 600
   },
+  "verify_ssl": true,
   "timeout": 1800,
 
-  "database": {
-    "host": "localhost",
-    "name": "loris",
-    "user": "lorisuser",
-    "password": "db_password_here"
+  "notification_defaults": {
+    "default_on_success": ["team@example.ca"],
+    "default_on_error": ["admin@example.ca"],
+    "default_on_evidata_failed": ["privacy@example.ca"]
   },
 
-  "data_access": {
-    "mode": "local",
-    "base_path": "/data"
+  "_comment_loris_profile": "LORIS-MRI profile name sent to the BIDS import endpoint. The file lives on the LORIS-MRI host in dicom-archive/.loris_mri/, not on this host.",
+  "loris_profile": "database_config.py",
+
+  "_comment_imaging": "DICOM only. header_reader: dcmdump (default, no LORIS-MRI needed), get_dicom_info (also set get_dicom_info_path or mri_code_path), or pydicom (also set python_bin and header_dump_script).",
+  "imaging": {
+    "header_reader": "dcmdump",
+    "dcmdump_path": "/usr/bin/dcmdump",
+    "dcmodify_path": "/usr/bin/dcmodify"
   },
-
-  "logging": {
-    "level": "INFO",
-    "log_dir": "/opt/loris-php-client/logs"
-  },
-
-  "notifications": {
-      "enabled": true,
-      "modalities": {
-        "clinical": { "enabled": true }
-      },
-      "smtp": {
-        "use_native_mail": true,
-        "from": "noreply@server.ca"
-      }
-    },
-
-    "notification_defaults": {
-        "default_on_success": ["sruthy.mcin@gmail.com"],
-        "default_on_error":   ["sruthy.mcin@gmail.com"],
-        "default_on_evidata_failed": ["sruthy.mcin@gmail.com"]
-      },
 
   "collections": [
     {
@@ -47,8 +34,8 @@
       "base_path": "/data/example_collection_1",
       "enabled": true,
       "projects": [
-        {"name": "example_project_1", "enabled": true},
-        {"name": "example_project_2", "enabled": true}
+        { "name": "example_project_1", "enabled": true },
+        { "name": "example_project_2", "enabled": false }
       ]
     },
     {
@@ -56,7 +43,7 @@
       "base_path": "/data/example_collection_2",
       "enabled": true,
       "projects": [
-        {"name": "example_project_3", "enabled": true}
+        { "name": "example_project_3", "enabled": true }
       ]
     }
   ]
