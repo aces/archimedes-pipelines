@@ -308,6 +308,7 @@ class ClinicalPipeline
         // Fills a blank/missing DoB only (see applyCandidateDefaults);
         // same fallback BIDS and DICOM use via Dob::resolve().
         Dob::DEFAULT_KEY => 'DoB',
+        'sex'   => 'Sex'
     ];
 
     /**
