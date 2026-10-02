@@ -14,7 +14,7 @@
  * Runs after run_dicom_organize.php and run_bids_participant_sync.php,
  * and before run_dicom_import.php.
  *
- * Source and target are resolved from project.json -> data_access.mount_path.
+ * Source and target are resolved from loris_client_config.json -> collections[].base_path/<project>.
  * Dry run is the default; pass --confirm to write.
  *
  * Usage:

@@ -410,7 +410,7 @@ class ClinicalPipeline
     private function processProject(array $project): void
     {
         $name      = $project['project_common_name'] ?? basename($project['_projectPath']);
-        $mountPath = $project['data_access']['mount_path'] ?? $project['_projectPath'];
+        $mountPath = $project['_projectPath'];
 
         if (!MountHealthCheck::guardOrReport(
             $mountPath,
@@ -2481,7 +2481,7 @@ class ClinicalPipeline
         // rejected for a bad date or a missing site/cohort, the operator
         // can open that file and see the value LORIS actually received.
         $processedDir  = rtrim(
-                $project['data_access']['mount_path'] ?? $project['_projectPath'],
+                $project['_projectPath'],
                 '/'
             ) . '/processed/clinical';
         $processedPath = "{$processedDir}/{$filename}";
@@ -2802,7 +2802,7 @@ class ClinicalPipeline
             return $srcPath;
         }
 
-        $outDir = rtrim($project['data_access']['mount_path'] ?? $project['_projectPath'], '/')
+        $outDir = rtrim($project['_projectPath'], '/')
             . '/processed/clinical';
         if (!is_dir($outDir) && !mkdir($outDir, 0755, true)) {
             fclose($in);
@@ -3816,7 +3816,7 @@ class ClinicalPipeline
 
     private function loadTrackingFile(array $project): void
     {
-        $base = rtrim($project['data_access']['mount_path'] ?? '', '/') . '/processed/clinical';
+        $base = rtrim($project['_projectPath'], '/') . '/processed/clinical';
 
         if (!is_dir($base)) {
             mkdir($base, 0755, true);
@@ -3928,7 +3928,7 @@ class ClinicalPipeline
      */
     private function archiveSnapshot(array $project, string $src): void
     {
-        $dest = rtrim($project['data_access']['mount_path'] ?? '', '/')
+        $dest = rtrim($project['_projectPath'], '/')
             . '/processed/clinical/' . date('Y-m-d');
 
         if (!is_dir($dest) && !@mkdir($dest, 0755, true) && !is_dir($dest)) {

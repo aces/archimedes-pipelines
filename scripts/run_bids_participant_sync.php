@@ -108,12 +108,7 @@ try {
     $confirm = isset($opts['confirm']);
 
     // Show what will be processed and confirm
-    // Resolve data root from config.
-// Priority: data_access.base_path → data_path → default /data
-    $dataPath = $config['data_access']['base_path']
-        ?? $config['data_path']
-        ?? '/data';
-    $projects = _findProjects($dataPath, $filters);
+    $projects = _findProjects($config['collections'] ?? [], $filters);
 
     if (empty($projects)) {
         echo "No projects found matching the specified filters.\n";
@@ -187,48 +182,34 @@ try {
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
-function _findProjects(string $dataPath, array $filters): array
+function _findProjects(array $collections, array $filters): array
 {
     $projects = [];
     $warnings = [];
 
-    if (!is_dir($dataPath)) {
-        fwrite(STDERR, "ERROR: data_path not found: {$dataPath}\n");
-        fwrite(STDERR, "  Check 'data_path' in loris_client_config.json\n");
+    if (empty($collections)) {
+        fwrite(STDERR, "ERROR: no 'collections' defined in loris_client_config.json\n");
         exit(1);
     }
 
-    $collections = glob($dataPath . '/*', GLOB_ONLYDIR) ?: [];
-
-    if (empty($collections)) {
-        fwrite(STDERR, "WARNING: No collection directories found in {$dataPath}\n");
-        return [];
-    }
-
-    foreach ($collections as $collectionPath) {
-        $collectionName = basename($collectionPath);
-        if (str_starts_with($collectionName, '.')) continue;
-
-        // Filter by collection if specified
+    // Only collections and projects listed in loris_client_config.json with
+    // enabled=true are processed, the same rule as the clinical pipeline.
+    // A disabled project is skipped even when named with --project.
+    foreach ($collections as $coll) {
+        if (!($coll['enabled'] ?? true)) continue;
+        $collectionName = $coll['name'] ?? '';
         if (isset($filters['collection']) && $collectionName !== $filters['collection']) continue;
 
-        $projectDirs = glob($collectionPath . '/*', GLOB_ONLYDIR) ?: [];
+        $basePath = rtrim($coll['base_path'] ?? '', '/');
 
-        if (empty($projectDirs)) {
-            $warnings[] = "No project directories found in collection: {$collectionName}";
-            continue;
-        }
-
-        foreach ($projectDirs as $projectPath) {
-            $projectName = basename($projectPath);
-            if (str_starts_with($projectName, '.')) continue;
-
-            // Filter by project if specified
+        foreach ($coll['projects'] ?? [] as $pc) {
+            if (!($pc['enabled'] ?? true)) continue;
+            $projectName = $pc['name'] ?? '';
             if (isset($filters['project']) && $projectName !== $filters['project']) continue;
 
-            $label = "{$collectionName}/{$projectName}";
+            $projectPath = "{$basePath}/{$projectName}";
+            $label       = "{$collectionName}/{$projectName}";
 
-            // project.json required
             if (!file_exists("{$projectPath}/project.json")) {
                 $warnings[] = "  [{$label}] SKIPPED — missing project.json at {$projectPath}/project.json";
                 continue;
@@ -236,14 +217,8 @@ function _findProjects(string $dataPath, array $filters): array
 
             $projectJson = json_decode(file_get_contents("{$projectPath}/project.json"), true) ?? [];
 
-            // Use data_access.mount_path from project.json when available.
-            // Prevents double-collection paths when data_path already contains
-            // the collection name (e.g. data_path=/data/archimedes but
-            // mount_path=/data/archimedes/FDG-PET).
-            $resolvedPath = (!empty($projectJson['data_access']['mount_path'])
-                && is_dir($projectJson['data_access']['mount_path']))
-                ? rtrim($projectJson['data_access']['mount_path'], '/')
-                : $projectPath;
+            // Project root comes from loris_client_config.json (collections[].base_path/<name>).
+            $resolvedPath = $projectPath;
 
             // Find BIDS source directory (deidentified-raw/bids/)
             $bidsDir    = null;
@@ -297,7 +272,8 @@ function _findProjects(string $dataPath, array $filters): array
         $proj = $filters['project'];
         fwrite(STDERR, "ERROR: Project not found or not eligible: {$col}/{$proj}\n");
         fwrite(STDERR, "  Check:\n");
-        fwrite(STDERR, "    1. Directory exists: {$dataPath}/{$col}/{$proj}\n");
+        fwrite(STDERR, "    1. Listed under collections in loris_client_config.json with enabled=true,\n"
+            . "       and its directory exists at <collections[].base_path>/{$proj}\n");
         fwrite(STDERR, "    2. project.json exists in that directory\n");
         fwrite(STDERR, "    3. deidentified-raw/bids/ exists with participants.tsv\n");
     }
