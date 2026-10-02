@@ -1154,13 +1154,9 @@ PHPCODE;
     /**
      * Is $instrument available to $project?
      *
-     * NOTE: this asks /projects/{project}/instruments, which is the
-     * project's TEST BATTERY — not "is the instrument installed". An
-     * instrument registered by installing a data dictionary but never
-     * added to a project's battery is installed and still returns false
-     * here. The log message says so, because the previous wording
-     * ("will attempt install") pointed at the wrong remedy: reinstalling
-     * the dictionary does not add anything to a battery.
+     * Answered from /projects/{project}/instruments. In LORIS 26 that
+     * endpoint returns every installed instrument (test_names); the
+     * project in the URL does not filter the list.
      *
      * @param string|null $project LORIS project name. Passing null falls
      *                             back to the first project the API
@@ -1181,8 +1177,8 @@ PHPCODE;
         // the pipeline tries a data file's own name as an instrument before
         // falling back to header matching - so a miss is the normal case for
         // any file that is not named after a single instrument. Reporting
-        // every miss at INFO produced alarming lines about the test battery
-        // for files that were about to be resolved correctly a moment later.
+        // every miss at INFO produced alarming lines for files that were
+        // about to be resolved correctly a moment later.
         // A miss that actually matters is reported by the caller, in context.
         if ($exists) {
             $this->logger->info("      ✓ '{$instrument}' available in project '{$resolved}'");
@@ -1206,8 +1202,9 @@ PHPCODE;
      * and has to be resolved by comparing each instrument's expected
      * columns against the file's header.
      *
-     * The list is the project's TEST BATTERY, not everything installed
-     * in LORIS. Cached per project for the run.
+     * The list is whatever /projects/{project}/instruments returns: in
+     * LORIS 26, every installed instrument (test_names). Cached per
+     * project for the run.
      *
      * @param string|null $project Project to scope the list to. Pass it
      *                             explicitly; null falls back to the
@@ -1228,7 +1225,7 @@ PHPCODE;
                 $resolved,
                 count($this->installedInstruments[$resolved]),
                 $this->installedInstruments[$resolved] === []
-                    ? " — nothing in this project's test battery"
+                    ? " - none returned for this project"
                     : ''
             ));
         }

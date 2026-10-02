@@ -95,7 +95,8 @@ final class MountHealthCheck
         string $mountPath,
         array $config,
         LoggerInterface $logger,
-        string $context
+        string $context,
+        bool $sendEmail = true
     ): bool {
         $detail = self::checkDetailed($mountPath);
 
@@ -107,6 +108,13 @@ final class MountHealthCheck
             "{$context} — "
             . self::formatFailureMessage($mountPath, $detail)
         );
+
+        // Dry runs report the problem in the console only.
+        if (!$sendEmail) {
+            $logger->info("{$context} — dry run: no alert email sent");
+
+            return false;
+        }
 
         // De-dup: one email per mount per run.
         if (isset(self::$emailedFailures[$mountPath])) {

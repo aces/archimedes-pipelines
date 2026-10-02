@@ -84,6 +84,21 @@ class ClinicalPipeline
     private array $evidataFailedFiles = [];
 
     private array $installResults = [];
+
+    /**
+     * Dry run only: instruments that STEP 1 would install, keyed by name.
+     * A dry run installs nothing, so without this every instrument that is
+     * new in this run would look unavailable in STEP 2 and the dry run
+     * could never pass for a new data dictionary.
+     */
+    private array $dryRunInstruments = [];
+
+    /**
+     * Dry run only: private temp folder for the working copies the checks
+     * need (enriched and date-normalised files). Deleted at the end of the
+     * run, so a dry run leaves nothing in the project folder.
+     */
+    private ?string $dryRunScratch = null;
     private array $dataResults = [];
 
     /**
@@ -101,10 +116,10 @@ class ClinicalPipeline
      * taken from project.json -> candidate_defaults.project.
      *
      * Instrument availability is per PROJECT: /projects/{name}/instruments
-     * returns that project's test battery. Without this, the client fell
+     * returns that project's instrument list. Without this, the client fell
      * back to whichever project the API happened to list first, so on a
      * multi-project LORIS every instrument check could be made against
-     * the wrong battery. Null means the project did not configure a
+     * the wrong project. Null means the project did not configure a
      * project name and the client's fallback applies, with a warning.
      */
     private ?string $lorisProjectName = null;
@@ -369,7 +384,9 @@ class ClinicalPipeline
             $this->logger->info("║  MODE: DRY RUN                                           ║");
             $this->logger->info("║  - No data will be ingested into ARCHIMEDES              ║");
             $this->logger->info("║  - No outcome notifications will be sent                 ║");
-            $this->logger->info("║  - Mount-failure alerts still go to the tech team        ║");
+            $this->logger->info("║  - Nothing is written: no processed copies, tracking or  ║");
+            $this->logger->info("║    log files - this console output is the report         ║");
+            $this->logger->info("║  - Mount problems are reported here, no alert email      ║");
             $this->logger->info("║  - Run again without --dry-run to actually ingest data   ║");
             $this->logger->info("╚══════════════════════════════════════════════════════════╝");
         }
@@ -404,7 +421,41 @@ class ClinicalPipeline
             $this->logger->debug($e->getTraceAsString());
             $this->closeAllLogs();
             return 1;
+        } finally {
+            $this->removeDryRunScratch();
         }
+    }
+
+    /**
+     * Where this run writes processed copies: the project's
+     * processed/clinical/ on a live run, a private temp folder on a dry run.
+     */
+    private function processedClinicalDir(array $project): string
+    {
+        if ($this->dryRun) {
+            if ($this->dryRunScratch === null) {
+                $this->dryRunScratch = sys_get_temp_dir() . '/archimedes-dryrun-'
+                    . $this->runTimestamp . '-' . getmypid();
+            }
+            return $this->dryRunScratch . '/processed/clinical';
+        }
+        return rtrim($project['_projectPath'], '/') . '/processed/clinical';
+    }
+
+    private function removeDryRunScratch(): void
+    {
+        if ($this->dryRunScratch === null || !is_dir($this->dryRunScratch)) {
+            return;
+        }
+        $it = new \RecursiveIteratorIterator(
+            new \RecursiveDirectoryIterator($this->dryRunScratch, \FilesystemIterator::SKIP_DOTS),
+            \RecursiveIteratorIterator::CHILD_FIRST
+        );
+        foreach ($it as $f) {
+            $f->isDir() ? @rmdir($f->getPathname()) : @unlink($f->getPathname());
+        }
+        @rmdir($this->dryRunScratch);
+        $this->dryRunScratch = null;
     }
 
     private function processProject(array $project): void
@@ -416,7 +467,8 @@ class ClinicalPipeline
             $mountPath,
             $this->config,
             $this->logger,
-            "Clinical pipeline / project {$name}"
+            "Clinical pipeline / project {$name}",
+            !$this->dryRun
         )) {
             $this->stats['data_failed']++;
             return;
@@ -1261,7 +1313,9 @@ class ClinicalPipeline
         if ($this->evidataLogDir !== null) {
             return $this->evidataLogDir;
         }
-        $dir = rtrim($mountPath, '/') . "/logs/evidata/{$this->runTimestamp}";
+        $dir = $this->dryRun
+            ? dirname($this->processedClinicalDir([]), 2) . "/logs/evidata/{$this->runTimestamp}"
+            : rtrim($mountPath, '/') . "/logs/evidata/{$this->runTimestamp}";
         if (!is_dir($dir)) {
             mkdir($dir, 0755, true);
         }
@@ -2025,7 +2079,13 @@ class ClinicalPipeline
         $this->log("  [{$type}] {$filename}");
 
         if ($this->dryRun) {
-            $this->log("    DRY RUN - would install");
+            $names = $this->instrumentsDefinedBy($filePath, $type);
+            foreach ($names as $n) {
+                $this->dryRunInstruments[$n] = true;
+            }
+            $this->log("    DRY RUN - would install" . ($names === []
+                ? ''
+                : ' ' . count($names) . ' instrument(s): ' . implode(', ', $names)));
             $this->installResults[$filename] = ['status' => 'dry_run', 'type' => $type];
             return;
         }
@@ -2081,17 +2141,58 @@ class ClinicalPipeline
     }
 
     /**
+     * Instrument names a data dictionary file defines.
+     *
+     * REDCap: the distinct values of its Form Name column.
+     * LINST:  the name on its "table<TAB>name" line.
+     * Anything else (BIDS .json) returns [] rather than guessing.
+     *
+     * @return array<string>
+     */
+    private function instrumentsDefinedBy(string $filePath, string $type): array
+    {
+        if ($type === 'redcap') {
+            return $this->redcapDictionaryForms($filePath);
+        }
+        if ($type === 'linst') {
+            $fh = @fopen($filePath, 'r');
+            if ($fh === false) {
+                return [];
+            }
+            while (($line = fgets($fh)) !== false) {
+                $parts = explode("\t", trim($line));
+                if (strtolower($parts[0]) === 'table' && !empty($parts[1])) {
+                    fclose($fh);
+                    return [trim($parts[1])];
+                }
+            }
+            fclose($fh);
+        }
+        return [];
+    }
+
+    /**
+     * Is $instrument available to the current LORIS project?
+     *
+     * In a dry run, instruments STEP 1 would install count as available,
+     * so the dry run shows what a live run would actually do.
+     */
+    private function instrumentAvailable(string $instrument): bool
+    {
+        if ($this->dryRun && isset($this->dryRunInstruments[$instrument])) {
+            return true;
+        }
+        return $this->client->instrumentExists($instrument, $this->lorisProjectName);
+    }
+
+    /**
      * Confirm that a REDCap dictionary reported as installed actually
      * produced instruments this project can use.
      *
      * "Already installed" is normally the right answer and the pipeline
-     * treats it as success. It is NOT always true. An instrument has to
-     * exist in three places, and the install can report success while
-     * only the first is satisfied:
-     *
-     *   1. the instruments directory  — the generated instrument file
-     *   2. test_names                 — the registry row LORIS looks up
-     *   3. test_battery               — active for this project + visit
+     * treats it as success. It is NOT always true: the install can report
+     * success when only the generated instrument file exists, without the
+     * test_names row LORIS looks up.
      *
      * A stale or empty file in the instruments directory is enough for
      * LORIS to answer "already exists" and skip the work, leaving no
@@ -2110,12 +2211,10 @@ class ClinicalPipeline
      * .json maps to instruments differently; both are skipped rather
      * than guessed at.
      *
-     * Reported as a NOTE, never as a failure. The pipeline can only see
-     * the project's instrument list, and an instrument can be correctly
-     * installed yet absent from it because it has not been added to the
-     * test battery. The genuine error - a data file targeting a form
-     * that is not available - is reported by processOneDataFile() when
-     * that file is processed, by name.
+     * Reported as a NOTE, never as a failure: a dictionary may define
+     * forms no data file uses. The genuine error - a data file targeting
+     * a form that is not available - is reported by processOneDataFile()
+     * when that file is processed, by name.
      */
     private function verifyRedcapDictionary(string $filePath, string $filename, string $type): void
     {
@@ -2149,12 +2248,8 @@ class ClinicalPipeline
             ? ' ... and ' . (count($missing) - 15) . ' more'
             : '';
 
-        // NOT reported as a failure. The list the pipeline can see is the
-        // project's instrument list; an instrument can be correctly
-        // installed - present in test_names, file on disk - and still be
-        // absent from it because nobody has added it to the test battery
-        // yet. That is a separate, deliberate step, not a fault in the
-        // dictionary or its installation.
+        // NOT reported as a failure: a dictionary may define forms that no
+        // data file uses.
         //
         // The genuine error surfaces later and precisely: if a data file
         // targets one of these forms, processOneDataFile() reports it by
@@ -2165,11 +2260,8 @@ class ClinicalPipeline
             . " project %s's instrument list: %s%s",
             $filename, count($missing), count($forms), $projectLabel, $shown, $suffix
         ));
-        $this->log("    That is expected if they have not been added to the test"
-            . " battery yet - installing a dictionary registers its instruments,"
-            . " it does not activate them for a project. Only an issue if a data"
-            . " file targets one of these forms, which is reported separately"
-            . " when that file is processed.");
+        $this->log("    Only an issue if a data file targets one of these forms;"
+            . " that is reported separately when the file is processed.");
     }
 
     /**
@@ -2480,10 +2572,7 @@ class ClinicalPipeline
         // defaults stamped, sex normalised, dates corrected. When a row is
         // rejected for a bad date or a missing site/cohort, the operator
         // can open that file and see the value LORIS actually received.
-        $processedDir  = rtrim(
-                $project['_projectPath'],
-                '/'
-            ) . '/processed/clinical';
+        $processedDir  = $this->processedClinicalDir($project);
         $processedPath = "{$processedDir}/{$filename}";
 
         if (!is_dir($processedDir) && !@mkdir($processedDir, 0755, true)
@@ -2503,7 +2592,9 @@ class ClinicalPipeline
         $usingTemp = ($uploadPath !== $sourcePath && $uploadPath !== $processedPath);
 
         if ($uploadPath === $processedPath) {
-            $this->log("    Processed copy (as uploaded): processed/clinical/{$filename}");
+            $this->log($this->dryRun
+                ? "    Processed copy (as it would be uploaded): checked, not kept"
+                : "    Processed copy (as uploaded): processed/clinical/{$filename}");
         }
 
         // Narrow the upload to the new/changed rows. Done AFTER enrichment
@@ -2564,7 +2655,7 @@ class ClinicalPipeline
             // Shortcut: a file named after a single instrument uploads
             // straight to it. A miss here is expected for any file holding
             // more than one instrument's data, and is not reported.
-            if ($this->client->instrumentExists($baseName, $this->lorisProjectName)) {
+            if ($this->instrumentAvailable($baseName)) {
                 $this->log("    Instrument: {$baseName} (matched by filename)");
                 $result = $this->doSingleUpload($baseName, $uploadPath, $format, $rows);
                 $this->dataResults[$filename] = array_merge($result, [
@@ -2601,19 +2692,18 @@ class ClinicalPipeline
                 // reach the same answer.
                 $missing = implode(', ', $detected['named']);
                 $this->log("    FAILED - the file targets " . count($detected['named'])
-                    . " instrument(s) that are NOT available to this project: {$missing}");
-                $this->log("    The data dictionary may be installed without the"
-                    . " instruments having been added to the project's test battery."
-                    . " Check the LORIS Test Battery module for this project.");
+                    . " instrument(s) that are NOT installed in LORIS: {$missing}");
+                $this->log("    Check that a data dictionary in documentation/data_dictionary/"
+                    . " defines them and installed without errors in STEP 1.");
                 $this->writeError($filename,
-                    "Instruments named by _complete columns are not available to this "
-                    . "project: {$missing}. Installing the data dictionary registers an "
-                    . "instrument; it does not add it to the project's test battery. "
-                    . "Add them to the battery for the visit label(s) being ingested."
+                    "Instruments named by _complete columns are not installed in LORIS: "
+                    . "{$missing}. "
+                    . "Check that a data dictionary in documentation/data_dictionary/ "
+                    . "defines them and installed without errors."
                 );
                 $this->dataResults[$filename] = [
                     'status'        => 'failed',
-                    'reason'        => 'instruments not in project battery',
+                    'reason'        => 'instruments not installed',
                     'instruments'   => [],
                     'rows'          => $rows,
                     'change_status' => $changeStatus,
@@ -2802,8 +2892,7 @@ class ClinicalPipeline
             return $srcPath;
         }
 
-        $outDir = rtrim($project['_projectPath'], '/')
-            . '/processed/clinical';
+        $outDir = $this->processedClinicalDir($project);
         if (!is_dir($outDir) && !mkdir($outDir, 0755, true)) {
             fclose($in);
             $this->log("    candidate_defaults: cannot create {$outDir}");
@@ -2893,7 +2982,9 @@ class ClinicalPipeline
             $parts[] = "sex normalised to Male/Female/Other ({$sexNormalized}/{$rows} value(s) rewritten)";
         }
         $this->log("    candidate_defaults applied from project.json: " . implode(', ', $parts));
-        $this->log("    Processed copy: processed/clinical/{$basename}");
+        if (!$this->dryRun) {
+            $this->log("    Processed copy: processed/clinical/{$basename}");
+        }
 
         return $outPath;
     }
@@ -3219,8 +3310,8 @@ class ClinicalPipeline
      *               project's instrument list.
      *
      * Previously only 'available' was returned, so a file naming eight
-     * instruments that are installed but absent from the project's test
-     * battery was indistinguishable from a file with no _complete
+     * instruments absent from the project's instrument list was
+     * indistinguishable from a file with no _complete
      * columns at all. The caller then logged "No *_complete column(s)"
      * and ran a field-match that could not possibly succeed.
      *
@@ -3244,7 +3335,7 @@ class ClinicalPipeline
                 continue;
             }
             $named[] = $inst;
-            if ($this->client->instrumentExists($inst, $this->lorisProjectName)) {
+            if ($this->instrumentAvailable($inst)) {
                 $available[] = $inst;
             }
         }
@@ -3568,7 +3659,7 @@ class ClinicalPipeline
         $this->log("    This is the expected response when every row already exists."
             . " If these rows are NEW, verify in ARCHIMEDES: check the visit label,"
             . " site, project and cohort values against those configured on the"
-            . " platform, and that the instrument is in this project's test battery.");
+            . " platform.");
 
         $this->stats['data_skipped']++;
 
@@ -3816,9 +3907,11 @@ class ClinicalPipeline
 
     private function loadTrackingFile(array $project): void
     {
+        // Always the REAL tracking file: a dry run reads it to report what a
+        // live run would skip, but never creates the folder or writes it.
         $base = rtrim($project['_projectPath'], '/') . '/processed/clinical';
 
-        if (!is_dir($base)) {
+        if (!$this->dryRun && !is_dir($base)) {
             mkdir($base, 0755, true);
         }
 
@@ -3838,7 +3931,9 @@ class ClinicalPipeline
 
     private function saveTrackingFile(): void
     {
-        if ($this->trackingFilePath === null) {
+        // A dry run uploads nothing, so it must not record hashes either:
+        // otherwise the next live run sees the file as unchanged and skips it.
+        if ($this->dryRun || $this->trackingFilePath === null) {
             return;
         }
         // Atomic write: temp + rename, so a crash or mount loss mid-write
@@ -3928,6 +4023,9 @@ class ClinicalPipeline
      */
     private function archiveSnapshot(array $project, string $src): void
     {
+        if ($this->dryRun) {
+            return;
+        }
         $dest = rtrim($project['_projectPath'], '/')
             . '/processed/clinical/' . date('Y-m-d');
 
@@ -3959,7 +4057,7 @@ class ClinicalPipeline
 
     private function openRunLog(): void
     {
-        if ($this->runLogFh !== null || $this->logDir === null) {
+        if ($this->dryRun || $this->runLogFh !== null || $this->logDir === null) {
             return;
         }
 
@@ -3999,7 +4097,7 @@ class ClinicalPipeline
     {
         $this->logger->error("[{$context}] {$msg}");
 
-        if ($this->errorFh === null && $this->logDir !== null) {
+        if (!$this->dryRun && $this->errorFh === null && $this->logDir !== null) {
             if (!is_dir($this->logDir)) {
                 mkdir($this->logDir, 0755, true);
             }
@@ -4743,7 +4841,8 @@ class ClinicalPipeline
                 $coll['base_path'],
                 $this->config,
                 $this->logger,
-                "Clinical pipeline / collection '{$coll['name']}'"
+                "Clinical pipeline / collection '{$coll['name']}'",
+                !$this->dryRun
             )) {
                 continue;
             }
