@@ -99,6 +99,13 @@ class ClinicalPipeline
      * run, so a dry run leaves nothing in the project folder.
      */
     private ?string $dryRunScratch = null;
+
+    /**
+     * Instrument name => the data dictionary file in this run that defines
+     * it. Used only to explain, in plain words, why a data file's
+     * instruments are not installed (e.g. the dictionary failed to install).
+     */
+    private array $ddInstrumentSource = [];
     private array $dataResults = [];
 
     /**
@@ -2078,8 +2085,12 @@ class ClinicalPipeline
 
         $this->log("  [{$type}] {$filename}");
 
+        $names = $this->instrumentsDefinedBy($filePath, $type);
+        foreach ($names as $n) {
+            $this->ddInstrumentSource[$n] = $filename;
+        }
+
         if ($this->dryRun) {
-            $names = $this->instrumentsDefinedBy($filePath, $type);
             foreach ($names as $n) {
                 $this->dryRunInstruments[$n] = true;
             }
@@ -2183,6 +2194,51 @@ class ClinicalPipeline
             return true;
         }
         return $this->client->instrumentExists($instrument, $this->lorisProjectName);
+    }
+
+    /**
+     * Plain-language reasons why these instruments are not installed,
+     * grouped by cause, one line per group. Message only.
+     *
+     * @param array<string> $missing
+     * @return array<string>
+     */
+    private function explainMissingInstruments(array $missing): array
+    {
+        $groups = [];
+        foreach ($missing as $inst) {
+            $dd = $this->ddInstrumentSource[$inst] ?? null;
+            if ($dd === null) {
+                $key = 'undefined';
+            } elseif (($this->installResults[$dd]['status'] ?? '') === 'failed') {
+                $key = "failed\0{$dd}";
+            } else {
+                $key = "unlisted\0{$dd}";
+            }
+            $groups[$key][] = $inst;
+        }
+
+        $lines = [];
+        foreach ($groups as $key => $insts) {
+            $list = implode(', ', $insts);
+            if ($key === 'undefined') {
+                $lines[] = "{$list}: not defined in any data dictionary in"
+                    . " documentation/data_dictionary/ - add the dictionary that"
+                    . " defines them, or install them in LORIS";
+                continue;
+            }
+            [$kind, $dd] = explode("\0", $key, 2);
+            if ($kind === 'failed') {
+                $err = trim((string)($this->installResults[$dd]['error'] ?? 'unknown error'));
+                $lines[] = "{$list}: defined in {$dd}, which could not be installed"
+                    . " in STEP 1 - {$err}";
+            } else {
+                $lines[] = "{$list}: defined in {$dd}, which STEP 1 reported as"
+                    . " installed, but LORIS does not list them - check them in"
+                    . " LORIS Instrument Manager";
+            }
+        }
+        return $lines;
     }
 
     /**
@@ -2690,16 +2746,15 @@ class ClinicalPipeline
                 // them. Fail immediately, naming them, instead of
                 // spending an HTTP call per installed instrument to
                 // reach the same answer.
-                $missing = implode(', ', $detected['named']);
-                $this->log("    FAILED - the file targets " . count($detected['named'])
-                    . " instrument(s) that are NOT installed in LORIS: {$missing}");
-                $this->log("    Check that a data dictionary in documentation/data_dictionary/"
-                    . " defines them and installed without errors in STEP 1.");
+                $reasons = $this->explainMissingInstruments($detected['named']);
+                $this->log("    FAILED - this file has data for " . count($detected['named'])
+                    . " instrument(s) that are not installed in LORIS, so nothing was uploaded:");
+                foreach ($reasons as $r) {
+                    $this->log("      - {$r}");
+                }
                 $this->writeError($filename,
-                    "Instruments named by _complete columns are not installed in LORIS: "
-                    . "{$missing}. "
-                    . "Check that a data dictionary in documentation/data_dictionary/ "
-                    . "defines them and installed without errors."
+                    "Nothing uploaded - instrument(s) not installed in LORIS: "
+                    . implode(' | ', $reasons)
                 );
                 $this->dataResults[$filename] = [
                     'status'        => 'failed',
@@ -2710,6 +2765,15 @@ class ClinicalPipeline
                 ];
                 $this->stats['data_failed']++;
                 return;
+            }
+
+            $notInstalled = array_values(array_diff($detected['named'], $instruments));
+            if ($instruments !== [] && $notInstalled !== []) {
+                $this->log("    WARNING - " . count($notInstalled) . " instrument(s) in this file"
+                    . " are not installed in LORIS; their columns will not be uploaded:");
+                foreach ($this->explainMissingInstruments($notInstalled) as $r) {
+                    $this->log("      - {$r}");
+                }
             }
 
             if ($instruments === []) {
