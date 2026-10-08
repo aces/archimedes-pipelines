@@ -15,18 +15,21 @@ use Psr\Log\LoggerInterface;
  * Read-only contract:
  *   The user-shared input subdirectories are treated as READ-ONLY. The
  *   pipeline NEVER writes to deidentified-raw/clinical/,
- *   deidentified-raw/bids/phenotype/ or documentation/data_dictionary/.
+ *   deidentified-raw/preclinical/, deidentified-raw/bids/phenotype/ or
+ *   documentation/data_dictionary/.
  *   It only writes to its own subdirectories: processed/clinical/,
  *   logs/clinical/, logs/evidata/.
  *
  * Data sources:
  *   deidentified-raw/clinical/        .csv and .tsv data files
+ *   deidentified-raw/preclinical/     .csv and .tsv data files
  *   deidentified-raw/bids/phenotype/  BIDS phenotype .tsv data files
  *   documentation/data_dictionary/    ALL dictionaries: .linst / REDCap
  *                                     .csv / BIDS .json
- *   Both data directories feed one list (discoverDataFiles) so the
+ *   All data directories feed one list (discoverDataFiles) so the
  *   privacy gate and the upload step always see the same files.
- *   Filenames must be unique across the two data directories.
+ *   Any of them may be absent. Filenames must be unique across all of
+ *   them.
  *
  * EviData privacy pre-flight gate — quasi-identifier (qis) resolution:
  *   QI lists are resolved with the following precedence:
@@ -211,9 +214,21 @@ class ClinicalPipeline
     ];
 
     /**
-     * Clinical data directory, relative to the project mount.
+     * Tabular (CSV/TSV) data directories, relative to the project mount,
+     * keyed by source label. Scanned in this order; a project may use
+     * either or both, and an absent directory is simply skipped.
+     *
+     * Preclinical files are handled exactly like clinical ones (same
+     * extensions, same DoB/candidate_defaults rules, same EviData gate);
+     * only the source label differs, so logs and duplicate-filename
+     * errors say which folder a file came from.
+     *
+     * Read-only, like every other input directory.
      */
-    private const CLINICAL_DIR = 'deidentified-raw/clinical';
+    private const TABULAR_DATA_DIRS = [
+        'clinical'    => 'deidentified-raw/clinical',
+        'preclinical' => 'deidentified-raw/preclinical',
+    ];
 
     /**
      * BIDS phenotype directory, relative to the project mount.
@@ -483,7 +498,10 @@ class ClinicalPipeline
         }
 
         $ddDir    = "{$mountPath}/documentation/data_dictionary";
-        $dataDir  = "{$mountPath}/" . self::CLINICAL_DIR;
+        $dataDirs = [];
+        foreach (self::TABULAR_DATA_DIRS as $label => $rel) {
+            $dataDirs[$label] = "{$mountPath}/{$rel}";
+        }
         $phenoDir = "{$mountPath}/" . self::PHENOTYPE_DIR;
 
         $this->lorisProjectName = trim((string)($project['candidate_defaults']['project'] ?? '')) ?: null;
@@ -495,7 +513,14 @@ class ClinicalPipeline
         $this->log("Project: {$name}");
         $this->log("Run: {$this->runTimestamp}");
         $this->log("DD dir    (read-only): {$ddDir}");
-        $this->log("Data dir  (read-only): {$dataDir}");
+        foreach ($dataDirs as $label => $dir) {
+            $this->log(sprintf("%-11s (read-only): %s", ucfirst($label), $dir)
+                . (is_dir($dir) ? "" : "  [absent - skipped]"));
+        }
+        if (!array_filter($dataDirs, 'is_dir')) {
+            $this->log("  NOTE: neither " . implode(' nor ', array_keys($dataDirs))
+                . " data directory exists for this project");
+        }
         $this->log("Phenotype (read-only): {$phenoDir}"
             . (is_dir($phenoDir) ? "" : "  [absent - skipped]"));
         $this->log("========================================");
@@ -518,10 +543,10 @@ class ClinicalPipeline
         // Files that pass are ingested; files that fail (bad verdict)
         // or error (no verdict) are skipped and retried next run. The
         // project is NOT aborted as a whole — passing files proceed.
-        // One file list for the whole project: clinical CSV/TSV plus
-        // BIDS phenotype TSV. The SAME list feeds the privacy gate and
+        // One file list for the whole project: clinical and preclinical
+        // CSV/TSV plus BIDS phenotype TSV. The SAME list feeds the privacy gate and
         // the upload step, so the two can never drift apart.
-        $dataFiles = $this->discoverDataFiles($dataDir, $phenoDir);
+        $dataFiles = $this->discoverDataFiles($dataDirs, $phenoDir);
 
         $evidataOutcome = $this->runEvidataPreflight($project, $mountPath, $dataFiles);
 
@@ -678,8 +703,8 @@ class ClinicalPipeline
      * offers, PER FILE. Records the basenames that did NOT pass in
      * $this->evidataFailedFiles so ingestion can skip them.
      *
-     * The file list is supplied by discoverDataFiles() — clinical CSV/TSV
-     * plus BIDS phenotype TSV — so phenotype data goes through exactly
+     * The file list is supplied by discoverDataFiles() — clinical and
+     * preclinical CSV/TSV plus BIDS phenotype TSV — so phenotype data goes through exactly
      * the same privacy gate as any other clinical file.
      *
      * @param array<array{path:string,name:string,format:string,source:string}> $dataFiles
@@ -710,10 +735,15 @@ class ClinicalPipeline
             $dataFiles,
             fn(array $f) => ($f['source'] ?? 'clinical') === 'phenotype'
         ));
+        $preclinicalCount = count(array_filter(
+            $dataFiles,
+            fn(array $f) => ($f['source'] ?? 'clinical') === 'preclinical'
+        ));
 
         $this->log("");
         $this->log("──── EVIDATA PRE-FLIGHT" . ($this->dryRun ? " [DRY RUN]" : "") . " ────");
         $this->log("  Checking " . count($csvFiles) . " file(s) against EviData"
+            . ($preclinicalCount > 0 ? " ({$preclinicalCount} from preclinical/)" : "")
             . ($phenoCount > 0 ? " ({$phenoCount} from BIDS phenotype/)" : ""));
         $this->log("  API endpoint: {$evi['api_base_url']}");
 
@@ -2373,58 +2403,58 @@ class ClinicalPipeline
     // ══════════════════════════════════════════════════════════════════
 
     /**
-     * Build the project's data-file list: everything in
-     * deidentified-raw/clinical (.csv, .tsv) plus every BIDS phenotype
-     * .tsv in deidentified-raw/bids/phenotype.
+     * Build the project's data-file list: every .csv/.tsv in the tabular
+     * data directories (deidentified-raw/clinical and
+     * deidentified-raw/preclinical, whichever exist) plus every BIDS
+     * phenotype .tsv in deidentified-raw/bids/phenotype.
      *
      * Called ONCE per project. The same list is handed to the EviData
      * gate and to the upload step, so a file can never be ingested
      * without having been privacy-checked, or checked without being
      * considered for ingestion.
      *
-     * Basenames must be unique ACROSS both directories. Tracking
+     * Basenames must be unique ACROSS all directories. Tracking
      * (.clinical_tracking.json), per-file results, EviData artifacts and
      * the processed copy are all keyed by basename, so a duplicate would
-     * silently overwrite the other file's state. A colliding phenotype
-     * file is therefore reported as a failure and excluded, rather than
-     * ingested under a key that already belongs to a clinical file.
+     * silently overwrite the other file's state. Sources are scanned in
+     * order (clinical, preclinical, phenotype); the first file to claim a
+     * basename wins and any later one is reported as a failure and
+     * excluded, rather than ingested under a key that already belongs to
+     * another file.
      *
+     * @param array<string,string> $dataDirs  source label => absolute dir
+     *                                        (see TABULAR_DATA_DIRS)
      * @return array<array{path:string,name:string,format:string,source:string}>
      */
-    private function discoverDataFiles(string $clinicalDir, string $phenoDir): array
+    private function discoverDataFiles(array $dataDirs, string $phenoDir): array
     {
-        $files = [];
-        $seen  = [];   // basename => source dir label
-
-        if (is_dir($clinicalDir)) {
-            foreach (self::DATA_EXTENSIONS as $ext => $format) {
-                foreach (glob("{$clinicalDir}/*.{$ext}") ?: [] as $path) {
-                    $name         = basename($path);
-                    $seen[$name]  = 'clinical';
-                    $files[]      = [
-                        'path'   => $path,
-                        'name'   => $name,
-                        'format' => $format,
-                        'source' => 'clinical',
-                    ];
-                }
-            }
+        $sources = [];
+        foreach ($dataDirs as $label => $dir) {
+            $sources[] = [$label, $dir, self::DATA_EXTENSIONS];
         }
+        $sources[] = ['phenotype', $phenoDir, self::PHENOTYPE_DATA_EXTENSIONS];
 
-        if (is_dir($phenoDir)) {
-            $phenoCount = 0;
-            foreach (self::PHENOTYPE_DATA_EXTENSIONS as $ext => $format) {
-                foreach (glob("{$phenoDir}/*.{$ext}") ?: [] as $path) {
+        $files = [];
+        $seen  = [];   // basename => source label
+
+        foreach ($sources as [$label, $dir, $extensions]) {
+            if (!is_dir($dir)) {
+                continue;
+            }
+            $count = 0;
+            foreach ($extensions as $ext => $format) {
+                foreach (glob("{$dir}/*.{$ext}") ?: [] as $path) {
                     $name = basename($path);
+                    $key  = "{$label}/{$name}";
 
                     if (isset($seen[$name])) {
-                        $msg = "phenotype/{$name} has the same filename as a file "
+                        $msg = "{$key} has the same filename as a file "
                             . "in {$seen[$name]}/ — not ingested. Tracking, privacy "
                             . "artifacts and the processed copy are keyed by "
                             . "filename, so rename one of them.";
-                        $this->log("  [phenotype/{$name}] FAILED - duplicate filename");
-                        $this->writeError("phenotype/{$name}", $msg);
-                        $this->dataResults["phenotype/{$name}"] = [
+                        $this->log("  [{$key}] FAILED - duplicate filename");
+                        $this->writeError($key, $msg);
+                        $this->dataResults[$key] = [
                             'status' => 'failed',
                             'reason' => "duplicate filename (also in {$seen[$name]}/)",
                         ];
@@ -2432,8 +2462,8 @@ class ClinicalPipeline
                         continue;
                     }
 
-                    // Same stem, different extension: clinical/moca.csv
-                    // and phenotype/moca.tsv are separate files (own
+                    // Same stem, different extension (e.g. clinical/moca.csv
+                    // and phenotype/moca.tsv) are separate files (own
                     // tracking entry, own privacy verdict, own artifacts
                     // — evidataArtifactStem keeps the extension) but
                     // processOneDataFile derives the instrument from the
@@ -2442,27 +2472,27 @@ class ClinicalPipeline
                     // a mistakenly duplicated export is not mistaken for
                     // two datasets.
                     $stem = pathinfo($name, PATHINFO_FILENAME);
-                    foreach (array_keys($seen) as $seenName) {
-                        if (pathinfo($seenName, PATHINFO_FILENAME) === $stem) {
-                            $this->log("  [phenotype/{$name}] NOTE: targets the "
-                                . "same instrument '{$stem}' as {$seenName} "
+                    foreach ($seen as $seenName => $seenLabel) {
+                        if (pathinfo((string)$seenName, PATHINFO_FILENAME) === $stem) {
+                            $this->log("  [{$key}] NOTE: targets the "
+                                . "same instrument '{$stem}' as {$seenLabel}/{$seenName} "
                                 . "(different extension). Both will be ingested.");
                             break;
                         }
                     }
 
-                    $seen[$name] = 'phenotype';
+                    $seen[$name] = $label;
                     $files[]     = [
                         'path'   => $path,
                         'name'   => $name,
                         'format' => $format,
-                        'source' => 'phenotype',
+                        'source' => $label,
                     ];
-                    $phenoCount++;
+                    $count++;
                 }
             }
-            if ($phenoCount > 0) {
-                $this->log("  BIDS phenotype: {$phenoCount} .tsv file(s) found in {$phenoDir}");
+            if ($count > 0) {
+                $this->log("  {$label}: {$count} data file(s) found in {$dir}");
             }
         }
 
@@ -2473,7 +2503,8 @@ class ClinicalPipeline
 
     /**
      * @param array<array{path:string,name:string,format:string,source:string}> $files
-     *        Prepared by discoverDataFiles(): clinical + BIDS phenotype.
+     *        Prepared by discoverDataFiles(): clinical + preclinical +
+     *        BIDS phenotype.
      */
     private function uploadFromDirectory(array $project, array $files): void
     {
@@ -2511,8 +2542,11 @@ class ClinicalPipeline
                 continue;
             }
 
-            if (($f['source'] ?? 'clinical') === 'phenotype') {
+            $source = $f['source'] ?? 'clinical';
+            if ($source === 'phenotype') {
                 $this->log("  [{$filename}] source: BIDS phenotype/");
+            } elseif ($source !== 'clinical') {
+                $this->log("  [{$filename}] source: {$source}/");
             }
 
             $changeStatus = $this->detectFileChange($filename, $f['path']);

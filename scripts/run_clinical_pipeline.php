@@ -7,6 +7,7 @@
  *
  * Data sources:
  *   deidentified-raw/clinical/        .csv / .tsv
+ *   deidentified-raw/preclinical/     .csv / .tsv
  *   deidentified-raw/bids/phenotype/  BIDS phenotype .tsv
  *
  * All data dictionaries (.linst, REDCap .csv, BIDS .json) live in
@@ -90,8 +91,8 @@ Options:
   --help               Show this help
 
 Reingestion behaviour:
-  Applies to files from deidentified-raw/clinical/ and from
-  deidentified-raw/bids/phenotype/ alike.
+  Applies to files from deidentified-raw/clinical/,
+  deidentified-raw/preclinical/ and deidentified-raw/bids/phenotype/ alike.
   Each file's MD5 hash is stored in processed/clinical/.clinical_tracking.json.
   On every run the pipeline compares the current hash to the stored one:
 
@@ -152,6 +153,8 @@ Directory Structure:
   │   ├── clinical/                      ← Place CSV/TSV files here
   │   │   ├── instrument1.csv
   │   │   └── instrument2.csv
+  │   ├── preclinical/                   ← and/or here (same rules)
+  │   │   └── instrument3.csv
   │   └── bids/
   │       └── phenotype/                 ← BIDS phenotype .tsv here
   │           └── moca.tsv
@@ -162,9 +165,10 @@ Directory Structure:
       └── clinical/2025-11-10/           ← Snapshots archived after each upload
           └── instrument1.csv
 
-  Filenames must be unique across clinical/ and bids/phenotype/ —
-  tracking, privacy artifacts and the processed copy are keyed by
-  filename. A colliding phenotype file is reported and not ingested.
+  Filenames must be unique across clinical/, preclinical/ and
+  bids/phenotype/ — tracking, privacy artifacts and the processed copy
+  are keyed by filename. A file reusing a name already taken is reported
+  and not ingested.
 
 Cron:
   0 2 * * * cd /opt/archimedes-pipelines && php scripts/run_clinical_pipeline.php --all
