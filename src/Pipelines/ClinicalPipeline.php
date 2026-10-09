@@ -353,6 +353,15 @@ class ClinicalPipeline
     private const SEX_COLUMN_NAMES = ['sex', 'gender'];
 
     /**
+     * Column names that hold the visit, matched case-insensitively
+     * against the header. First match wins. Values in this column are
+     * rewritten through project.json -> visit_mappings (source value =>
+     * LORIS visit label), e.g. {"bhi_fnd2_data": "BHiFND2Visit1"}, the
+     * file-upload equivalent of the LORIS REDCap module's <visit> mapper.
+     */
+    private const VISIT_COLUMN_NAMES = ['redcap_event_name', 'visit_label'];
+
+    /**
      * Default MTA message_size_limit in MB, used when the host's
      * evidata_config.json does not set evidata.mta_message_size_limit_mb.
      * The real per-host value (from `postconf message_size_limit`) should
@@ -2893,6 +2902,12 @@ class ClinicalPipeline
      * Both operations share this one pass so the processed copy is
      * written once.
      *
+     * ALSO rewrites the visit column (redcap_event_name / Visit_label)
+     * through project.json -> visit_mappings when that block is present.
+     * Keys match case-insensitively. A value with no entry is kept as-is,
+     * so a file whose events already match the LORIS visit labels needs
+     * no mapping, and a partial mapping only touches the listed events.
+     *
      * A file that needs nothing gets no processed copy: the original path
      * is returned and ingestion reads it directly. In practice only the
      * REDCap exports, which omit these columns, reach processed/clinical/.
@@ -2934,6 +2949,17 @@ class ClinicalPipeline
             array_merge(self::SEX_VALUE_MAP, $project['sex_mappings'] ?? []),
             CASE_LOWER
         );
+
+        // Source visit value => LORIS visit label. Empty when the project
+        // has no visit_mappings block, in which case values pass through.
+        $visitMap = [];
+        foreach (($project['visit_mappings'] ?? []) as $from => $to) {
+            $from = strtolower(trim((string)$from));
+            $to   = trim((string)$to);
+            if ($from !== '' && $to !== '') {
+                $visitMap[$from] = $to;
+            }
+        }
 
         $delimiter = $this->delimiterForFormat($format);
         $basename  = basename($srcPath);
@@ -2984,9 +3010,21 @@ class ClinicalPipeline
             }
         }
 
-        // Nothing to stamp AND no sex column to normalise - the copy
-        // would be byte-identical to the original, so skip it entirely.
-        if ($apply === [] && $sexIdx === null) {
+        // Locate the visit column, only when there is a mapping to apply.
+        $visitIdx = null;
+        if ($visitMap !== []) {
+            foreach (self::VISIT_COLUMN_NAMES as $visitCol) {
+                $i = array_search($visitCol, $headersLower, true);
+                if ($i !== false) {
+                    $visitIdx = $i;
+                    break;
+                }
+            }
+        }
+
+        // Nothing to stamp, no sex column to normalise and no visit to
+        // map - the copy would be byte-identical, so skip it entirely.
+        if ($apply === [] && $sexIdx === null && $visitIdx === null) {
             fclose($in);
             return $srcPath;
         }
@@ -3011,6 +3049,8 @@ class ClinicalPipeline
         $rows           = 0;
         $sexNormalized  = 0;
         $sexUnmapped    = [];   // raw value => occurrences
+        $visitMapped    = [];   // "from => to" => occurrences
+        $visitUnmapped  = [];   // raw value => occurrences
         while (($row = fgetcsv($in, 0, $delimiter)) !== false) {
             $rows++;
             $row = array_pad($row, $origCount, '');
@@ -3042,6 +3082,22 @@ class ClinicalPipeline
                 }
             }
 
+            // Map the visit through visit_mappings. A value with no entry
+            // is kept as-is: it may already be a valid LORIS visit label.
+            if ($visitIdx !== null && isset($row[$visitIdx])) {
+                $raw = trim((string)$row[$visitIdx]);
+                if ($raw !== '') {
+                    $to = $visitMap[strtolower($raw)] ?? null;
+                    if ($to === null) {
+                        $visitUnmapped[$raw] = ($visitUnmapped[$raw] ?? 0) + 1;
+                    } elseif ($to !== $raw) {
+                        $row[$visitIdx] = $to;
+                        $k = "{$raw} => {$to}";
+                        $visitMapped[$k] = ($visitMapped[$k] ?? 0) + 1;
+                    }
+                }
+            }
+
             foreach ($appended as $column) {
                 $row[] = $apply[$column];
             }
@@ -3059,10 +3115,21 @@ class ClinicalPipeline
                 . "project.json -> sex_mappings, or correct the source export.");
         }
 
-        // Nothing was missing and no sex value changed - the copy matches
-        // the original, so discard it and ingest the original. Only files
-        // that actually needed a change reach processed/clinical/.
-        if ($appended === [] && array_sum($filled) === 0 && $sexNormalized === 0) {
+        // Visit values with no visit_mappings entry go to LORIS as-is.
+        // Not an error - but if LORIS then rejects the visit, this line
+        // says which value to add to visit_mappings.
+        foreach ($visitUnmapped as $value => $n) {
+            $this->log("    visit_mappings: no entry for '{$value}' ({$n} row(s) of "
+                . "{$basename}) - used as-is");
+        }
+
+        // Nothing was missing, no sex value changed and no visit was
+        // mapped - the copy matches the original, so discard it and
+        // ingest the original. Only files that actually needed a change
+        // reach processed/clinical/.
+        if ($appended === [] && array_sum($filled) === 0 && $sexNormalized === 0
+            && $visitMapped === []
+        ) {
             @unlink($outPath);
             $this->log("    candidate_defaults: {$basename} already carries every target column - using file as-is");
             return $srcPath;
@@ -3079,6 +3146,9 @@ class ClinicalPipeline
         }
         if ($sexNormalized > 0) {
             $parts[] = "sex normalised to Male/Female/Other ({$sexNormalized}/{$rows} value(s) rewritten)";
+        }
+        foreach ($visitMapped as $pair => $n) {
+            $parts[] = "visit {$pair} ({$n}/{$rows} row(s))";
         }
         $this->log("    candidate_defaults applied from project.json: " . implode(', ', $parts));
         if (!$this->dryRun) {
