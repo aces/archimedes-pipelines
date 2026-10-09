@@ -19,6 +19,8 @@
  *       [--loris-config=<path to LORIS config.xml, if not in the usual places>]
  *       [--upload-dir=/data/web_uploads/instrument_manager]
  *       [--warn-if-contains=<text>[,<text>...]]   e.g. a dev hostname
+ *       [--no-prompt]   do not ask to confirm notification recipients
+ *                       (also skipped automatically when not run in a terminal)
  *
  * Exit code: 0 = no FAIL, 1 = at least one FAIL.
  */
@@ -30,7 +32,8 @@ if (is_file($autoload)) {
 
 use GuzzleHttp\Client;
 
-$opts      = getopt('', ['project:', 'loris-root:', 'loris-config:', 'upload-dir:', 'warn-if-contains:']);
+$opts      = getopt('', ['project:', 'loris-root:', 'loris-config:', 'upload-dir:', 'warn-if-contains:', 'no-prompt']);
+$askConfirm = !isset($opts['no-prompt']) && function_exists('posix_isatty') && posix_isatty(STDIN);
 $onlyProj  = $opts['project'] ?? null;
 $lorisRoot = rtrim($opts['loris-root'] ?? '/var/www/loris', '/');
 $uploadDir = rtrim($opts['upload-dir'] ?? '/data/web_uploads/instrument_manager', '/');
@@ -468,6 +471,66 @@ if ($adminState === 'found') {
 }
 
 // ---------------------------------------------------------------- projects
+// ---------------------------------------------------------------- notification emails
+/**
+ * Recipients a pipeline will use for one modality, resolved like the pipeline
+ * code: clinical uses project.json only; the others fall back to
+ * notification_defaults when a list is missing. Returns label => [list, fromDefault].
+ */
+function resolveRecipients(string $modality, array $block, array $cfg): array
+{
+    $def  = $cfg['notification_defaults'] ?? [];
+    $pick = fn(string $k, string $d) => array_key_exists($k, $block)
+        ? [$block[$k], false]
+        : ($modality === 'clinical' ? [[], false] : [$def[$d] ?? [], true]);
+    return $modality === 'evidata'
+        ? ['privacy fail' => $pick('on_check_failed', 'default_on_evidata_failed')]
+        : ['success' => $pick('on_success', 'default_on_success'), 'error' => $pick('on_error', 'default_on_error')];
+}
+
+/** Show who gets emailed per enabled modality, flag bad addresses, ask to confirm. */
+function notificationReport(string $project, ?array $pj, array $cfg, bool $ask): void
+{
+    echo "\n  Notification emails\n";
+    $problems = [];
+    $shown    = 0;
+    foreach ((array) ($pj['notification_emails'] ?? []) as $modality => $block) {
+        if (!is_array($block) || empty($block['enabled'])) {
+            continue;
+        }
+        $shown++;
+        foreach (resolveRecipients((string) $modality, $block, $cfg) as $label => [$list, $fromDefault]) {
+            $list = is_array($list) ? $list : [$list];
+            $text = $list ? implode(', ', $list) : '(none)';
+            printf("    %-20s %-13s %s%s\n", $modality, $label, $text, $fromDefault ? '  (default)' : '');
+            foreach ($list as $a) {
+                if (stripos((string) $a, 'example') !== false || str_contains((string) $a, '<')
+                    || filter_var(trim((string) $a), FILTER_VALIDATE_EMAIL) === false) {
+                    $problems[] = "$modality $label: '$a'";
+                }
+            }
+            if (!$list && $label !== 'success') {
+                out('WARN', "$modality: no $label recipient, failures will not be emailed");
+            }
+        }
+    }
+
+    if ($shown === 0) {
+        out('WARN', 'no enabled modality in notification_emails, so no emails for this project');
+        return;
+    }
+    $problems
+        ? out('FAIL', 'invalid email: ' . implode('; ', $problems), "Fix notification_emails in $project/project.json")
+        : out('PASS', 'email addresses valid');
+
+    if ($ask) {
+        echo "    Are these the right recipients for $project? [y/N] ";
+        in_array(strtolower(trim((string) fgets(STDIN))), ['y', 'yes'], true)
+            ? out('PASS', 'recipients confirmed')
+            : out('WARN', 'recipients not confirmed', "Update notification_emails in $project/project.json");
+    }
+}
+
 section('Project paths');
 
 // Overview: every collection and project listed in loris_client_config.json.
@@ -557,6 +620,8 @@ foreach ($cfg['collections'] ?? [] as $col) {
         } else {
             out('FAIL', 'project.json missing', "Add $pjFile");
         }
+
+        notificationReport($name, $pj, $cfg, $askConfirm);
 
         echo "\n  Data folders (read by the pipeline)\n";
         foreach (['deidentified-raw', 'deidentified-raw/clinical', 'deidentified-raw/preclinical',
