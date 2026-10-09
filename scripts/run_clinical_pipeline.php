@@ -93,7 +93,8 @@ Options:
 Reingestion behaviour:
   Applies to files from deidentified-raw/clinical/,
   deidentified-raw/preclinical/ and deidentified-raw/bids/phenotype/ alike.
-  Each file's MD5 hash is stored in processed/clinical/.clinical_tracking.json.
+  Each file's MD5 hash is stored in processed/clinical/.clinical_tracking.json
+  (preclinical/ files: processed/preclinical/.preclinical_tracking.json).
   On every run the pipeline compares the current hash to the stored one:
 
     No entry in tracking  →  FIRST UPLOAD   (all rows sent, ARCHIMEDES inserts everything)
@@ -103,6 +104,7 @@ Reingestion behaviour:
 
   To reset a single file's tracking entry (force it to re-upload next run):
     Delete its key from processed/clinical/.clinical_tracking.json
+    (or processed/preclinical/.preclinical_tracking.json)
 
 EviData privacy gate:
   When config/evidata_config.json exists AND its "enabled" field is true,
@@ -153,7 +155,8 @@ Directory Structure:
   │   ├── clinical/                      ← Place CSV/TSV files here
   │   │   ├── instrument1.csv
   │   │   └── instrument2.csv
-  │   ├── preclinical/                   ← and/or here (same rules)
+  │   ├── preclinical/                   ← and/or here (same rules,
+  │   │                                     own processed/, logs/, email)
   │   │   └── instrument3.csv
   │   └── bids/
   │       └── phenotype/                 ← BIDS phenotype .tsv here
@@ -165,10 +168,15 @@ Directory Structure:
       └── clinical/2025-11-10/           ← Snapshots archived after each upload
           └── instrument1.csv
 
-  Filenames must be unique across clinical/, preclinical/ and
-  bids/phenotype/ — tracking, privacy artifacts and the processed copy
-  are keyed by filename. A file reusing a name already taken is reported
-  and not ingested.
+  Filenames must be unique across clinical/ and bids/phenotype/ —
+  tracking, privacy artifacts and the processed copy are keyed by
+  filename. A file reusing a name already taken is reported and not
+  ingested.
+
+  preclinical/ runs as its own pass with its own outputs:
+  processed/preclinical/, logs/preclinical/, and a
+  "<STATUS>: <project> Preclinical Ingestion" email, sent to the same
+  notification_emails.clinical recipients.
 
 Cron:
   0 2 * * * cd /opt/archimedes-pipelines && php scripts/run_clinical_pipeline.php --all

@@ -18,7 +18,8 @@ use Psr\Log\LoggerInterface;
  *   deidentified-raw/preclinical/, deidentified-raw/bids/phenotype/ or
  *   documentation/data_dictionary/.
  *   It only writes to its own subdirectories: processed/clinical/,
- *   logs/clinical/, logs/evidata/.
+ *   logs/clinical/, logs/evidata/ and, for preclinical data,
+ *   processed/preclinical/ and logs/preclinical/.
  *
  * Data sources:
  *   deidentified-raw/clinical/        .csv and .tsv data files
@@ -26,10 +27,13 @@ use Psr\Log\LoggerInterface;
  *   deidentified-raw/bids/phenotype/  BIDS phenotype .tsv data files
  *   documentation/data_dictionary/    ALL dictionaries: .linst / REDCap
  *                                     .csv / BIDS .json
- *   All data directories feed one list (discoverDataFiles) so the
- *   privacy gate and the upload step always see the same files.
- *   Any of them may be absent. Filenames must be unique across all of
- *   them.
+ *   Each pass feeds one list (discoverDataFiles) so the privacy gate
+ *   and the upload step always see the same files. Any directory may be
+ *   absent.
+ *
+ * Passes (same pipeline, separate outputs - see processProject):
+ *   clinical     clinical/ + bids/phenotype/; filenames unique across both
+ *   preclinical  preclinical/ - only when it holds data files
  *
  * EviData privacy pre-flight gate — quasi-identifier (qis) resolution:
  *   QI lists are resolved with the following precedence:
@@ -72,6 +76,23 @@ class ClinicalPipeline
 
     private ?string $logDir = null;
 
+    /**
+     * Data domain of the pass currently running: 'clinical' or
+     * 'preclinical'. The pipeline is identical for both; the domain only
+     * decides WHERE outputs go and how they are labelled:
+     *
+     *   clinical    -> processed/clinical/, logs/clinical/, logs/evidata/,
+     *                  .clinical_tracking.json, "Clinical Ingestion" email
+     *   preclinical -> processed/preclinical/, logs/preclinical/,
+     *                  logs/preclinical/evidata/, .preclinical_tracking.json,
+     *                  "Preclinical Ingestion" email (same recipients:
+ *                  notification_emails.clinical)
+     *
+     * Clinical is the default, so a project with no preclinical data
+     * behaves exactly as before.
+     */
+    private string $domain = 'clinical';
+
     private array $trackingData = [];
     private ?string $trackingFilePath = null;
 
@@ -110,6 +131,16 @@ class ClinicalPipeline
      */
     private array $ddInstrumentSource = [];
     private array $dataResults = [];
+
+    /**
+     * filename => list of notes about corrections made to that file in
+     * this pass (e.g. a wrong project name replaced with
+     * project_full_name). Logged as they happen and listed in the
+     * outcome email under "Notes"; empty means no section is added.
+     *
+     * @var array<string, array<string>>
+     */
+    private array $dataNotes = [];
 
     /**
      * instrument name => its lowercased data-field list, populated by
@@ -469,9 +500,33 @@ class ClinicalPipeline
                 $this->dryRunScratch = sys_get_temp_dir() . '/archimedes-dryrun-'
                     . $this->runTimestamp . '-' . getmypid();
             }
-            return $this->dryRunScratch . '/processed/clinical';
+            return $this->dryRunScratch . '/processed/' . $this->domain;
         }
-        return rtrim($project['_projectPath'], '/') . '/processed/clinical';
+        return rtrim($project['_projectPath'], '/') . '/processed/' . $this->domain;
+    }
+
+    /** "Clinical" / "Preclinical" — for log headers, email subjects and bodies. */
+    private function domainLabel(): string
+    {
+        return ucfirst($this->domain);
+    }
+
+    /**
+     * True when $dir holds at least one file with one of $extensions.
+     * Used only to decide which passes a project needs; it logs nothing,
+     * so discoverDataFiles() still reports each file exactly once.
+     */
+    private function dirHasDataFiles(string $dir, array $extensions): bool
+    {
+        if (!is_dir($dir)) {
+            return false;
+        }
+        foreach (array_keys($extensions) as $ext) {
+            if (glob("{$dir}/*.{$ext}") ?: []) {
+                return true;
+            }
+        }
+        return false;
     }
 
     private function removeDryRunScratch(): void
@@ -513,25 +568,153 @@ class ClinicalPipeline
         }
         $phenoDir = "{$mountPath}/" . self::PHENOTYPE_DIR;
 
+        // Same pipeline, two domains. Clinical (clinical/ + BIDS
+        // phenotype/) and preclinical (preclinical/) each get their own
+        // pass, so each has its own processed/, logs/, tracking file,
+        // EviData artifacts and outcome email.
+        //
+        //   - preclinical pass: only when preclinical/ has data files
+        //   - clinical pass:    always, EXCEPT when the project has
+        //     preclinical data and nothing in clinical/ or phenotype/
+        //     (a purely preclinical project should not get an empty
+        //     "Clinical Ingestion" email or a processed/clinical/ folder)
+        //
+        // A project without preclinical data therefore runs exactly one
+        // clinical pass, as before.
+        $hasPreclinical = $this->dirHasDataFiles($dataDirs['preclinical'], self::DATA_EXTENSIONS);
+        $hasClinical    = $this->dirHasDataFiles($dataDirs['clinical'], self::DATA_EXTENSIONS)
+            || $this->dirHasDataFiles($phenoDir, self::PHENOTYPE_DATA_EXTENSIONS);
+
+        $ddInstalled = false;
+
+        if ($hasClinical || !$hasPreclinical) {
+            $this->processDomain(
+                $project, 'clinical',
+                ['clinical' => $dataDirs['clinical'], 'preclinical' => $dataDirs['preclinical']],
+                ['clinical' => $dataDirs['clinical']],
+                $phenoDir, $ddDir, true
+            );
+            $ddInstalled = true;
+        }
+
+        if ($hasPreclinical) {
+            $this->runIsolatedDomain(function () use ($project, $dataDirs, $ddDir, $ddInstalled) {
+                $this->processDomain(
+                    $project, 'preclinical',
+                    ['preclinical' => $dataDirs['preclinical']],
+                    ['preclinical' => $dataDirs['preclinical']],
+                    '', $ddDir, !$ddInstalled
+                );
+            });
+        }
+    }
+
+    /**
+     * Run a non-clinical pass with its own run/error log and its own
+     * stats, then restore the clinical state.
+     *
+     * - Logs: the clinical run/error log handles stay open across
+     *   projects (one file per run); they are parked here and restored
+     *   afterwards, so clinical logging is unchanged.
+     * - Stats: the pass starts from zero so its summary and email
+     *   describe this pass only; its counts are then added back into the
+     *   run totals, so the final summary and the exit code still cover
+     *   everything.
+     */
+    private function runIsolatedDomain(callable $pass): void
+    {
+        $saved = [
+            'domain'       => $this->domain,
+            'logDir'       => $this->logDir,
+            'runLogFh'     => $this->runLogFh,
+            'runLogPath'   => $this->runLogPath,
+            'errorFh'      => $this->errorFh,
+            'errorLogPath' => $this->errorLogPath,
+            'stats'        => $this->stats,
+        ];
+
+        $this->runLogFh     = null;
+        $this->runLogPath   = null;
+        $this->errorFh      = null;
+        $this->errorLogPath = null;
+        foreach ($this->stats as $k => $v) {
+            $this->stats[$k] = is_array($v) ? [] : 0;
+        }
+
+        try {
+            $pass();
+        } finally {
+            $this->closeAllLogs();
+
+            $passStats = $this->stats;
+            $total     = $saved['stats'];
+            foreach ($passStats as $k => $v) {
+                if (is_array($v)) {
+                    $total[$k] = array_merge($total[$k] ?? [], $v);
+                } else {
+                    $total[$k] = ($total[$k] ?? 0) + $v;
+                }
+            }
+
+            $this->stats        = $total;
+            $this->domain       = $saved['domain'];
+            $this->logDir       = $saved['logDir'];
+            $this->runLogFh     = $saved['runLogFh'];
+            $this->runLogPath   = $saved['runLogPath'];
+            $this->errorFh      = $saved['errorFh'];
+            $this->errorLogPath = $saved['errorLogPath'];
+        }
+    }
+
+    /**
+     * One ingestion pass for one data domain. This is the original
+     * per-project flow, unchanged apart from taking its folders and
+     * output domain as parameters.
+     *
+     * @param array<string,string> $headerDirs dirs listed in the log header
+     * @param array<string,string> $dataDirs   dirs actually scanned
+     * @param string               $phenoDir   BIDS phenotype dir, '' for none
+     * @param bool                 $installDd  run STEP 1 (data dictionaries)
+     */
+    private function processDomain(
+        array $project,
+        string $domain,
+        array $headerDirs,
+        array $dataDirs,
+        string $phenoDir,
+        string $ddDir,
+        bool $installDd
+    ): void {
+        $this->domain = $domain;
+
+        $name      = $project['project_common_name'] ?? basename($project['_projectPath']);
+        $mountPath = $project['_projectPath'];
+
         $this->lorisProjectName = trim((string)($project['candidate_defaults']['project'] ?? '')) ?: null;
 
-        $this->logDir = "{$mountPath}/logs/clinical";
+        $this->logDir = "{$mountPath}/logs/{$domain}";
         $this->openRunLog();
 
         $this->log("========================================");
         $this->log("Project: {$name}");
+        if ($domain !== 'clinical') {
+            $this->log("Data domain: {$this->domainLabel()}");
+        }
         $this->log("Run: {$this->runTimestamp}");
         $this->log("DD dir    (read-only): {$ddDir}");
-        foreach ($dataDirs as $label => $dir) {
-            $this->log(sprintf("%-11s (read-only): %s", ucfirst($label), $dir)
-                . (is_dir($dir) ? "" : "  [absent - skipped]"));
+        foreach ($headerDirs as $label => $dir) {
+            $note = !is_dir($dir) ? "  [absent - skipped]"
+                : (!isset($dataDirs[$label]) ? "  [ingested in its own {$label} pass]" : "");
+            $this->log(sprintf("%-11s (read-only): %s", ucfirst($label), $dir) . $note);
         }
-        if (!array_filter($dataDirs, 'is_dir')) {
-            $this->log("  NOTE: neither " . implode(' nor ', array_keys($dataDirs))
-                . " data directory exists for this project");
+        if ($domain === 'clinical') {
+            if (!array_filter($headerDirs, 'is_dir')) {
+                $this->log("  NOTE: neither " . implode(' nor ', array_keys($headerDirs))
+                    . " data directory exists for this project");
+            }
+            $this->log("Phenotype (read-only): {$phenoDir}"
+                . (is_dir($phenoDir) ? "" : "  [absent - skipped]"));
         }
-        $this->log("Phenotype (read-only): {$phenoDir}"
-            . (is_dir($phenoDir) ? "" : "  [absent - skipped]"));
         $this->log("========================================");
         $this->log("  ✓ Data accessible: {$mountPath}");
         if ($this->lorisProjectName !== null) {
@@ -544,6 +727,7 @@ class ClinicalPipeline
 
         $this->installResults          = [];
         $this->dataResults             = [];
+        $this->dataNotes               = [];
         $this->evidataLogDir           = null;
         $this->evidataNotificationSent = false;
         $this->evidataFailedFiles      = [];
@@ -552,9 +736,9 @@ class ClinicalPipeline
         // Files that pass are ingested; files that fail (bad verdict)
         // or error (no verdict) are skipped and retried next run. The
         // project is NOT aborted as a whole — passing files proceed.
-        // One file list for the whole project: clinical and preclinical
-        // CSV/TSV plus BIDS phenotype TSV. The SAME list feeds the privacy gate and
-        // the upload step, so the two can never drift apart.
+        // One file list per pass (clinical: clinical/ + BIDS phenotype/;
+        // preclinical: preclinical/). The SAME list feeds the privacy
+        // gate and the upload step, so the two can never drift apart.
         $dataFiles = $this->discoverDataFiles($dataDirs, $phenoDir);
 
         $evidataOutcome = $this->runEvidataPreflight($project, $mountPath, $dataFiles);
@@ -580,7 +764,13 @@ class ClinicalPipeline
         $this->loadExistingCandidatesForProject();
         $this->loadTrackingFile($project);
 
-        $this->installFromDirectory($ddDir);
+        if ($installDd) {
+            $this->installFromDirectory($ddDir);
+        } else {
+            $this->log("");
+            $this->log("STEP 1: data dictionaries already handled in the clinical pass"
+                . " of this run - not installed again");
+        }
         $this->uploadFromDirectory($project, $dataFiles);
 
         $this->saveTrackingFile();
@@ -1360,9 +1550,12 @@ class ClinicalPipeline
         if ($this->evidataLogDir !== null) {
             return $this->evidataLogDir;
         }
+        // Clinical keeps logs/evidata/; other domains keep theirs under
+        // their own log folder (logs/preclinical/evidata/).
+        $sub = ($this->domain === 'clinical') ? 'logs/evidata' : "logs/{$this->domain}/evidata";
         $dir = $this->dryRun
-            ? dirname($this->processedClinicalDir([]), 2) . "/logs/evidata/{$this->runTimestamp}"
-            : rtrim($mountPath, '/') . "/logs/evidata/{$this->runTimestamp}";
+            ? dirname($this->processedClinicalDir([]), 2) . "/{$sub}/{$this->runTimestamp}"
+            : rtrim($mountPath, '/') . "/{$sub}/{$this->runTimestamp}";
         if (!is_dir($dir)) {
             mkdir($dir, 0755, true);
         }
@@ -1794,7 +1987,7 @@ class ClinicalPipeline
 
         $projectName = $project['project_common_name']
             ?? basename($project['_projectPath']);
-        $subject     = "PRIVACY CHECK FAILED: {$projectName} Clinical Pipeline";
+        $subject     = "PRIVACY CHECK FAILED: {$projectName} {$this->domainLabel()} Pipeline";
         $body        = $this->buildEvidataFailureBody($projectName, $clientErrorOverride);
 
         [$attachments, $totalBytes, $attachTier] =
@@ -2694,7 +2887,7 @@ class ClinicalPipeline
         if ($uploadPath === $processedPath) {
             $this->log($this->dryRun
                 ? "    Processed copy (as it would be uploaded): checked, not kept"
-                : "    Processed copy (as uploaded): processed/clinical/{$filename}");
+                : "    Processed copy (as uploaded): processed/{$this->domain}/{$filename}");
         }
 
         // Narrow the upload to the new/changed rows. Done AFTER enrichment
@@ -2908,6 +3101,14 @@ class ClinicalPipeline
      * so a file whose events already match the LORIS visit labels needs
      * no mapping, and a partial mapping only touches the listed events.
      *
+     * ALSO checks the file's own project column against project.json ->
+     * project_full_name. A populated value that differs is replaced with
+     * project_full_name in the processed copy and reported as a note (run
+     * log + email), so a mistyped project name no longer makes LORIS
+     * reject every row. Blank cells are still filled from
+     * candidate_defaults.project as before. No project_full_name in
+     * project.json, or no project column in the file -> no check.
+     *
      * A file that needs nothing gets no processed copy: the original path
      * is returned and ingestion reads it directly. In practice only the
      * REDCap exports, which omit these columns, reach processed/clinical/.
@@ -2960,6 +3161,9 @@ class ClinicalPipeline
                 $visitMap[$from] = $to;
             }
         }
+
+        // Expected project name for the file's own project column.
+        $projectFullName = trim((string)($project['project_full_name'] ?? ''));
 
         $delimiter = $this->delimiterForFormat($format);
         $basename  = basename($srcPath);
@@ -3022,9 +3226,20 @@ class ClinicalPipeline
             }
         }
 
-        // Nothing to stamp, no sex column to normalise and no visit to
-        // map - the copy would be byte-identical, so skip it entirely.
-        if ($apply === [] && $sexIdx === null && $visitIdx === null) {
+        // Locate the file's OWN project column (not one appended above),
+        // only when project.json gives a name to check it against.
+        $projectIdx = null;
+        if ($projectFullName !== '') {
+            $i = array_search('project', array_slice($headersLower, 0, $origCount), true);
+            if ($i !== false) {
+                $projectIdx = $i;
+            }
+        }
+
+        // Nothing to stamp, no sex column to normalise, no visit to map
+        // and no project name to check - the copy would be
+        // byte-identical, so skip it entirely.
+        if ($apply === [] && $sexIdx === null && $visitIdx === null && $projectIdx === null) {
             fclose($in);
             return $srcPath;
         }
@@ -3051,9 +3266,22 @@ class ClinicalPipeline
         $sexUnmapped    = [];   // raw value => occurrences
         $visitMapped    = [];   // "from => to" => occurrences
         $visitUnmapped  = [];   // raw value => occurrences
+        $projectFixed   = [];   // wrong project value => occurrences
         while (($row = fgetcsv($in, 0, $delimiter)) !== false) {
             $rows++;
             $row = array_pad($row, $origCount, '');
+
+            // Wrong project name -> project_full_name. Runs BEFORE the
+            // blank-fill below, so a blank cell is still filled from
+            // candidate_defaults.project exactly as before.
+            if ($projectIdx !== null) {
+                $raw = trim((string)$row[$projectIdx]);
+                if ($raw !== '' && $raw !== $projectFullName) {
+                    $row[$projectIdx] = $projectFullName;
+                    $projectFixed[$raw] = ($projectFixed[$raw] ?? 0) + 1;
+                }
+            }
+
             foreach ($fillIndex as $column => $idx) {
                 if (trim((string)$row[$idx]) === '') {
                     $row[$idx] = $apply[$column];
@@ -3106,6 +3334,16 @@ class ClinicalPipeline
         fclose($in);
         fclose($out);
 
+        // Project names that did not match project_full_name: replaced in
+        // the processed copy, and noted so the source can be corrected.
+        foreach ($projectFixed as $value => $n) {
+            $note = "Project '{$value}' does not match project.json project_full_name "
+                . "'{$projectFullName}' - replaced with project_full_name in {$n}/{$rows} "
+                . "row(s). The source file is unchanged; correct it to avoid this note.";
+            $this->log("    NOTE: {$note}");
+            $this->dataNotes[$basename][] = $note;
+        }
+
         // Unrecognised sex values are reported whether or not a copy is
         // kept - they will be rejected by LORIS either way, and the
         // operator needs to know which value to add to sex_mappings.
@@ -3128,7 +3366,7 @@ class ClinicalPipeline
         // ingest the original. Only files that actually needed a change
         // reach processed/clinical/.
         if ($appended === [] && array_sum($filled) === 0 && $sexNormalized === 0
-            && $visitMapped === []
+            && $visitMapped === [] && $projectFixed === []
         ) {
             @unlink($outPath);
             $this->log("    candidate_defaults: {$basename} already carries every target column - using file as-is");
@@ -3150,9 +3388,13 @@ class ClinicalPipeline
         foreach ($visitMapped as $pair => $n) {
             $parts[] = "visit {$pair} ({$n}/{$rows} row(s))";
         }
+        if ($projectFixed !== []) {
+            $parts[] = "project name corrected to project_full_name ("
+                . array_sum($projectFixed) . "/{$rows} row(s))";
+        }
         $this->log("    candidate_defaults applied from project.json: " . implode(', ', $parts));
         if (!$this->dryRun) {
-            $this->log("    Processed copy: processed/clinical/{$basename}");
+            $this->log("    Processed copy: processed/{$this->domain}/{$basename}");
         }
 
         return $outPath;
@@ -4078,13 +4320,13 @@ class ClinicalPipeline
     {
         // Always the REAL tracking file: a dry run reads it to report what a
         // live run would skip, but never creates the folder or writes it.
-        $base = rtrim($project['_projectPath'], '/') . '/processed/clinical';
+        $base = rtrim($project['_projectPath'], '/') . '/processed/' . $this->domain;
 
         if (!$this->dryRun && !is_dir($base)) {
             mkdir($base, 0755, true);
         }
 
-        $this->trackingFilePath = "{$base}/.clinical_tracking.json";
+        $this->trackingFilePath = "{$base}/.{$this->domain}_tracking.json";
         $this->trackingData     = [];
 
         if (file_exists($this->trackingFilePath)) {
@@ -4196,7 +4438,7 @@ class ClinicalPipeline
             return;
         }
         $dest = rtrim($project['_projectPath'], '/')
-            . '/processed/clinical/' . date('Y-m-d');
+            . '/processed/' . $this->domain . '/' . date('Y-m-d');
 
         if (!is_dir($dest) && !@mkdir($dest, 0755, true) && !is_dir($dest)) {
             $this->log("    WARNING: snapshot directory could not be created: {$dest}"
@@ -4210,7 +4452,7 @@ class ClinicalPipeline
         }
 
         if (@copy($src, $target)) {
-            $this->log("    Snapshot archived -> processed/clinical/"
+            $this->log("    Snapshot archived -> processed/{$this->domain}/"
                 . date('Y-m-d') . "/" . basename($target));
             return;
         }
@@ -4234,14 +4476,14 @@ class ClinicalPipeline
             mkdir($this->logDir, 0755, true);
         }
 
-        $this->runLogPath = "{$this->logDir}/clinical_run_{$this->runTimestamp}.log";
+        $this->runLogPath = "{$this->logDir}/{$this->domain}_run_{$this->runTimestamp}.log";
         $this->runLogFh   = fopen($this->runLogPath, 'a');
 
         if ($this->runLogFh) {
             $sep = str_repeat('=', 72);
             fwrite($this->runLogFh,
                 "{$sep}\n"
-                . " ARCHIMEDES Clinical Pipeline - Run Log\n"
+                . " ARCHIMEDES {$this->domainLabel()} Pipeline - Run Log\n"
                 . " Started: " . date('Y-m-d H:i:s T') . "\n"
                 . ($this->dryRun ? " Mode: DRY RUN\n" : "")
                 . ($this->force  ? " Mode: FORCE (hash check bypassed)\n" : "")
@@ -4270,14 +4512,14 @@ class ClinicalPipeline
             if (!is_dir($this->logDir)) {
                 mkdir($this->logDir, 0755, true);
             }
-            $this->errorLogPath = "{$this->logDir}/clinical_errors_{$this->runTimestamp}.log";
+            $this->errorLogPath = "{$this->logDir}/{$this->domain}_errors_{$this->runTimestamp}.log";
             $this->errorFh      = fopen($this->errorLogPath, 'a');
 
             if ($this->errorFh) {
                 $sep = str_repeat('=', 72);
                 fwrite($this->errorFh,
                     "{$sep}\n"
-                    . " ARCHIMEDES Clinical Pipeline - Error Log\n"
+                    . " ARCHIMEDES {$this->domainLabel()} Pipeline - Error Log\n"
                     . " Run: {$this->runTimestamp}\n"
                     . "{$sep}\n\n"
                 );
@@ -4568,6 +4810,8 @@ class ClinicalPipeline
         $status = $this->notificationStatus();
 
         // Anything other than a clean SUCCESS goes to the error list.
+        // Clinical and preclinical passes share notification_emails.clinical;
+        // only the subject line says which one the email is about.
         $successEmails = $project['notification_emails']['clinical']['on_success'] ?? [];
         $errorEmails   = $project['notification_emails']['clinical']['on_error']   ?? [];
         $emailsToSend  = ($status === 'SUCCESS') ? $successEmails : $errorEmails;
@@ -4579,7 +4823,7 @@ class ClinicalPipeline
             return;
         }
 
-        $subject = "{$status}: {$name} Clinical Ingestion";
+        $subject = "{$status}: {$name} {$this->domainLabel()} Ingestion";
         $body    = $this->buildClinicalNotificationBody($name, $status);
 
         $this->log("  Sending notification to: " . implode(', ', $emailsToSend));
@@ -4629,7 +4873,7 @@ class ClinicalPipeline
     private function buildClinicalNotificationBody(string $name, string $status): string
     {
         $body  = "Project: {$name}\n";
-        $body .= "Modality: clinical\n";
+        $body .= "Modality: {$this->domain}\n";
         $body .= "Timestamp: " . date('Y-m-d H:i:s') . "\n";
         $body .= "Run: {$this->runTimestamp}\n";
         if ($this->force) {
@@ -4640,6 +4884,7 @@ class ClinicalPipeline
         $body .= $this->notificationEvidataSection();
         $body .= $this->notificationInstallSection();
         $body .= $this->notificationDataSection();
+        $body .= $this->notificationNotesSection();
         $body .= $this->notificationTotalsSection();
         $body .= $this->notificationCandidateSection();
         $body .= $this->notificationOutcomeLine($status);
@@ -4743,6 +4988,25 @@ class ClinicalPipeline
                 . ")\n";
         }
 
+        return $body . "\n";
+    }
+
+    /**
+     * Corrections the pipeline made on its own (e.g. a wrong project name
+     * replaced with project_full_name). Empty string when there were
+     * none, so emails for clean files are unchanged.
+     */
+    private function notificationNotesSection(): string
+    {
+        if ($this->dataNotes === []) {
+            return '';
+        }
+        $body = "Notes:\n";
+        foreach ($this->dataNotes as $file => $notes) {
+            foreach ($notes as $note) {
+                $body .= "  - {$file}: {$note}\n";
+            }
+        }
         return $body . "\n";
     }
 
