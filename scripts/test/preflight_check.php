@@ -698,14 +698,21 @@ foreach ($cfg['collections'] ?? [] as $col) {
             line('exists in LORIS', yn($exists));
             if (!$exists) {
                 out('WARN', "LORIS project '$lorisProject' not found via API (HTTP " . $r->getStatusCode() . ')', 'Check the LORIS project exists and candidate_defaults.project in project.json');
-            } elseif ($values) {
-                $visits  = json_decode((string) $r->getBody(), true)['Visits'] ?? [];
-                $missing = array_diff(array_keys($values), $visits);
-                line('visits in data', implode(', ', array_keys($values)));
-                line('all found in LORIS', yn(!$missing));
-                $missing
-                    ? out('WARN', 'visit values not in LORIS project: ' . implode(', ', $missing), 'Add the visit in LORIS, or map it in project.json visit_mappings')
-                    : out('PASS', 'visit values match LORIS');
+            }
+            // The LORIS API cannot say which visits are defined for a project:
+            // its project 'Visits' list comes from existing sessions only
+            // (Utility::getVisitList), so a first ingestion would always look
+            // "missing". Show the values instead, for a human to check.
+            if ($values) {
+                if (empty($map)) {
+                    line('visit_mappings', 'none in project.json (data values are used as LORIS visit labels as-is)');
+                } else {
+                    foreach ($map as $from => $to) {
+                        line('visit_mappings', "$from -> $to");
+                    }
+                }
+                line('visits sent to LORIS', implode(', ', array_keys($values)));
+                line('check in LORIS', 'each must equal a visit label of this project (case-sensitive)');
             }
         }
     }
