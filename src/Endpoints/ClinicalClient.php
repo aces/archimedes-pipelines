@@ -1369,6 +1369,34 @@ PHPCODE;
         return $this->apiGet('/candidates')['Candidates'] ?? [];
     }
 
+    /**
+     * CandIDs of one LORIS project, from /projects/{project}/candidates.
+     *
+     * Much smaller than getCandidates(), which lists every candidate on the
+     * server. Returns null when the request fails or the response has no
+     * Candidates list, so a caller can tell "failed" from "no candidates".
+     * Accepts both response shapes: a list of CandID strings, or a list of
+     * candidate objects carrying CandID.
+     *
+     * @return string[]|null
+     */
+    public function getProjectCandidateIds(string $project): ?array
+    {
+        $data = $this->apiGet('/projects/' . rawurlencode($project) . '/candidates');
+        if (!is_array($data) || !isset($data['Candidates']) || !is_array($data['Candidates'])) {
+            return null;
+        }
+
+        $ids = [];
+        foreach ($data['Candidates'] as $c) {
+            $cid = is_array($c) ? ($c['CandID'] ?? $c['candid'] ?? $c['candId'] ?? null) : $c;
+            if ($cid !== null && $cid !== '') {
+                $ids[] = (string)$cid;
+            }
+        }
+        return array_values(array_unique($ids));
+    }
+
     public function getCandidate(int $candid): ?array
     {
         if ($this->hasApiClient && $this->apiConfig !== null) {

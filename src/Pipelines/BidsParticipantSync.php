@@ -1004,22 +1004,11 @@ class BidsParticipantSync
                 $cohort = trim($defaults['cohort']);
                 $this->_log("  Cohort: {$cohort} (from project.json → candidate_defaults.cohort)");
             }
-            if (!$cohort && !empty($this->projectDefaults['cohorts'])) {
-                $cohort = trim($this->projectDefaults['cohorts'][0]);
-                $this->_log("  Cohort: {$cohort} (from project.json → cohorts[0])");
-            }
             if (!$site && !empty($defaults['site'])) {
                 $site = trim($defaults['site']);
                 $this->_warn('SITE_DEFAULT',
                     "{$subjectId} — no 'site' in participants.tsv."
                     . " Using candidate_defaults.site from project.json: '{$site}'."
-                );
-            }
-            if (!$site && !empty($this->projectDefaults['sites'])) {
-                $site = trim($this->projectDefaults['sites'][0]);
-                $this->_warn('SITE_DEFAULT',
-                    "{$subjectId} — no 'site' in participants.tsv."
-                    . " Using sites[0] from project.json: '{$site}'."
                 );
             }
             if (!$project && !empty($this->config['cli_overrides']['project'])) {
@@ -1065,7 +1054,7 @@ class BidsParticipantSync
             }
             if (!$site) {
                 $missingFields[] = 'site (add column to participants.tsv,'
-                    . ' or candidate_defaults.site / sites[] to project.json)';
+                    . ' or candidate_defaults.site to project.json)';
             }
             if (!$dob) {
                 // Enforced at creation time (see DoB gate below), so

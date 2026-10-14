@@ -761,7 +761,7 @@ class ClinicalPipeline
         // 'skipped' (gate disabled / no files) falls through to normal
         // ingestion with no EviData restriction.
 
-        $this->loadExistingCandidatesForProject();
+        $this->loadExistingCandidatesForProject($project);
         $this->loadTrackingFile($project);
 
         if ($installDd) {
@@ -779,10 +779,30 @@ class ClinicalPipeline
         $this->sendNotification($project);
     }
 
-    private function loadExistingCandidatesForProject(): void
+    private function loadExistingCandidatesForProject(array $project): void
     {
         $this->existingCandIdsAtProjectStart    = [];
         $this->candidateClassificationAvailable = false;
+
+        // Project-scoped snapshot: only this project's candidates, instead of
+        // every candidate on the server. The LORIS project name comes from
+        // candidate_defaults.project (optional), else project_full_name.
+        // Falls back to the full list below when neither is set or the
+        // call fails. Used only for the new/existing candidate counts.
+        $snapshotProject = $this->lorisProjectName
+            ?? (trim((string)($project['project_full_name'] ?? '')) ?: null);
+        if ($snapshotProject !== null) {
+            $ids = $this->client->getProjectCandidateIds($snapshotProject);
+            if ($ids !== null) {
+                $this->existingCandIdsAtProjectStart    = $ids;
+                $this->candidateClassificationAvailable = true;
+                $this->log("  Pre-run candidate snapshot: " . count($ids)
+                    . " CandID(s) already in project {$snapshotProject}");
+                return;
+            }
+            $this->log("  Project candidate list unavailable for {$snapshotProject}"
+                . " - using the full candidate list");
+        }
 
         try {
             $candidates = $this->client->getCandidates();
@@ -1985,8 +2005,7 @@ class ClinicalPipeline
             return;
         }
 
-        $projectName = $project['project_common_name']
-            ?? basename($project['_projectPath']);
+        $projectName = $this->notificationProjectName($project);
         $subject     = "PRIVACY CHECK FAILED: {$projectName} {$this->domainLabel()} Pipeline";
         $body        = $this->buildEvidataFailureBody($projectName, $clientErrorOverride);
 
@@ -4806,7 +4825,7 @@ class ClinicalPipeline
      */
     private function sendNotification(array $project): void
     {
-        $name   = $project['project_common_name'] ?? 'Unknown';
+        $name   = $this->notificationProjectName($project);
         $status = $this->notificationStatus();
 
         // Anything other than a clean SUCCESS goes to the error list.
@@ -4851,6 +4870,22 @@ class ClinicalPipeline
      * config-excluded files are NOT errors, so steady-state runs stay
      * SUCCESS.
      */
+    /**
+     * Project name shown in notification emails (subject and body):
+     * project.json project_full_name, else project_common_name, else the
+     * project folder name.
+     */
+    private function notificationProjectName(array $project): string
+    {
+        foreach (['project_full_name', 'project_common_name'] as $key) {
+            $v = trim((string)($project[$key] ?? ''));
+            if ($v !== '') {
+                return $v;
+            }
+        }
+        return basename((string)($project['_projectPath'] ?? '')) ?: 'Unknown';
+    }
+
     private function notificationStatus(): string
     {
         $s = $this->stats;
