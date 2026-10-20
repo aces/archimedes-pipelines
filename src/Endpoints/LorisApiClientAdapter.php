@@ -32,7 +32,7 @@
 
 declare(strict_types=1);
 
-namespace LORIS\Pipelines;
+namespace LORIS\Endpoints;
 
 use LORIS\Utils\Dob;
 use RuntimeException;
@@ -86,6 +86,9 @@ class LorisApiClientAdapter implements LorisApiClientInterface
 
     /** @var array<string, bool> */
     private array $sessionsEnsured = [];
+
+    /** @var array<string, string> PSCID => CandID, from GET /candidates */
+    private array $candidateIndex = [];
 
     public function __construct(array $config, ?object $logger = null)
     {
@@ -143,7 +146,7 @@ class LorisApiClientAdapter implements LorisApiClientInterface
             : $this->projectName;
 
         if ($this->projectName === null) {
-            $this->warn(
+            $this->_warn(
                 'candidate_defaults.project is not set - CandidatesPlus cannot '
                 . 'be used, falling back to the legacy candidate-creation path'
             );
@@ -181,7 +184,7 @@ class LorisApiClientAdapter implements LorisApiClientInterface
         if ($this->projectExternalId === null) {
             // Not fatal: CandidatesPlus needs only the name. It becomes fatal
             // only if the legacy path is reached, which is checked there.
-            $this->info(sprintf(
+            $this->_info(sprintf(
                 'No ProjectExternalID configured - using ProjectExternalName '
                 . "'%s' via CandidatesPlus. The legacy fallback will not be "
                 . 'available on a server without it.',
@@ -212,7 +215,7 @@ class LorisApiClientAdapter implements LorisApiClientInterface
             return $this->resolved[$externalId];
         }
 
-        $response = $this->raw(
+        $response = $this->_raw(
             'POST',
             $this->baseUrl . '/cbigr_api/externalToInternalIdMapper',
             [$externalId]
@@ -223,11 +226,11 @@ class LorisApiClientAdapter implements LorisApiClientInterface
         // duplicate candidate and reports success. Each path says which
         // condition it hit and what came back.
         if ($response['status'] !== 200) {
-            $this->warn(sprintf(
+            $this->_warn(sprintf(
                 "Mapper lookup for '%s': HTTP %d (treating as not found). Body: %s",
                 $externalId,
                 $response['status'],
-                $this->snippet($response['raw'])
+                $this->_snippet($response['raw'])
             ));
             return null;
         }
@@ -236,12 +239,12 @@ class LorisApiClientAdapter implements LorisApiClientInterface
         $lines = explode("\n", trim($response['raw']));
 
         if (count($lines) < 2) {
-            $this->warn(sprintf(
+            $this->_warn(sprintf(
                 "Mapper lookup for '%s': expected a header line plus at least "
                 . 'one data line, got %d line(s) (treating as not found). Body: %s',
                 $externalId,
                 count($lines),
-                $this->snippet($response['raw'])
+                $this->_snippet($response['raw'])
             ));
             return null;
         }
@@ -249,12 +252,12 @@ class LorisApiClientAdapter implements LorisApiClientInterface
         $parts = str_getcsv($lines[1]);
 
         if (count($parts) < 2) {
-            $this->warn(sprintf(
+            $this->_warn(sprintf(
                 "Mapper lookup for '%s': data line has %d field(s), expected at "
                 . 'least 2 (ExtID,PSCID) (treating as not found). Line: %s',
                 $externalId,
                 count($parts),
-                $this->snippet($lines[1])
+                $this->_snippet($lines[1])
             ));
             return null;
         }
@@ -262,11 +265,11 @@ class LorisApiClientAdapter implements LorisApiClientInterface
         $pscid = trim($parts[1]);
 
         if ($pscid === '') {
-            $this->warn(sprintf(
+            $this->_warn(sprintf(
                 "Mapper lookup for '%s': PSCID field is empty (treating as not "
                 . 'found). Line: %s',
                 $externalId,
-                $this->snippet($lines[1])
+                $this->_snippet($lines[1])
             ));
             return null;
         }
@@ -274,7 +277,7 @@ class LorisApiClientAdapter implements LorisApiClientInterface
         if ($pscid === 'unauthorized_access') {
             // Not a missing candidate: the API user cannot see it. Creating one
             // would duplicate a record that already exists.
-            $this->warn(sprintf(
+            $this->_warn(sprintf(
                 "Mapper lookup for '%s': mapper returned unauthorized_access. "
                 . 'This is a permissions problem, not a missing candidate - the '
                 . 'API user may lack access to the site or project.',
@@ -283,7 +286,22 @@ class LorisApiClientAdapter implements LorisApiClientInterface
             return null;
         }
 
-        $this->resolved[$externalId] = ['pscid' => $pscid, 'cand_id' => ''];
+        // The mapper returns PSCID only. Callers build PSCID_CandID_Visit and
+        // create sessions by CandID, so resolve it here rather than return ''.
+        $candId = $this->_lookupCandidateByPscid($pscid);
+
+        if ($candId === null || $candId === '') {
+            $this->_warn(sprintf(
+                "Mapper resolved '%s' to PSCID %s, but no CandID was found for "
+                . 'it in /candidates (the API user may lack access to its site '
+                . 'or project).',
+                $externalId,
+                $pscid
+            ));
+            $candId = '';
+        }
+
+        $this->resolved[$externalId] = ['pscid' => $pscid, 'cand_id' => $candId];
 
         return $this->resolved[$externalId];
     }
@@ -310,8 +328,8 @@ class LorisApiClientAdapter implements LorisApiClientInterface
         ?string $dob,
         ?string $sex
     ): array {
-        $dobValue = $this->normaliseDate($dob ?? '');
-        $sexValue = $this->normaliseSex($sex) ?? '';
+        $dobValue = $this->_normaliseDate($dob ?? '');
+        $sexValue = $this->_normaliseSex($sex) ?? '';
 
         // DoB is required to create a candidate (LORIS\Utils\Dob). Fail
         // before any request; callers already turn this into a rejected
@@ -350,7 +368,7 @@ class LorisApiClientAdapter implements LorisApiClientInterface
                 'ProjectExternalName' => $this->projectExternalName,
             ]];
 
-            $response = $this->raw(
+            $response = $this->_raw(
                 'POST',
                 $this->baseUrl . '/cbigr_api/candidatesPlus',
                 $body
@@ -360,7 +378,7 @@ class LorisApiClientAdapter implements LorisApiClientInterface
                 // Endpoint absent (server predates CandidatesPlus entirely), or
                 // transport failure. Fall through to legacy, once per run.
                 $this->candidatesPlusAvailable = false;
-                $this->warn(
+                $this->_warn(
                     'CandidatesPlus unavailable on this server - using the '
                     . 'legacy candidate-creation path for the rest of this run'
                 );
@@ -379,7 +397,7 @@ class LorisApiClientAdapter implements LorisApiClientInterface
                 $result = ['pscid' => $pscid, 'cand_id' => (string) $candId];
                 $this->resolved[$externalId] = $result;
 
-                $this->info(
+                $this->_info(
                     "Created via CandidatesPlus: CandID={$candId} PSCID={$pscid} "
                     . "ExtStudyID={$externalId} (relation linked atomically)"
                 );
@@ -393,7 +411,7 @@ class LorisApiClientAdapter implements LorisApiClientInterface
                 // through to legacy is safe. Two causes: the name genuinely is
                 // not in Project_external, or this build predates the
                 // accept-Project-name PR.
-                $this->warn(sprintf(
+                $this->_warn(sprintf(
                     "CandidatesPlus rejected ProjectExternalName '%s' as unknown "
                     . '(nothing was created). Either the name is not in '
                     . 'Project_external, or this server predates the '
@@ -436,9 +454,9 @@ class LorisApiClientAdapter implements LorisApiClientInterface
             ));
         }
 
-        $candId = $this->createCandidateLegacy($pscid, $sexValue, $dobValue);
+        $candId = $this->_createCandidateLegacy($pscid, $sexValue, $dobValue);
 
-        $this->appendExternalId($candId, $externalId, $this->projectExternalId);
+        $this->_appendExternalId($candId, $externalId, $this->projectExternalId);
 
         $result = ['pscid' => $pscid, 'cand_id' => $candId];
         $this->resolved[$externalId] = $result;
@@ -449,7 +467,7 @@ class LorisApiClientAdapter implements LorisApiClientInterface
     /**
      * POST /api/{version}/candidates. Legacy path only.
      */
-    private function createCandidateLegacy(
+    private function _createCandidateLegacy(
         string $pscid,
         string $sex,
         string $dob
@@ -468,15 +486,15 @@ class LorisApiClientAdapter implements LorisApiClientInterface
             'Sex'     => $sex,
         ]];
 
-        $response = $this->raw(
+        $response = $this->_raw(
             'POST',
             $this->baseUrl . '/api/' . $this->version . '/candidates',
             $body
         );
 
         if ($response['status'] === 409) {
-            $this->warn("PSCID={$pscid} already exists (409) - looking up CandID");
-            $existing = $this->lookupCandidateByPscid($pscid);
+            $this->_warn("PSCID={$pscid} already exists (409) - looking up CandID");
+            $existing = $this->_lookupCandidateByPscid($pscid);
 
             if ($existing !== null) {
                 return $existing;
@@ -502,7 +520,7 @@ class LorisApiClientAdapter implements LorisApiClientInterface
             );
         }
 
-        $this->info("Created via legacy: CandID={$candId} PSCID={$pscid}");
+        $this->_info("Created via legacy: CandID={$candId} PSCID={$pscid}");
 
         return (string) $candId;
     }
@@ -512,7 +530,7 @@ class LorisApiClientAdapter implements LorisApiClientInterface
      *
      * Multipart, not JSON - this is a form endpoint, not the REST API.
      */
-    private function appendExternalId(
+    private function _appendExternalId(
         string $candId,
         string $extStudyId,
         string $projectExternalId
@@ -524,7 +542,7 @@ class LorisApiClientAdapter implements LorisApiClientInterface
             'ExtStudyID' => $extStudyId,
         ];
 
-        $response = $this->raw(
+        $response = $this->_raw(
             'POST',
             $this->baseUrl . '/candidate_parameters/ajax/formHandler.php',
             $fields,
@@ -541,23 +559,71 @@ class LorisApiClientAdapter implements LorisApiClientInterface
             ));
         }
 
-        $this->info("ExternalID linked: {$extStudyId} -> CandID {$candId}");
+        $this->_info("ExternalID linked: {$extStudyId} -> CandID {$candId}");
     }
 
-    private function lookupCandidateByPscid(string $pscid): ?string
+    private function _lookupCandidateByPscid(string $pscid): ?string
     {
-        $response = $this->raw(
-            'GET',
-            $this->baseUrl . '/api/' . $this->version . '/candidates'
-        );
+        if (!isset($this->candidateIndex[$pscid])) {
+            // (Re)load when the PSCID is unknown: it may have been created
+            // since the list was last fetched.
+            $response = $this->_raw(
+                'GET',
+                $this->baseUrl . '/api/' . $this->version . '/candidates'
+            );
 
-        foreach ($response['body']['Candidates'] ?? [] as $candidate) {
-            if (($candidate['PSCID'] ?? '') === $pscid) {
-                return (string) ($candidate['CandID'] ?? '');
+            foreach ($response['body']['Candidates'] ?? [] as $candidate) {
+                if (isset($candidate['PSCID'], $candidate['CandID'])) {
+                    $this->candidateIndex[(string) $candidate['PSCID']]
+                        = (string) $candidate['CandID'];
+                }
             }
         }
 
-        return null;
+        return $this->candidateIndex[$pscid] ?? null;
+    }
+
+    /**
+     * {@inheritDoc}
+     */
+    public function demographicsDiffer(string $candId, ?string $dob, ?string $sex): array
+    {
+        if ($candId === '') {
+            return [];
+        }
+
+        $response = $this->_raw(
+            'GET',
+            $this->baseUrl . '/api/' . $this->version . '/candidates/' . rawurlencode($candId)
+        );
+        $meta = $response['body']['Meta'] ?? null;
+
+        if ($response['status'] !== 200 || !is_array($meta)) {
+            $this->_warn(sprintf(
+                'Could not read candidate %s to compare dob/sex (HTTP %d) - not compared',
+                $candId,
+                $response['status']
+            ));
+            return [];
+        }
+
+        $diff = [];
+
+        if ($dob !== null && trim($dob) !== '' && isset($meta['DoB']) && $meta['DoB'] !== '') {
+            $tsvDob = $this->_normaliseDate(trim($dob));
+            if ($tsvDob !== (string) $meta['DoB']) {
+                $diff[] = "dob {$tsvDob} in participants.tsv, {$meta['DoB']} in LORIS";
+            }
+        }
+
+        $tsvSex = $this->_normaliseSex($sex);
+        if ($tsvSex !== null && isset($meta['Sex']) && $meta['Sex'] !== ''
+            && strcasecmp($tsvSex, (string) $meta['Sex']) !== 0
+        ) {
+            $diff[] = "sex {$tsvSex} in participants.tsv, {$meta['Sex']} in LORIS";
+        }
+
+        return $diff;
     }
 
     // =========================================================================
@@ -581,11 +647,27 @@ class LorisApiClientAdapter implements LorisApiClientInterface
             );
         }
 
-        $response = $this->raw(
+        $response = $this->_raw(
             'GET',
             $this->baseUrl . '/api/' . $this->version . '/projects/'
             . rawurlencode($this->projectName)
         );
+
+        // A refusal is not "no visits": without this every study would be
+        // rejected as visit_not_configured and the site told to rename folders.
+        // 403 = no loris_api permission (CBIGR api override); 404 = no such
+        // project. The caller stops the project with this reason.
+        if ($response['status'] !== 200) {
+            throw new RuntimeException(sprintf(
+                "Cannot read the visits of project '%s': GET /projects/%s returned HTTP %d%s",
+                $this->projectName,
+                rawurlencode($this->projectName),
+                $response['status'],
+                $response['status'] === 403
+                    ? ' - the API user needs the loris_api permission'
+                    : ($response['status'] === 404 ? ' - no such project in LORIS (check candidate_defaults.project)' : '')
+            ));
+        }
 
         $labels = [];
         $visits = $response['body']['Visits'] ?? [];
@@ -605,13 +687,80 @@ class LorisApiClientAdapter implements LorisApiClientInterface
         $this->visitLabels = array_values(array_unique(array_filter($labels)));
 
         if (empty($this->visitLabels)) {
-            $this->warn(
+            $this->_warn(
                 "No visit labels returned for '{$this->projectName}' - every "
                 . 'study will be treated as visit_not_configured'
             );
         }
 
         return $this->visitLabels;
+    }
+
+    // -------------------------------------------------------------------------
+    //  Read-only lookups for validation (LORIS 26 API, v0.0.4-dev)
+    // -------------------------------------------------------------------------
+
+    /**
+     * Project names in LORIS. GET /api/{v}/projects -> {"Projects": {name: {...}}}.
+     *
+     * @return string[]
+     *
+     * @throws RuntimeException when LORIS does not answer.
+     */
+    public function getProjectNames(): array
+    {
+        $r = $this->_raw('GET', $this->baseUrl . '/api/' . $this->version . '/projects');
+        if ($r['status'] !== 200 || !is_array($r['body']['Projects'] ?? null)) {
+            throw new RuntimeException("GET /projects returned HTTP {$r['status']}");
+        }
+        return array_map('strval', array_keys($r['body']['Projects']));
+    }
+
+    /**
+     * Cohort titles of the resolved project. GET /api/{v}/projects/{name} ->
+     * "Cohorts" (API v0.0.4 and later; v0.0.3 has none).
+     *
+     * @return string[]|null Null when this API version does not list cohorts.
+     *
+     * @throws RuntimeException when the project is not set or LORIS does not answer.
+     */
+    public function getProjectCohorts(): ?array
+    {
+        if ($this->projectName === null) {
+            throw new RuntimeException('candidate_defaults.project must be set to read cohorts');
+        }
+        $r = $this->_raw(
+            'GET',
+            $this->baseUrl . '/api/' . $this->version . '/projects/' . rawurlencode($this->projectName)
+        );
+        if ($r['status'] !== 200 || !is_array($r['body'])) {
+            throw new RuntimeException("GET /projects/{$this->projectName} returned HTTP {$r['status']}");
+        }
+        if (!array_key_exists('Cohorts', $r['body'])) {
+            return null;
+        }
+        return array_values(array_map('strval', (array) $r['body']['Cohorts']));
+    }
+
+    /**
+     * Sites the API user can see. GET /api/{v}/sites ->
+     * {"Sites": [{"Name": ..., "Alias": ..., "MRI alias": ...}]}.
+     *
+     * @return array<int, array{Name: string, Alias: string}>
+     *
+     * @throws RuntimeException when LORIS does not answer.
+     */
+    public function getSites(): array
+    {
+        $r = $this->_raw('GET', $this->baseUrl . '/api/' . $this->version . '/sites');
+        if ($r['status'] !== 200 || !is_array($r['body']['Sites'] ?? null)) {
+            throw new RuntimeException("GET /sites returned HTTP {$r['status']}");
+        }
+        $sites = [];
+        foreach ($r['body']['Sites'] as $s) {
+            $sites[] = ['Name' => (string) ($s['Name'] ?? ''), 'Alias' => (string) ($s['Alias'] ?? '')];
+        }
+        return $sites;
     }
 
     /**
@@ -628,7 +777,7 @@ class LorisApiClientAdapter implements LorisApiClientInterface
         $url = $this->baseUrl . '/api/' . $this->version . '/candidates/'
             . rawurlencode($candId) . '/' . rawurlencode($visitLabel);
 
-        $existing = $this->raw('GET', $url);
+        $existing = $this->_raw('GET', $url);
 
         if ($existing['status'] >= 200 && $existing['status'] < 300) {
             $this->sessionsEnsured[$key] = true;
@@ -645,7 +794,7 @@ class LorisApiClientAdapter implements LorisApiClientInterface
             static fn ($v): bool => $v !== null && $v !== ''
         );
 
-        $response = $this->raw('PUT', $url, ['Meta' => $meta]);
+        $response = $this->_raw('PUT', $url, ['Meta' => $meta]);
 
         if ($response['status'] < 200 || $response['status'] >= 300) {
             throw new RuntimeException(sprintf(
@@ -659,14 +808,14 @@ class LorisApiClientAdapter implements LorisApiClientInterface
 
         $this->sessionsEnsured[$key] = true;
 
-        $this->info("Ensured session {$candId}/{$visitLabel}");
+        $this->_info("Ensured session {$candId}/{$visitLabel}");
     }
 
     // =========================================================================
     //  HTTP
     // =========================================================================
 
-    private function login(): string
+    private function _login(): string
     {
         if ($this->token !== null) {
             return $this->token;
@@ -680,7 +829,7 @@ class LorisApiClientAdapter implements LorisApiClientInterface
             }
         }
 
-        $response = $this->raw(
+        $response = $this->_raw(
             'POST',
             $this->baseUrl . '/api/' . $this->version . '/login',
             ['username' => $loris['username'], 'password' => $loris['password']],
@@ -707,7 +856,7 @@ class LorisApiClientAdapter implements LorisApiClientInterface
      *
      * @return array{status: int, body: mixed, raw: string}
      */
-    private function raw(
+    private function _raw(
         string $method,
         string $url,
                $payload = null,
@@ -717,7 +866,7 @@ class LorisApiClientAdapter implements LorisApiClientInterface
         $headers = ['Accept: application/json'];
 
         if ($authenticated) {
-            $headers[] = 'Authorization: Bearer ' . $this->login();
+            $headers[] = 'Authorization: Bearer ' . $this->_login();
         }
 
         $handle = curl_init();
@@ -761,7 +910,7 @@ class LorisApiClientAdapter implements LorisApiClientInterface
         if ($raw === false) {
             // status 0 signals a transport failure, which callers treat the
             // same as 404 for fallback purposes.
-            $this->warn("{$method} {$url} failed: {$error}");
+            $this->_warn("{$method} {$url} failed: {$error}");
             return ['status' => 0, 'body' => null, 'raw' => $error];
         }
 
@@ -783,18 +932,48 @@ class LorisApiClientAdapter implements LorisApiClientInterface
      * day kept, missing day/month -> 01, invalid left unchanged for the
      * DoB check in createCandidate().
      */
-    private function normaliseDate(string $value): string
+    private function _normaliseDate(string $value): string
     {
         return Dob::normalize($value, $this->dateOrder);
     }
 
-    private function normaliseSex(?string $sex): ?string
+    /** @var array<string, string> project.json sex_mappings (source => LORIS value). */
+    private array $sexMappings = [];
+
+    /** Per-project sex encodings, merged over the baseline - as clinical does. */
+    public function setSexMappings(array $mappings): void
+    {
+        $this->sexMappings = $mappings;
+    }
+
+    private function _normaliseSex(?string $sex): ?string
+    {
+        return self::normaliseSexValue($sex, $this->sexMappings);
+    }
+
+    /**
+     * Source sex value -> Male | Female | Other, or null when it cannot be
+     * mapped. Same baseline as before, plus project.json sex_mappings
+     * (e.g. {"1": "Male", "2": "Female"}) merged over it, case-insensitive.
+     * Shared with the pre-flight check so both judge a value the same way.
+     */
+    public static function normaliseSexValue(?string $sex, array $mappings = []): ?string
     {
         if ($sex === null || trim($sex) === '') {
             return null;
         }
 
-        return match (strtolower(trim($sex))) {
+        $key = strtolower(trim($sex));
+
+        foreach ($mappings as $from => $to) {
+            if (strtolower(trim((string) $from)) === $key
+                && in_array((string) $to, ['Male', 'Female', 'Other'], true)
+            ) {
+                return (string) $to;
+            }
+        }
+
+        return match ($key) {
             'm', 'male'                                                 => 'Male',
             'f', 'female'                                               => 'Female',
             'o', 'other', 'nb', 'non-binary', 'nonbinary',
@@ -803,14 +982,14 @@ class LorisApiClientAdapter implements LorisApiClientInterface
         };
     }
 
-    private function info(string $message): void
+    private function _info(string $message): void
     {
         if ($this->logger !== null) {
             $this->logger->info($message);
         }
     }
 
-    private function warn(string $message): void
+    private function _warn(string $message): void
     {
         if ($this->logger !== null) {
             $this->logger->warning($message);
@@ -820,7 +999,7 @@ class LorisApiClientAdapter implements LorisApiClientInterface
     /**
      * Trim a response body down to something safe to put in a log line.
      */
-    private function snippet(string $raw, int $limit = 200): string
+    private function _snippet(string $raw, int $limit = 200): string
     {
         $clean = trim(preg_replace('/\s+/', ' ', $raw) ?? '');
 

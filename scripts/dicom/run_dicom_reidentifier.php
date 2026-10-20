@@ -18,8 +18,8 @@
  * Dry run is the default; pass --confirm to write.
  *
  * Usage:
- *   php scripts/run_dicom_reidentifier.php --collection=archimedes --project=FDG-PET -v
- *   php scripts/run_dicom_reidentifier.php --collection=archimedes --project=FDG-PET --confirm
+ *   php scripts/dicom/run_dicom_reidentifier.php --collection=archimedes --project=FDG-PET -v
+ *   php scripts/dicom/run_dicom_reidentifier.php --collection=archimedes --project=FDG-PET --confirm
  *
  * PHP Version 8.1
  *
@@ -29,11 +29,12 @@
 
 declare(strict_types=1);
 
-require_once __DIR__ . '/../vendor/autoload.php';
+require_once __DIR__ . '/../../vendor/autoload.php';
 
-use LORIS\Pipelines\DicomHeaderWriter;
-use LORIS\Pipelines\DicomReidentifier;
-use LORIS\Pipelines\ParticipantsTsv;
+use LORIS\Pipelines\Shared\Cli;
+use LORIS\Pipelines\Dicom\DicomHeaderWriter;
+use LORIS\Pipelines\Dicom\DicomReidentifier;
+use LORIS\Pipelines\Shared\ParticipantsTsv;
 use Monolog\Handler\RotatingFileHandler;
 use Monolog\Handler\StreamHandler;
 use Monolog\Level;
@@ -43,7 +44,7 @@ const EXIT_OK      = 0;
 const EXIT_FAILURE = 1;
 const EXIT_USAGE   = 2;
 
-const DEFAULT_CONFIG = __DIR__ . '/../config/loris_client_config.json';
+const DEFAULT_CONFIG = __DIR__ . '/../../config/loris_client_config.json';
 
 /**
  * Print usage and exit.
@@ -53,7 +54,7 @@ function usage(int $code = EXIT_USAGE): void
     fwrite(
         $code === EXIT_OK ? STDOUT : STDERR,
         <<<TXT
-Usage: php scripts/run_dicom_reidentifier.php [options]
+Usage: php scripts/dicom/run_dicom_reidentifier.php [options]
 
 Maps ExternalIDs to PSCIDs, copies studies to deidentified-lorisid/imaging/
 and rewrites DICOM patient identity headers on the copy.
@@ -69,6 +70,8 @@ Execution:
   --confirm            Execute
   --dry-run            Report without changing anything (the default)
   --force              Reprocess studies already in the tracking file
+  --exclude-file=FILE  Studies to leave out (written by the bundle when the
+                       operator continues with the good studies only)
   --create-candidates  Create candidates this stage cannot resolve. Off by
                        default: run_dicom_participant_sync.php owns candidate
                        creation, because it sees the whole participants.tsv
@@ -156,7 +159,13 @@ function resolveTargets(array $config, array $options): array
                 continue;
             }
 
-            if (empty($project['enabled']) && $wantProject !== $projectName) {
+            if (!\LORIS\Pipelines\Dicom\DicomStudyOrganizer::acceptProject(
+                "{$collectionName}/{$projectName}",
+                $basePath . '/' . $projectName,
+                !empty($collection['enabled']) && !empty($project['enabled']),
+                $wantProject === $projectName
+                    || (empty($collection['enabled']) && $wantCollection === $collectionName)
+            )) {
                 continue;
             }
 
@@ -229,21 +238,24 @@ function confirmCommand(array $argv): string
 //  Arguments
 // -----------------------------------------------------------------------------
 
-$options = getopt(
-    'v',
-    [
-        'all',
-        'collection:',
-        'project:',
-        'confirm',
-        'dry-run',
-        'force',
-        'create-candidates',
-        'config:',
-        'verbose',
-        'help',
-    ]
-);
+$shortOpts = 'v';
+$longOpts  = [
+    'all',
+    'collection:',
+    'project:',
+    'confirm',
+    'dry-run',
+    'force',
+    'create-candidates',
+    'exclude-file:',
+    'config:',
+    'verbose',
+    'help',
+];
+$options = getopt($shortOpts, $longOpts);
+// getopt() ignores options it does not know; a typo or a removed option
+// must not run with the default instead.
+Cli::exitOnUnknownOptions($shortOpts, $longOpts);
 
 if ($options === false || isset($options['help'])) {
     usage(isset($options['help']) ? EXIT_OK : EXIT_USAGE);
@@ -363,8 +375,14 @@ foreach ($targets as $target) {
     $logger = buildLogger($projectPath, $verbose);
 
     try {
-        // TODO: replace with the project's LORIS API client adapter.
-        $api = new \Archimedes\Pipeline\LorisApiClientAdapter($config, $logger);
+        // Same setup as run_dicom_participant_sync.php: site and LORIS
+        // project name are needed for visit labels and new sessions.
+        $projectConfig ??= readJson($projectPath . '/project.json');
+
+        $api = new \LORIS\Endpoints\LorisApiClientAdapter($config, $logger);
+        $api->setSite($projectConfig['candidate_defaults']['site'] ?? null);
+        $api->resolveProject($projectConfig, $config);
+        $api->setSexMappings($projectConfig['sex_mappings'] ?? []);
 
         $reidentifier = new DicomReidentifier(
             $api,
@@ -375,18 +393,21 @@ foreach ($targets as $target) {
 
         $reidentifier->setDryRun(!$confirm);
         $reidentifier->setCreateCandidates($create);
+        $reidentifier->setForce($force);
+        $reidentifier->setExcluded(
+            \LORIS\Pipelines\Dicom\DicomPreflight::readExclusions($options['exclude-file'] ?? null)['study_uids']
+        );
 
         $reidentifier->mapFromManifest($manifestPath, $participants);
         $stats = $reidentifier->getStats();
 
         fwrite(STDERR, sprintf(
-            "  %d/%d mapped, %d matched, %d created, %d unlinked, %d phantom\n",
+            "  %d/%d mapped, %d matched, %d created, %d unlinked (not processed)\n",
             $stats['studies_mapped'],
             $stats['studies_total'],
             $stats['candidates_matched'],
             $stats['candidates_created'],
-            $stats['unlinked_studies'],
-            $stats['phantom_studies']
+            $stats['unlinked_studies']
         ));
 
         fwrite(STDERR, sprintf(

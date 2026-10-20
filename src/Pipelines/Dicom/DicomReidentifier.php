@@ -12,8 +12,8 @@
  * All LORIS interaction goes through LorisApiClientInterface - this class
  * never opens a database connection.
  *
- * Phantom studies skip candidate resolution entirely and are flagged for the
- * archiver, which attaches them to the scanner candidate instead.
+ * Unlinked studies (no matching participant or visit) are only reported:
+ * no candidate, no session, no copy, nothing to ingest.
  *
  * PHP Version 8.1
  *
@@ -21,60 +21,10 @@
  * @package  Archimedes
  */
 
-namespace LORIS\Pipelines;
+namespace LORIS\Pipelines\Dicom;
 
-/**
- * The LORIS operations this stage needs.
- *
- * Implement this as an adapter over the existing ARCHIMEDES API client rather
- * than changing that client to match.
- */
-interface LorisApiClientInterface
-{
-    /**
-     * Find a candidate by the site's own identifier.
-     *
-     * @param string $externalId Site identifier (the sub- value).
-     *
-     * @return array{pscid: string, cand_id: string}|null Null when not found.
-     */
-    public function findCandidateByExternalId(string $externalId): ?array;
-
-    /**
-     * Create a candidate.
-     *
-     * @param string      $pscid      PSCID to assign.
-     * @param string      $externalId Site identifier, stored as ExtStudyID.
-     * @param string|null $dob        Normalised to YYYY-MM-DD before sending
-     *                                (day kept if given, else 01).
-     * @param string|null $sex        Male, Female or Other.
-     *
-     * @return array{pscid: string, cand_id: string}
-     */
-    public function createCandidate(
-        string $pscid,
-        string $externalId,
-        ?string $dob,
-        ?string $sex
-    ): array;
-
-    /**
-     * Visit labels configured for the project.
-     *
-     * @return string[]
-     */
-    public function getConfiguredVisitLabels(): array;
-
-    /**
-     * Ensure a session exists for this candidate and visit.
-     *
-     * @param string $candId     CandID.
-     * @param string $visitLabel Visit label.
-     *
-     * @return void
-     */
-    public function ensureSession(string $candId, string $visitLabel): void;
-}
+use LORIS\Endpoints\LorisApiClientInterface;
+use LORIS\Pipelines\Shared\TrackingFile;
 
 class DicomReidentifier
 {
@@ -82,7 +32,8 @@ class DicomReidentifier
     const STUDY_SUBDIR = 'dicoms';
 
     /** Idempotency state, keyed on StudyInstanceUID. */
-    const TRACK_FILE = '.dicom_mapping_tracking.json';
+    const TRACK_FILE        = '.dicom_reidentify_tracking.json';
+    const LEGACY_TRACK_FILE = '.dicom_mapping_tracking.json';
 
     /** Handoff to the archiving stage. */
     const MANIFEST_FILE = 'dicom_studies_lorisid.json';
@@ -91,7 +42,7 @@ class DicomReidentifier
      * Per-study provenance sidecar, written next to each study directory as
      * <directory_name>.provenance.json.
      *
-     * The directory name carries an unlinked-/phantom- prefix and the manifest
+     * The manifest
      * records link_status, but both can be lost: directories get renamed, and
      * a manifest can be separated from the data it describes. The sidecar
      * travels with the study and states plainly whether reidentification
@@ -119,6 +70,9 @@ class DicomReidentifier
     /** @var bool */
     private $dryRun = false;
 
+    /** @var bool Remap every study, ignoring tracking. */
+    private $force = false;
+
     /**
      * Candidate creation belongs to run_dicom_participant_sync.php, which owns
      * participants.tsv and can report orphans across the whole delivery. This
@@ -142,7 +96,6 @@ class DicomReidentifier
         'studies_skipped'     => 0,
         'candidates_created'  => 0,
         'candidates_matched'  => 0,
-        'phantom_studies'     => 0,
         'unlinked_studies'    => 0,
         'studies_degraded'    => 0,
         'files_rewritten'     => 0,
@@ -171,12 +124,17 @@ class DicomReidentifier
      * Off by default. run_dicom_participant_sync.php is the owner: it sees the
      * whole participants.tsv, so it can report orphan directories and orphan
      * rows together, which this stage cannot - it only ever sees studies that
-     * organised successfully.
+     * organized successfully.
      *
      * @param bool $v Whether to create missing candidates.
      *
      * @return void
      */
+    public function setForce(bool $v): void
+    {
+        $this->force = $v;
+    }
+
     public function setCreateCandidates(bool $v): void
     {
         $this->createCandidates = $v;
@@ -241,6 +199,13 @@ class DicomReidentifier
 
         $tracking = $this->_readTracking();
         $output   = [];
+        $seen     = [];
+
+        // Studies the operator left out (issues reported): untouched this run,
+        // and not mistaken for studies removed from the delivery.
+        foreach ($this->excludedUids as $uid => $_) {
+            $seen[$uid] = true;
+        }
 
         foreach ($stage1['studies'] as $study) {
             $studyUid = $study['study_instance_uid'] ?? null;
@@ -250,18 +215,112 @@ class DicomReidentifier
                 continue;
             }
 
-            if (isset($tracking['studies'][$studyUid])) {
-                $this->_info("  Already mapped, skipping: {$studyUid}");
+            $tracked = $tracking['studies'][$studyUid] ?? null;
+            $seen[$studyUid] = true;
+
+            if (isset($this->excludedUids[$studyUid])) {
+                $this->_info("  {$studyUid}: excluded (issue reported) - no session, no reidentify this run");
                 $this->stats['studies_skipped']++;
-                $output[] = $tracking['studies'][$studyUid];
+                if ($tracked !== null) {
+                    $output[] = $tracked;
+                }
                 continue;
             }
 
+            // A study already reidentified to a LORIS candidate is not downgraded
+            // to unlinked because its participants.tsv row went missing: that
+            // is almost always an edit mistake, and re-archiving it unlinked
+            // would rewrite PatientName in LORIS while it stays in the visit.
+            // Keep the reidentified copy and say so; withdrawals are a LORIS-side
+            // deletion, never an automatic one.
+            // Never downgrade a reidentified study - not for a missing row, an
+            // unconfigured visit, and not with --force:
+            // re-archiving it would overwrite PatientName in LORIS with the
+            // site identifier while the study stays in its visit.
+            if ($tracked !== null
+                && ($tracked['link_status'] ?? null) === 'linked'
+                && ($study['link_status'] ?? null) === 'unlinked'
+            ) {
+                $this->_warn(sprintf(
+                    '%s: now %s (%s), but already reidentified to %s (%s) - kept as matched, '
+                    . 'not re-imported. Fix the delivery (e.g. restore the participants.tsv row), '
+                    . 'or remove the study in LORIS if it really must be unlinked.',
+                    $studyUid,
+                    $study['link_status'],
+                    $study['link_reason'] ?? 'declared',
+                    $tracked['loris_patient_name'] ?? ($tracked['cand_id'] ?? '?'),
+                    basename((string) ($tracked['directory'] ?? ''))
+                ));
+                $this->stats['studies_skipped']++;
+                $output[] = $tracked;
+                continue;
+            }
+
+            // An already reidentified study that moved to another participant
+            // or visit folder is not re-assigned automatically: that would move
+            // archived data between candidates or sessions in LORIS on the
+            // strength of a folder rename. Kept, warned; --force re-assigns.
+            if ($tracked !== null && !$this->force
+                && ($tracked['link_status'] ?? null) === 'linked'
+                && ($study['link_status'] ?? null) === 'linked'
+            ) {
+                $extWas   = $tracked['source_external_id'] ?? null;
+                $extNow   = $study['external_id'] ?? null;
+                $visitWas = $tracked['visit_label'] ?? null;
+                $visitNow = $this->_resolveVisitLabel($study['session'] ?? null);
+
+                if (($extWas !== null && $extNow !== $extWas)
+                    || ($visitWas !== null && $visitNow !== null && $visitNow !== $visitWas)
+                ) {
+                    $this->_warn(sprintf(
+                        '%s: moved in the delivery from %s/%s to %s/%s, but already reidentified as %s - '
+                        . 'kept, NOT moved in LORIS. Undo the move, or re-run with --force to re-assign it.',
+                        $studyUid,
+                        $extWas ?? '?',
+                        $visitWas ?? '?',
+                        $extNow ?? '?',
+                        $visitNow ?? '?',
+                        $tracked['loris_patient_name'] ?? basename((string) ($tracked['directory'] ?? ''))
+                    ));
+                    $this->stats['studies_skipped']++;
+                    $output[] = $tracked;
+                    continue;
+                }
+            }
+
+            $why     = $this->_remapReason($tracked, $study);
+
+            if ($why === null) {
+                $this->_info("  Already mapped, skipping: {$studyUid}");
+                $this->stats['studies_skipped']++;
+                $output[] = $tracked;
+                continue;
+            }
+
+            if ($tracked !== null) {
+                $this->_info("  Remapping {$studyUid}: {$why}");
+            }
+
+            // A remapped study may reuse its own folder: without this, new
+            // series in ARCHI0001_300001_V01_MR would land in ..._MR_2.
+            $this->ownDir = $tracked !== null
+                ? basename((string) ($tracked['directory'] ?? ''))
+                : null;
             $entry = $this->_mapStudy($study, $participantRows);
+            $this->ownDir = null;
 
             if ($entry === null) {
                 $this->stats['studies_skipped']++;
                 continue;
+            }
+
+            // The previous copy (e.g. unlinked-ARCHI0003_V01_MR, now
+            // ARCHI0003_300003_V01_MR) would otherwise stay in
+            // deidentified-lorisid/ and be imported again later.
+            if ($tracked !== null && !$this->dryRun
+                && ($tracked['directory'] ?? null) !== ($entry['directory'] ?? null)
+            ) {
+                $this->_removeStudyCopy($tracked);
             }
 
             $this->_writeProvenance($entry);
@@ -270,6 +329,26 @@ class DicomReidentifier
             $tracking['studies'][$studyUid] = $entry;
 
             if (!$this->dryRun) {
+                $this->_writeTracking($tracking);
+            }
+        }
+
+        // Reidentified before, gone from the organized manifest now: the study was
+        // removed from the delivery. Remove the working copy so it cannot be
+        // imported again, keep the tracking entry so a re-deposit is matched.
+        foreach ($tracking['studies'] ?? [] as $uid => $tracked) {
+            if (isset($seen[$uid]) || !empty($tracked['removed_at'])) {
+                continue;
+            }
+            $this->_warn(sprintf(
+                'REMOVED from delivery: %s (%s) - %s; LORIS is not changed',
+                $uid,
+                basename((string) ($tracked['directory'] ?? '?')),
+                $this->dryRun ? 'would remove reidentified copy' : 'reidentified copy removed'
+            ));
+            if (!$this->dryRun) {
+                $this->_removeStudyCopy($tracked);
+                $tracking['studies'][$uid]['removed_at'] = date('c');
                 $this->_writeTracking($tracking);
             }
         }
@@ -298,96 +377,53 @@ class DicomReidentifier
         $studyUid   = $study['study_instance_uid'];
         $subject    = $study['subject'] ?? null;
         $session    = $study['session'] ?? null;
-        $linkStatus = $study['link_status'] ?? (!empty($study['is_phantom']) ? 'phantom' : 'linked');
-        $isPhantom  = ($linkStatus === 'phantom');
+        $linkStatus = $study['link_status'] ?? 'linked';
         $isUnlinked = ($linkStatus === 'unlinked');
         $sourceDir  = $study['directory'] ?? null;
         $modalities = $study['modalities'] ?? [];
 
         if ($sourceDir === null || !is_dir($sourceDir)) {
+            // In a dry run, organize only previews: a new study has no
+            // processed/ folder yet. That is expected, not a failure.
+            if ($this->dryRun) {
+                $this->_info("  {$studyUid}: would reidentify once organized (dry run)");
+                return null;
+            }
             return $this->_reject($studyUid, "stage 1 directory missing: {$sourceDir}");
         }
 
         $this->_info("  {$studyUid}");
 
-        // --- Phantom or already unlinked: no candidate, no identity rewrite ---
-        if ($isPhantom || $isUnlinked) {
-            if ($isPhantom) {
-                $this->stats['phantom_studies']++;
-            } else {
-                $this->stats['unlinked_studies']++;
-            }
-
-            $dirName = $isPhantom
-                ? $this->_phantomDirName($subject, $session, $modalities)
-                : $this->_unlinkedDirName($subject, $session, $modalities);
-            $targetDir = $this->_studyRoot() . '/' . $dirName;
-
-            $this->_info(sprintf(
-                '    -> %s   [%s]',
-                $dirName,
-                $isPhantom ? 'phantom' : 'unlinked'
+        // --- Unlinked: no participant, so nothing to do ----------------------
+        // No candidate, no session, no reidentify, no copy - and so nothing for
+        // the import to ingest. Reported; it is picked up on the run after its
+        // participants.tsv row arrives.
+        if ($isUnlinked) {
+            $this->stats['unlinked_studies']++;
+            $this->_problem('warning', $studyUid, sprintf(
+                'UNLINKED %s: not synced, not reidentified, not ingested - %s',
+                $study['directory_name'] ?? $studyUid,
+                DicomPreflight::unlinkedAdvice($study['link_reason'] ?? null, $study['subject'] ?? null)
             ));
-
-            if (!$this->dryRun) {
-                $this->_copyTree($sourceDir, $targetDir);
-            }
-
-            $this->stats['studies_mapped']++;
-
-            return $this->_entry($study, $targetDir, $dirName, [
-                'link_status'         => $linkStatus,
-                'link_reason'         => $study['link_reason'] ?? ($isPhantom ? 'declared' : 'unknown'),
-                'is_phantom'          => $isPhantom,
-                'pscid'               => null,
-                'cand_id'             => null,
-                'visit_label'         => null,
-                'loris_patient_name'  => null,
-                'original_patient_name' => $study['patient_name'] ?? null,
-                'files_rewritten'     => 0,
-            ]);
+            return null;
         }
 
         // --- Visit must be configured -----------------------------------------
         $visitLabel = $this->_resolveVisitLabel($session);
 
         if ($visitLabel === null) {
-            $this->_problem('warning', $studyUid, sprintf(
-                "sub-%s: visit label '%s' is not configured - archiving UNLINKED",
+            // A participant study in a visit LORIS does not have: a mismatch,
+            // not an unlinked study. Rejected (the pre-flight in participant
+            // sync normally stops the run before this point).
+            return $this->_reject($studyUid, sprintf(
+                "sub-%s: visit label '%s' is not configured in LORIS - not processed",
                 $subject,
                 $session ?? '?'
             ));
-
-            $this->stats['unlinked_studies']++;
-            $this->stats['studies_degraded']++;
-
-            $dirName   = $this->_unlinkedDirName($subject, $session, $modalities);
-            $targetDir = $this->_studyRoot() . '/' . $dirName;
-
-            $this->_info("    -> {$dirName}   [unlinked: visit not configured]");
-
-            if (!$this->dryRun) {
-                $this->_copyTree($sourceDir, $targetDir);
-            }
-
-            $this->stats['studies_mapped']++;
-
-            return $this->_entry($study, $targetDir, $dirName, [
-                'link_status'           => 'unlinked',
-                'link_reason'           => 'visit_not_configured',
-                'is_phantom'            => false,
-                'pscid'                 => null,
-                'cand_id'               => null,
-                'visit_label'           => null,
-                'loris_patient_name'    => null,
-                'original_patient_name' => $study['patient_name'] ?? null,
-                'files_rewritten'       => 0,
-            ]);
         }
 
         // --- Candidate ---------------------------------------------------------
-        // external_id is set by stage 1: the sub- folder for a real subject,
-        // the header value for a phantom.
+        // external_id is set by stage 1: the sub- folder of the participant.
         $externalId = $study['external_id']
             ?? $study['patient_name']
             ?? $subject;
@@ -439,6 +475,16 @@ class DicomReidentifier
         $pscid  = $candidate['pscid'];
         $candId = $candidate['cand_id'];
 
+        // Without a CandID the name would be PSCID__Visit and no session could
+        // be created, so the import could never attach it to a visit.
+        if ($candId === '' || $candId === null) {
+            return $this->_reject(
+                $studyUid,
+                "no CandID resolved for {$externalId} (PSCID {$pscid}) - "
+                . 'cannot build PSCID_CandID_Visit or create the session'
+            );
+        }
+
         // --- Session -----------------------------------------------------------
         if (!$this->dryRun) {
             try {
@@ -486,7 +532,6 @@ class DicomReidentifier
         return $this->_entry($study, $targetDir, $dirName, [
             'link_status'           => 'linked',
             'link_reason'           => null,
-            'is_phantom'            => false,
             'pscid'                 => $pscid,
             'cand_id'               => $candId,
             'visit_label'           => $visitLabel,
@@ -525,35 +570,37 @@ class DicomReidentifier
         return null;
     }
 
+    /** @var array<string, true> StudyInstanceUIDs excluded by the operator. */
+    private array $excludedUids = [];
+
+    public function setExcluded(array $studyUids): void
+    {
+        $this->excludedUids = array_flip(array_map('strval', $studyUids));
+    }
+
+    /** @var string|null Folder of the study being remapped; free to reuse. */
+    private $ownDir = null;
+
     private function _lorisDirName(string $lorisName, array $modalities): string
     {
         $suffix = empty($modalities) ? 'NA' : implode('-', $modalities);
 
-        return $this->_unique($lorisName . '_' . $suffix);
+        return $this->_ownDirFor($lorisName)
+            ?? $this->_unique($lorisName . '_' . $suffix);
     }
 
-    private function _unlinkedDirName(?string $subject, ?string $session, array $modalities): string
+    /**
+     * The study's previous folder, when it differs from $base only in the
+     * modality suffix. Keeping it keeps the LORIS archive name, so
+     * import_dicom_study.py overwrites the archive in place instead of
+     * leaving the old DCM_..._CT-PT.tar behind when a series is added/removed.
+     */
+    private function _ownDirFor(string $prefix): ?string
     {
-        $suffix = empty($modalities) ? 'NA' : implode('-', $modalities);
-
-        return $this->_unique(sprintf(
-            'unlinked-%s_%s_%s',
-            $subject ?? 'unknown',
-            $session ?? 'nosession',
-            $suffix
-        ));
-    }
-
-    private function _phantomDirName(?string $subject, ?string $session, array $modalities): string
-    {
-        $suffix = empty($modalities) ? 'NA' : implode('-', $modalities);
-
-        return $this->_unique(sprintf(
-            'phantom-%s_%s_%s',
-            $subject ?? 'unknown',
-            $session ?? 'nosession',
-            $suffix
-        ));
+        return ($this->ownDir !== null && $this->ownDir !== ''
+            && str_starts_with($this->ownDir, $prefix . '_'))
+            ? $this->ownDir
+            : null;
     }
 
     /**
@@ -565,7 +612,7 @@ class DicomReidentifier
      */
     private function _unique(string $base): string
     {
-        if (!is_dir($this->_studyRoot() . '/' . $base)) {
+        if ($base === $this->ownDir || !is_dir($this->_studyRoot() . '/' . $base)) {
             return $base;
         }
 
@@ -575,6 +622,80 @@ class DicomReidentifier
         }
 
         return "{$base}_{$n}";
+    }
+
+    /**
+     * Why a tracked study must be mapped again, or null to skip it.
+     *
+     * Tracking used to be "seen this StudyInstanceUID, skip forever", which
+     * left a study unlinked after its subject was added to participants.tsv,
+     * and stale after organize re-wrote it with new series.
+     *
+     * @param array|null $tracked Previous mapping, if any.
+     * @param array      $study   Current stage 1 entry.
+     *
+     * @return string|null
+     */
+    private function _remapReason(?array $tracked, array $study): ?string
+    {
+        if ($tracked === null) {
+            return 'new';
+        }
+        if ($this->force) {
+            return '--force';
+        }
+
+        $linkNow    = $study['link_status'] ?? null;
+        $linkBefore = $tracked['source_link_status'] ?? $tracked['link_status'] ?? null;
+
+        if ($linkNow !== $linkBefore) {
+            return "link status {$linkBefore} -> {$linkNow}";
+        }
+
+        if (array_key_exists('source_external_id', $tracked)
+            && ($study['external_id'] ?? null) !== $tracked['source_external_id']
+        ) {
+            return 'external ID changed';
+        }
+
+        $hashNow = $study['content_hash'] ?? $study['manifest_hash'] ?? null;
+
+        // Entries written before source_hash existed are taken as current.
+        if (array_key_exists('source_hash', $tracked)
+            && $hashNow !== null
+            && $hashNow !== $tracked['source_hash']
+        ) {
+            return 'organized study changed';
+        }
+
+        if (!is_dir((string) ($tracked['directory'] ?? ''))) {
+            return 'copy missing';
+        }
+
+        return null;
+    }
+
+    /**
+     * Remove a previous copy and its provenance sidecar from the working area.
+     *
+     * @param array $tracked Previous mapping.
+     *
+     * @return void
+     */
+    private function _removeStudyCopy(array $tracked): void
+    {
+        $dir = realpath((string) ($tracked['directory'] ?? ''));
+
+        if ($dir === false || !$this->_deleteTree($dir)) {
+            return;
+        }
+
+        $sidecar = $dir . self::PROVENANCE_SUFFIX;
+        if (is_file($sidecar)) {
+            unlink($sidecar);
+        }
+
+        $this->_info('    removed previous copy ' . basename($dir));
     }
 
     private function _entry(array $study, string $targetDir, string $dirName, array $extra): array
@@ -590,6 +711,9 @@ class DicomReidentifier
                 'modalities'         => $study['modalities'] ?? [],
                 'series_count'       => $study['series_count'] ?? null,
                 'file_count'         => $study['file_count'] ?? null,
+                'source_link_status' => $study['link_status'] ?? null,
+                'source_external_id' => $study['external_id'] ?? null,
+                'source_hash'        => $study['content_hash'] ?? $study['manifest_hash'] ?? null,
                 'mapped_at'          => date('c'),
             ],
             $extra
@@ -610,6 +734,12 @@ class DicomReidentifier
      */
     private function _copyTree(string $source, string $target): void
     {
+        // Start from an empty target: a re-mapped study may have lost files
+        // since its last copy, and those must not linger and be archived.
+        if (is_dir($target)) {
+            $this->_deleteTree($target);
+        }
+
         if (!is_dir($target) && !@mkdir($target, 0775, true) && !is_dir($target)) {
             throw new \RuntimeException("Could not create {$target}");
         }
@@ -633,6 +763,33 @@ class DicomReidentifier
                 throw new \RuntimeException("Could not copy {$item->getPathname()}");
             }
         }
+    }
+
+    /**
+     * Recursively delete a directory, only inside this stage's study root.
+     *
+     * @param string $dir Directory to delete.
+     *
+     * @return bool True when deleted.
+     */
+    private function _deleteTree(string $dir): bool
+    {
+        $root = realpath($this->_studyRoot());
+        $dir  = realpath($dir);
+
+        if ($root === false || $dir === false || !str_starts_with($dir, $root . '/')) {
+            return false;
+        }
+
+        $it = new \RecursiveIteratorIterator(
+            new \RecursiveDirectoryIterator($dir, \FilesystemIterator::SKIP_DOTS),
+            \RecursiveIteratorIterator::CHILD_FIRST
+        );
+        foreach ($it as $file) {
+            $file->isDir() ? rmdir($file->getPathname()) : unlink($file->getPathname());
+        }
+
+        return rmdir($dir);
     }
 
     // =========================================================================
@@ -663,7 +820,10 @@ class DicomReidentifier
 
     private function _readTracking(): array
     {
-        $path = $this->targetDir . '/' . self::TRACK_FILE;
+        $path = TrackingFile::readPath(
+            $this->targetDir . '/' . self::TRACK_FILE,
+            $this->targetDir . '/' . self::LEGACY_TRACK_FILE
+        );
 
         if (!file_exists($path)) {
             return ['studies' => []];
@@ -682,6 +842,10 @@ class DicomReidentifier
     {
         $tracking['updated_at'] = date('c');
         $this->_atomicWriteJson($this->targetDir . '/' . self::TRACK_FILE, $tracking);
+        TrackingFile::retireLegacy(
+            $this->targetDir . '/' . self::TRACK_FILE,
+            $this->targetDir . '/' . self::LEGACY_TRACK_FILE
+        );
     }
 
     private function _writeManifest(array $manifest): void
@@ -720,11 +884,8 @@ class DicomReidentifier
         $summary = match ($status) {
             'linked'   => 'Reidentified: PatientName replaced with the LORIS '
                 . 'identifier, original preserved in OtherPatientNames.',
-            'phantom'  => 'NOT reidentified: declared phantom acquisition. '
-                . 'Headers are unchanged from the delivery.',
             default    => 'NOT reidentified: no participant link could be '
-                . 'resolved. Headers are unchanged from the delivery and this '
-                . 'study will archive with a NULL SessionID.',
+                . 'resolved. Headers are unchanged from the delivery; not ingested.',
         };
 
         $provenance = [
@@ -831,6 +992,11 @@ class DicomReidentifier
         } else {
             $this->logger->warning($message);
         }
+    }
+
+    private function _warn(string $message): void
+    {
+        $this->_problem('warning', null, $message);
     }
 
     private function _info(string $message): void

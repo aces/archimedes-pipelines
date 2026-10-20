@@ -1,7 +1,7 @@
 <?php
 
 /**
- * run_all_dicom_scripts_bundle.php
+ * run_dicom_bundle.php
  *
  * Bundle runner for the DICOM chain.
  *
@@ -20,16 +20,16 @@
  * only sequences them and decides the branch.
  *
  * Branching is driven by the manifest rather than by the presence of a file:
- * after organising, any study with link_status other than 'linked' would be
+ * after organizing, any study with link_status other than 'linked' would be
  * archived without a participant link. When there are any, the run stops and
  * asks before continuing.
  *
  * Dry run is the default. --confirm executes.
  *
  * Usage:
- *   php scripts/run_all_dicom_scripts_bundle.php --collection=archimedes --project=FDG-PET -v
- *   php scripts/run_all_dicom_scripts_bundle.php --collection=archimedes --project=FDG-PET --confirm
- *   php scripts/run_all_dicom_scripts_bundle.php --all --confirm --yes     # unattended
+ *   php scripts/dicom/run_dicom_bundle.php --collection=archimedes --project=FDG-PET -v
+ *   php scripts/dicom/run_dicom_bundle.php --collection=archimedes --project=FDG-PET --confirm
+ *   php scripts/dicom/run_dicom_bundle.php --all --confirm --yes     # unattended
  *
  * PHP Version 8.1
  *
@@ -39,14 +39,16 @@
 
 declare(strict_types=1);
 
-require_once __DIR__ . '/../vendor/autoload.php';
+require_once __DIR__ . '/../../vendor/autoload.php';
+
+use LORIS\Pipelines\Shared\Cli;
 
 const EXIT_OK       = 0;
 const EXIT_FAILURE  = 1;
 const EXIT_USAGE    = 2;
 const EXIT_ABORTED  = 3;
 
-const DEFAULT_CONFIG = __DIR__ . '/../config/loris_client_config.json';
+const DEFAULT_CONFIG = __DIR__ . '/../../config/loris_client_config.json';
 
 /**
  * Print usage and exit.
@@ -56,16 +58,17 @@ function usage(int $code = EXIT_USAGE): void
     fwrite(
         $code === EXIT_OK ? STDOUT : STDERR,
         <<<TXT
-Usage: php scripts/run_all_dicom_scripts_bundle.php [options]
+Usage: php scripts/dicom/run_dicom_bundle.php [options]
 
 Runs the full DICOM ingestion chain:
   1. run_dicom_organize.php          eviData audit (gate) + grouping
-  2. run_dicom_participant_sync.php  candidates       (skipped without participants.tsv)
-  3. run_dicom_reidentifier.php      LORIS IDs        (skipped without participants.tsv)
-  4. run_dicom_import.php            archive
+  2. run_dicom_participant_sync.php  candidates   (skipped when no study matches a participant)
+  3. run_dicom_reidentifier.php      sessions + PSCID_CandID_Visit reidentify
+  4. run_dicom_import.php            archive, from deidentified-lorisid/ only
 
-Stops at the first failing step. When any study would be archived without a
-participant link, stops and asks before running the import.
+Runs only enabled projects whose project.json lists the Imaging modality.
+If organize, sync or reidentify fails, NOTHING is ingested for that project.
+Without --confirm every step is a dry run.
 
 Selection:
   --all                Process all enabled collections & projects
@@ -75,20 +78,27 @@ Selection:
 Execution:
   --confirm            Execute
   --dry-run            Report without changing anything (the default)
-  --force              Pass --force to each step
-  --yes                Answer yes to the unlinked-studies prompt. Required
-                       when stdin is not a terminal.
-  --no-unlinked        Do not ingest unlinked studies at all; stop instead
-  --stop-after=STEP    organize | sync | reidentify  (skip later steps)
+  --force              Redo regardless of hashes (organize, reidentify, import)
+  --no-unlinked        Stop the project if any study has no participant
+                       (they are never ingested either way)
+  --continue-good      When data issues are found, continue with the good studies
+                       without asking (unattended runs). Without it the bundle
+                       lists every issue and asks; with no answer it aborts
+  --evidata            Run the EviData header check even if project.json
+                       has evidata.imaging.enabled false
+  --no-evidata         Skip the EviData check for this run
 
 Step selection:
   --steps=LIST         Run only these steps, comma separated
-                       (organize, sync, reidentify, import)
-  --skip=LIST          Run everything except these steps
-  --no-organize        Shorthand for --skip=organize
-  --no-sync            Shorthand for --skip=sync
-  --no-reidentify      Shorthand for --skip=reidentify
-  --no-import          Shorthand for --skip=import  (prepare only, no ingestion)
+                       (organize, sync, reidentify, import).
+                       --steps=organize,sync,reidentify prepares everything
+                       and ingests nothing
+  --skip=LIST          Run everything except these steps (--skip=import is
+                       the same as the --steps example above)
+
+Studies reidentified to a participant are imported with --session, attached to
+the visit the reidentifier created. Unlinked studies are never ingested.
+An option this script does not know is an error (exit 2), never ignored.
   --config=FILE        Config file (default: config/loris_client_config.json)
   -v, --verbose        Pass -v to each step
   --help               Show this message
@@ -160,7 +170,11 @@ function resolveTargets(array $config, array $options): array
 
         $collectionWanted = $matches($wantCollection, $collectionName);
 
-        if (empty($collection['enabled']) && !$collectionWanted) {
+        // Named explicitly only when --collection was given; matches() is also
+        // true when no name was given, which made --all include disabled ones.
+        $collectionNamed = $wantCollection !== null && $collectionWanted;
+
+        if (empty($collection['enabled']) && !$collectionNamed) {
             continue;
         }
 
@@ -183,7 +197,14 @@ function resolveTargets(array $config, array $options): array
                 continue;
             }
 
-            if (empty($project['enabled']) && !$projectWanted) {
+            $projectNamed = $wantProject !== null && $projectWanted;
+
+            if (!\LORIS\Pipelines\Dicom\DicomStudyOrganizer::acceptProject(
+                "{$collectionName}/{$projectName}",
+                $basePath . '/' . $projectName,
+                !empty($collection['enabled']) && !empty($project['enabled']),
+                $projectNamed || ($collectionNamed && empty($collection['enabled']))
+            )) {
                 continue;
             }
 
@@ -226,7 +247,7 @@ function masterLog(?string $path, string $line): void
  * proc_open rather than passthru so the output can go two places at once.
  * stderr is merged into stdout because the steps write progress there.
  *
- * @param string      $script    Basename in scripts/.
+ * @param string      $script    Basename in scripts/dicom/.
  * @param string[]    $args      Additional arguments.
  * @param string|null $logPath   Master log, or null to only stream.
  *
@@ -371,10 +392,135 @@ function runStep(string $script, array $args, ?string $logPath = null): int
  * Refuses to assume yes when stdin is not a terminal - an unattended run must
  * pass --yes explicitly rather than silently ingesting unlinked studies.
  */
+/**
+ * Stop a project before ingestion because a preparation step failed.
+ *
+ * Participant sync and reidentification are all-or-nothing gates: if any
+ * candidate could not be created/matched or any study could not be reidentified
+ * (or its session created), NOTHING is ingested for the project - not even the
+ * studies that did succeed. Ingesting a partial set would leave some of a
+ * participant's visits in LORIS and others not, and the run would look
+ * finished. Everything before the import is reversible, so re-running after the
+ * fix picks up exactly where this stopped.
+ *
+ * On --confirm runs the project's DICOM error recipients get a FAILED email,
+ * because the import step - which sends the usual summary - never runs.
+ */
+function stopBeforeIngestion(
+    string $label,
+    string $step,
+    string $projectPath,
+    array $config,
+    ?string $masterLogPath,
+    bool $confirm
+): void {
+    $message = "{$step} failed - INGESTION ABORTED for {$label}. Nothing was "
+        . 'sent to LORIS for this project, including the studies that did succeed. '
+        . 'Studies already in LORIS are unchanged. Fix the error above and re-run '
+        . 'the bundle; only what is still missing will be processed.';
+
+    fwrite(STDERR, "
+  STOP {$message}
+");
+    masterLog($masterLogPath, "STOP {$message}");
+
+    if (!$confirm) {
+        return;
+    }
+
+    $projectJson = $projectPath . '/project.json';
+    $project     = is_file($projectJson)
+        ? (json_decode((string) file_get_contents($projectJson), true) ?: [])
+        : [];
+    $notif = $project['notification_emails']['dicom']
+        ?? $config['notification_emails']['dicom']
+        ?? $config['notification_defaults']
+        ?? [];
+
+    if (!($notif['enabled'] ?? false)) {
+        return;
+    }
+
+    $to = $notif['on_error'] ?? $config['notification_defaults']['default_on_error'] ?? [];
+    $projectName = basename($projectPath);
+    $body = "Project: {$projectName} (dicom)\n"
+        . "Status:  FAILED - stopped before ingestion\n"
+        . "Step:    {$step}\n\n"
+        . "Nothing was ingested for this project in this run.\n"
+        . "Studies already in LORIS are unchanged. Fix the error and re-run.\n"
+        . ($masterLogPath ? "\nBundle log: {$masterLogPath}\n" : '');
+
+    $mailer = new \LORIS\Utils\Notification();
+    foreach ((array) $to as $address) {
+        $mailer->send($address, "FAILED: {$projectName} DICOM Import (stopped at {$step})", $body);
+    }
+}
+
+/**
+ * DATA ISSUES report: every issue, grouped by what it affects, and the good
+ * studies that could go ahead.
+ */
+function dataIssuesReport(array $plan, int $issueCount): string
+{
+    $out = sprintf("  DATA ISSUES - found before any candidate is created (%d):\n", $issueCount);
+
+    if (!empty($plan['abort'])) {
+        $out .= "    whole project (cannot continue):\n";
+        foreach ($plan['abort'] as $m) {
+            $out .= "      - {$m}\n";
+        }
+    }
+    foreach ($plan['bad'] as $what => $reasons) {
+        $out .= "    {$what}\n";
+        foreach ($reasons as $m) {
+            $out .= "      - {$m}\n";
+        }
+    }
+
+    $out .= sprintf(
+        "  GOOD: %d participant study/studies with no issue%s\n",
+        count($plan['good']),
+        empty($plan['good']) ? '' : ': ' . implode(', ', array_slice($plan['good'], 0, 12))
+            . (count($plan['good']) > 12 ? ' ...' : '')
+    );
+
+    return $out;
+}
+
+/**
+ * The UNLINKED report: every study with no participant, where it was
+ * delivered, why, and the exact commands to get it in.
+ */
+function unlinkedReport(string $manifestPath, array $target, string $configPath): string
+{
+    $manifest = is_file($manifestPath)
+        ? (json_decode((string) file_get_contents($manifestPath), true) ?: [])
+        : [];
+    $out = '';
+    $n   = 0;
+    foreach ($manifest['studies'] ?? [] as $s) {
+        if (($s['link_status'] ?? '') !== 'unlinked') {
+            continue;
+        }
+        $n++;
+        $where = ($s['subject'] ?? null) !== null
+            ? sprintf('sub-%s/ses-%s', $s['subject'], $s['session'] ?? '?')
+            : ($s['directory_name'] ?? '?');
+        $out .= sprintf("    %s  [%s]\n      %s\n",
+            $where,
+            implode('-', $s['modalities'] ?? []),
+            \LORIS\Pipelines\Dicom\DicomPreflight::unlinkedAdvice($s['link_reason'] ?? null, $s['subject'] ?? null)
+        );
+    }
+
+    return sprintf("  UNLINKED %d study/studies - no matching participant or session: not synced, not reidentified, NOT ingested:\n", $n)
+        . $out;
+}
+
 function confirmPrompt(string $question, bool $assumeYes): bool
 {
     if ($assumeYes) {
-        fwrite(STDERR, "{$question} [--yes given]\n");
+        fwrite(STDERR, "{$question} [yes - answered by command-line option]\n");
         return true;
     }
 
@@ -393,11 +539,11 @@ function confirmPrompt(string $question, bool $assumeYes): bool
 /**
  * Count studies by link status in a stage 0 manifest.
  *
- * @return array{total: int, linked: int, unlinked: int, phantom: int}
+ * @return array{total: int, linked: int, unlinked: int}
  */
 function manifestCounts(string $manifestPath): array
 {
-    $counts = ['total' => 0, 'linked' => 0, 'unlinked' => 0, 'phantom' => 0];
+    $counts = ['total' => 0, 'linked' => 0, 'unlinked' => 0];
 
     if (!file_exists($manifestPath)) {
         return $counts;
@@ -453,29 +599,28 @@ function confirmCommand(array $argv): string
 //  Arguments
 // -----------------------------------------------------------------------------
 
-$options = getopt(
-    'v',
-    [
-        'all',
-        'collection:',
-        'project:',
-        'confirm',
-        'dry-run',
-        'force',
-        'yes',
-        'no-unlinked',
-        'stop-after:',
-        'steps:',
-        'skip:',
-        'no-organize',
-        'no-sync',
-        'no-reidentify',
-        'no-import',
-        'config:',
-        'verbose',
-        'help',
-    ]
-);
+$shortOpts = 'v';
+$longOpts  = [
+    'all',
+    'collection:',
+    'project:',
+    'confirm',
+    'dry-run',
+    'force',
+    'no-unlinked',
+    'continue-good',
+    'evidata',
+    'no-evidata',
+    'steps:',
+    'skip:',
+    'config:',
+    'verbose',
+    'help',
+];
+$options = getopt($shortOpts, $longOpts);
+// getopt() ignores options it does not know; a typo or a removed option
+// must not run with the default instead.
+Cli::exitOnUnknownOptions($shortOpts, $longOpts);
 
 if ($options === false || isset($options['help'])) {
     usage(isset($options['help']) ? EXIT_OK : EXIT_USAGE);
@@ -496,16 +641,16 @@ if (isset($options['confirm']) && isset($options['dry-run'])) {
     fwrite(STDERR, "Both --confirm and --dry-run given - treating as dry run.\n\n");
 }
 $force      = isset($options['force']);
-$assumeYes  = isset($options['yes']);
 $noUnlinked = isset($options['no-unlinked']);
+$continueGood    = isset($options['continue-good']);
+$evidataFlag = isset($options['no-evidata']) ? ['--no-evidata']
+    : (isset($options['evidata']) ? ['--evidata'] : []);
 $verbose    = isset($options['v']) || isset($options['verbose']);
 $configPath = $options['config'] ?? DEFAULT_CONFIG;
-$stopAfter  = $options['stop-after'] ?? null;
 
 $allSteps = ['organize', 'sync', 'reidentify', 'import'];
 
-// Step selection: --steps is a whitelist, --skip and the --no-* shorthands
-// subtract. A step that is off is reported, not silently absent, so a run
+// Step selection: --steps is a whitelist, --skip subtracts. A step that is off is reported, not silently absent, so a run
 // that did less than expected says so.
 $enabledSteps = $allSteps;
 
@@ -534,12 +679,6 @@ if (isset($options['skip'])) {
     }
 }
 
-foreach (['organize', 'sync', 'reidentify', 'import'] as $step) {
-    if (isset($options['no-' . $step])) {
-        $skip[] = $step;
-    }
-}
-
 $enabledSteps = array_values(array_diff($enabledSteps, $skip));
 
 if (empty($enabledSteps)) {
@@ -553,13 +692,6 @@ if (empty($enabledSteps)) {
 $stepEnabled = static function (string $step) use ($enabledSteps): bool {
     return in_array($step, $enabledSteps, true);
 };
-
-$validStops = ['organize', 'sync', 'reidentify'];
-
-if ($stopAfter !== null && !in_array($stopAfter, $validStops, true)) {
-    fwrite(STDERR, "--stop-after must be one of: " . implode(', ', $validStops) . "\n\n");
-    usage();
-}
 
 try {
     $config = readJson($configPath);
@@ -654,6 +786,27 @@ $exitCode = EXIT_OK;
 foreach ($targets as $target) {
     $projectPath = $target['path'];
     $label       = "{$target['collection']}/{$target['project']}";
+    $projectStart = time();
+
+    // One bundle run per project at a time (released when the next project
+    // starts or the script exits).
+    $bundleLock = @fopen($projectPath . '/.dicom_bundle.lock', 'c');
+    if ($bundleLock === false || !flock($bundleLock, LOCK_EX | LOCK_NB)) {
+        fwrite(STDERR, "\n  SKIP {$label}: another bundle run is in progress for this project\n");
+        $exitCode = EXIT_FAILURE;
+        continue;
+    }
+
+    // A delivery still being uploaded is left alone - nothing is read, so a
+    // half-written participants.tsv cannot create wrong candidates.
+    $waitReason = \LORIS\Pipelines\Dicom\DicomStudyOrganizer::uploadInProgress(
+        $projectPath . '/deidentified-raw/imaging/dicoms',
+        (int) ($config['imaging']['delivery_quiet_minutes'] ?? 5)
+    );
+    if ($waitReason !== null && !$force) {
+        fwrite(STDERR, "\n  WAIT {$label}: {$waitReason}\n");
+        continue;
+    }
 
     fwrite(STDERR, "\n========================================\n");
     fwrite(STDERR, "  {$label}\n");
@@ -704,50 +857,145 @@ foreach ($targets as $target) {
     // than erroring - only add it where it is handled.
     $withForce = $force ? array_merge($common, ['--force']) : $common;
 
-    // --- Step 1: eviData audit + organise --------------------------------------
-    // The audit gate lives inside the organise runner and aborts there, so a
+    // --- Step 1: eviData audit + organize --------------------------------------
+    // The audit gate lives inside the organize runner and aborts there, so a
     // non-zero exit here already means "do not ingest this project".
     if (!$stepEnabled('organize')) {
         fwrite(STDERR, "  SKIP organize (disabled)\n");
         masterLog($masterLogPath, 'SKIP organize (disabled)');
         $code = EXIT_OK;
     } else {
-        $code = runStep('run_dicom_organize.php', $withForce, $masterLogPath);
+        // EviData is optional per modality (project.json evidata.imaging.enabled);
+        // --evidata / --no-evidata override it for this run only.
+        $code = runStep(
+            'run_dicom_organize.php',
+            array_merge($withForce, $evidataFlag),
+            $masterLogPath
+        );
     }
 
+    // Organize exits 1 both when it could not run at all (unreadable
+    // delivery, EviData gate, no participant_id column...) and when it ran
+    // and found data issues in some studies. Only a fresh manifest means the
+    // latter; those issues are reported with the rest below.
     if ($code !== EXIT_OK) {
-        fwrite(STDERR, "\n  STOP organise failed or was gated - skipping {$label}\n");
-        masterLog($masterLogPath, "STOP organise failed or was gated");
-        $exitCode = EXIT_FAILURE;
-        continue;
+        $orgManifest  = $projectPath . '/processed/imaging/dicom_studies.json';
+        $orgGenerated = is_file($orgManifest)
+            ? (strtotime((string) ((json_decode((string) file_get_contents($orgManifest), true) ?: [])['generated_at'] ?? '')) ?: 0)
+            : 0;
+        if ($orgGenerated < $projectStart - 1) {
+            stopBeforeIngestion($label, 'organize', $projectPath, $config, $masterLogPath, $confirm);
+            $exitCode = EXIT_FAILURE;
+            continue;
+        }
+        $exitCode = EXIT_FAILURE;   // issues were found; reported below
     }
 
-    if ($stopAfter === 'organize') {
-        fwrite(STDERR, "\n  stopped after organise as requested\n");
-        continue;
+    // --- Data issues: report all, then continue with the good ones or abort ---
+    // Every issue from organize and the pre-flight, before any candidate is
+    // created. Whole-project issues abort. Otherwise the operator chooses:
+    // continue with the good studies (the others are not created,
+    // reidentified or ingested this run), or abort until all data is good.
+    $exclusionFile = null;
+    $excludedLive  = $projectPath . '/processed/imaging/.dicom_excluded.json';
+
+    if ($stepEnabled('sync') || $stepEnabled('reidentify') || $stepEnabled('import')) {
+        $projectConfig = is_file($projectPath . '/project.json')
+            ? (json_decode((string) file_get_contents($projectPath . '/project.json'), true) ?: [])
+            : [];
+        $visitLabels = static function () use ($config, $projectConfig): array {
+            $api = new \LORIS\Endpoints\LorisApiClientAdapter($config);
+            $api->setSite($projectConfig['candidate_defaults']['site'] ?? null);
+            $api->resolveProject($projectConfig, $config);
+            return $api->getConfiguredVisitLabels();
+        };
+
+        $pre  = \LORIS\Pipelines\Dicom\DicomPreflight::check($projectPath, $projectConfig, $visitLabels);
+        $plan = \LORIS\Pipelines\Dicom\DicomPreflight::plan($projectPath, $pre['issues']);
+
+        if (empty($pre['issues'])) {
+            if ($confirm && is_file($excludedLive)) {
+                @unlink($excludedLive);
+            }
+        } else {
+            $report = dataIssuesReport($plan, count($pre['issues']));
+            fwrite(STDERR, "\n" . $report);
+            masterLog($masterLogPath, $report);
+
+            if (!empty($plan['abort'])) {
+                stopBeforeIngestion($label, 'data checks (whole-project issue)', $projectPath, $config, $masterLogPath, $confirm);
+                $exitCode = EXIT_FAILURE;
+                continue;
+            }
+            if (empty($plan['good'])) {
+                stopBeforeIngestion($label, 'data checks (no study without issues)', $projectPath, $config, $masterLogPath, $confirm);
+                $exitCode = EXIT_FAILURE;
+                continue;
+            }
+
+            $question = sprintf(
+                "\n  Continue with the %d good study/studies? The %d with issues are NOT created,\n"
+                . "  reidentified or ingested in this run; fix them and re-run to add them.",
+                count($plan['good']),
+                count($plan['exclude_uids'])
+            );
+
+            if (!$confirm) {
+                fwrite(STDERR, $question . " [dry run - not asked; the preview continues without them]\n");
+            } elseif (!confirmPrompt($question, $continueGood)) {
+                fwrite(STDERR, "\n  ABORTED - nothing created or ingested for {$label}. Fix the issues listed above\n"
+                    . "  and re-run (or answer yes / pass --continue-good to go ahead with the good studies).\n");
+                masterLog($masterLogPath, 'ABORTED by operator - data issues');
+                stopBeforeIngestion($label, 'data checks (operator chose not to continue)', $projectPath, $config, $masterLogPath, $confirm);
+                $exitCode = EXIT_ABORTED;
+                continue;
+            }
+
+            $exclusionFile = $confirm ? $excludedLive : (tempnam(sys_get_temp_dir(), 'dicom_excl_') ?: $excludedLive);
+            @mkdir(dirname($exclusionFile), 0775, true);
+            file_put_contents($exclusionFile, json_encode([
+                'generated_at' => date('c'),
+                'study_uids'   => $plan['exclude_uids'],
+                'subjects'     => $plan['exclude_subjects'],
+                'issues'       => $plan['bad'],
+            ], JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES));
+            masterLog($masterLogPath, sprintf(
+                'continuing with %d good study/studies, %d excluded (%s)',
+                count($plan['good']),
+                count($plan['exclude_uids']),
+                $continueGood ? '--continue-good' : 'operator confirmed'
+            ));
+        }
     }
+    $exArgs = $exclusionFile !== null ? ['--exclude-file=' . $exclusionFile] : [];
 
     // --- Branch on what the manifest says --------------------------------------
     $manifestPath = $projectPath . '/processed/imaging/dicom_studies.json';
     $counts       = manifestCounts($manifestPath);
 
     if ($counts['total'] === 0) {
-        fwrite(STDERR, "\n  no studies organised - nothing to ingest\n");
+        fwrite(STDERR, "\n  no studies organized - nothing to ingest\n");
         continue;
     }
 
     $countLine = sprintf(
-        '%d study/studies: %d linked, %d unlinked, %d phantom',
+        '%d study/studies: %d matched to a participant, %d unlinked (no matching participant or session)',
         $counts['total'],
         $counts['linked'],
-        $counts['unlinked'],
-        $counts['phantom']
+        $counts['unlinked']
     );
 
     fwrite(STDERR, "\n  {$countLine}\n");
     masterLog($masterLogPath, $countLine);
 
-    $unlinkedTotal = $counts['unlinked'] + $counts['phantom'];
+    // Unlinked studies (no participant) are never synced, reidentified or
+    // ingested - only reported.
+
+    if ($counts['unlinked'] > 0) {
+        $report = unlinkedReport($manifestPath, $target, $configPath);
+        fwrite(STDERR, "\n" . $report . "\n");
+        masterLog($masterLogPath, $report);
+    }
 
     // --- Steps 2 and 3: only meaningful when something is linked ----------------
     if ($counts['linked'] > 0) {
@@ -756,18 +1004,12 @@ foreach ($targets as $target) {
             masterLog($masterLogPath, 'SKIP sync (disabled)');
             $code = EXIT_OK;
         } else {
-            $code = runStep('run_dicom_participant_sync.php', $common, $masterLogPath);
+            $code = runStep('run_dicom_participant_sync.php', array_merge($common, $exArgs), $masterLogPath);
         }
 
         if ($code !== EXIT_OK) {
-            fwrite(STDERR, "\n  STOP participant sync failed - skipping {$label}\n");
-            masterLog($masterLogPath, "STOP participant sync failed");
+            stopBeforeIngestion($label, 'participant sync', $projectPath, $config, $masterLogPath, $confirm);
             $exitCode = EXIT_FAILURE;
-            continue;
-        }
-
-        if ($stopAfter === 'sync') {
-            fwrite(STDERR, "\n  stopped after sync as requested\n");
             continue;
         }
 
@@ -776,101 +1018,65 @@ foreach ($targets as $target) {
             masterLog($masterLogPath, 'SKIP reidentify (disabled)');
             $code = EXIT_OK;
         } else {
-            $code = runStep('run_dicom_reidentifier.php', $common, $masterLogPath);
+            $code = runStep('run_dicom_reidentifier.php', array_merge($withForce, $exArgs), $masterLogPath);
         }
 
         if ($code !== EXIT_OK) {
-            fwrite(STDERR, "\n  STOP reidentifier failed - skipping {$label}\n");
-            masterLog($masterLogPath, "STOP reidentifier failed");
+            stopBeforeIngestion($label, 'reidentification', $projectPath, $config, $masterLogPath, $confirm);
             $exitCode = EXIT_FAILURE;
             continue;
         }
     } else {
         // Nothing resolved to a participant - no participants.tsv, or an
-        // unorganised delivery, or no matching rows. Both middle steps have
+        // unorganized delivery, or no matching rows. Both middle steps have
         // nothing to act on, so they are skipped by name with the reason,
         // rather than one combined line that hides which ran.
-        $why = $counts['total'] === $counts['phantom']
-            ? 'all studies are phantoms'
-            : 'no linked studies (no participants.tsv, unorganised delivery, '
+        $why = 'no study matches a participant (no participants.tsv, unorganized delivery, '
             . 'or no matching rows)';
 
-        foreach (['participant sync', 'reidentifier'] as $step) {
-            fwrite(STDERR, "  SKIP {$step} - {$why}\n");
-            masterLog($masterLogPath, "SKIP {$step} - {$why}");
+        fwrite(STDERR, "  SKIP participant sync - {$why}\n");
+        masterLog($masterLogPath, "SKIP participant sync - {$why}");
+
+        // Reidentify still runs: it reports the unlinked studies and makes no
+        // LORIS call for them. Nothing unlinked is copied or ingested.
+        if (!$stepEnabled('reidentify')) {
+            fwrite(STDERR, "  SKIP reidentify (disabled)\n");
+            masterLog($masterLogPath, 'SKIP reidentify (disabled)');
+            $code = EXIT_OK;
+        } else {
+            $code = runStep('run_dicom_reidentifier.php', array_merge($withForce, $exArgs), $masterLogPath);
+        }
+
+        if ($code !== EXIT_OK) {
+            stopBeforeIngestion($label, 'reidentification', $projectPath, $config, $masterLogPath, $confirm);
+            $exitCode = EXIT_FAILURE;
+            continue;
         }
 
         fwrite(
             STDERR,
-            "       studies will be archived with no participant link\n"
+            "       unlinked studies are reported only - nothing is ingested for them\n"
         );
-    }
-
-    if ($stopAfter === 'reidentify') {
-        fwrite(STDERR, "\n  stopped after reidentify as requested\n");
-        continue;
     }
 
     // --- Reidentification gate, immediately before ingestion ----------------
     // Everything up to here is reversible: delete processed/ and
     // deidentified-lorisid/ and start again. The import is not. So the last
     // thing before it is an explicit statement of what was NOT reidentified.
-    if ($unlinkedTotal > 0) {
-        if ($noUnlinked) {
-            fwrite(STDERR, sprintf(
-                "\n  STOP %d study/studies were not reidentified and "
-                . "--no-unlinked was given\n",
-                $unlinkedTotal
-            ));
-            masterLog($masterLogPath, 'STOP not reidentified, --no-unlinked');
-            $exitCode = EXIT_FAILURE;
-            continue;
-        }
-
-        $question = sprintf(
-            "\n  NOT REIDENTIFIED: %d of %d study/studies\n"
-            . "    %d unlinked - no LORIS ID could be resolved\n"
-            . "    %d phantom  - no LORIS ID applies\n"
-            . "\n"
-            . "  Their DICOM headers are unchanged from the delivery: PatientName\n"
-            . "  still holds the site identifier, and they will archive with a\n"
-            . "  NULL SessionID, under no candidate.\n"
-            . "\n"
-            . "  Ingest them anyway, with no linked LORIS ID?",
-            $unlinkedTotal,
-            $counts['total'],
-            $counts['unlinked'],
-            $counts['phantom']
-        );
-
-        if (!$confirm) {
-            fwrite(STDERR, $question . " [dry run - not asked]\n");
-            masterLog($masterLogPath, 'reidentification prompt not asked (dry run)');
-        } elseif (!confirmPrompt($question, $assumeYes)) {
-            fwrite(
-                STDERR,
-                "\n  ABORTED - nothing ingested for {$label}. Add participants.tsv\n"
-                . "  rows for the unresolved subjects, re-run the chain, and the\n"
-                . "  studies will be reidentified instead.\n"
-            );
-            masterLog($masterLogPath, 'ABORTED by operator - not reidentified');
-            $exitCode = EXIT_ABORTED;
-            continue;
-        } else {
-            masterLog($masterLogPath, sprintf(
-                'ingesting %d non-reidentified study/studies (%s)',
-                $unlinkedTotal,
-                $assumeYes ? '--yes' : 'operator confirmed'
-            ));
-        }
+    if ($noUnlinked && $counts['unlinked'] > 0) {
+        fwrite(STDERR, sprintf(
+            "\n  STOP %d study/studies have no participant and --no-unlinked was given\n",
+            $counts['unlinked']
+        ));
+        masterLog($masterLogPath, 'STOP no participant, --no-unlinked');
+        $exitCode = EXIT_FAILURE;
+        continue;
     }
 
     // --- Step 4: the actual ingestion ----------------------------------------
-    // Relabelled studies live in deidentified-lorisid/, unlinked ones stay in
-    // processed/. Importing from the raw delivery would archive the original
-    // files with the site identifier still in PatientName, silently discarding
-    // the relabelling - so the source is chosen per group, and the importer is
-    // invoked once for each that has studies.
+    // Only reidentified studies are imported, from deidentified-lorisid/.
+    // Importing the raw delivery or processed/ would archive the original
+    // files with the site identifier still in PatientName.
     if (!$stepEnabled('import')) {
         fwrite(STDERR, "  SKIP import (disabled) - nothing ingested\n");
         masterLog($masterLogPath, 'SKIP import (disabled) - nothing ingested');
@@ -879,27 +1085,31 @@ foreach ($targets as $target) {
         continue;
     }
 
-    $sources = [];
+    // Import from ONE place. The reidentify step copies every matched study
+    // into deidentified-lorisid/, reidentified. Importing processed/ as well would archive each
+    // study a second time - and the importer's ALREADY_EXISTS auto-retry
+    // (--update --overwrite) would then replace the reidentified archive with
+    // the site-identifier copy. So processed/ is used only when reidentification
+    // has not produced output (this run or an earlier one).
+    $sources        = [];
+    $lorisidSubdir  = 'deidentified-lorisid/imaging/dicoms';
+    $lorisidManifest = $projectPath . '/deidentified-lorisid/imaging/dicom_studies_lorisid.json';
 
-    if ($counts['linked'] > 0 && $stepEnabled('reidentify')) {
-        $sources['deidentified-lorisid/imaging/dicoms'] = sprintf(
-            '%d relabelled',
-            $counts['linked']
-        );
+    // Ingest ONLY reidentified output. processed/ holds site identifiers and
+    // is never a source: importing it would overwrite reidentified archives.
+    if (is_file($lorisidManifest)) {
+        $sources[$lorisidSubdir] = sprintf('%d reidentified', $counts['linked']);
     } elseif ($counts['linked'] > 0) {
-        // Relabelling was skipped, so linked studies were never copied to
-        // deidentified-lorisid/ - they are still in processed/.
-        $sources['processed/imaging/dicoms'] = sprintf(
-            '%d linked (relabel skipped)',
-            $counts['linked']
+        stopBeforeIngestion(
+            $label,
+            'reidentification (no deidentified-lorisid/ output - run it before importing)',
+            $projectPath,
+            $config,
+            $masterLogPath,
+            $confirm
         );
-    }
-
-    if ($unlinkedTotal > 0) {
-        $key = 'processed/imaging/dicoms';
-        $sources[$key] = isset($sources[$key])
-            ? $sources[$key] . sprintf(' + %d unlinked/phantom', $unlinkedTotal)
-            : sprintf('%d unlinked/phantom', $unlinkedTotal);
+        $exitCode = EXIT_FAILURE;
+        continue;
     }
 
     if (empty($sources)) {
@@ -916,7 +1126,11 @@ foreach ($targets as $target) {
 
         $code = runStep(
             'run_dicom_import.php',
-            array_merge($withForce, ['--source-subdir=' . $subdir]),
+            array_merge(
+                $withForce,
+                ['--source-subdir=' . $subdir],
+                $exArgs
+            ),
             $masterLogPath
         );
 

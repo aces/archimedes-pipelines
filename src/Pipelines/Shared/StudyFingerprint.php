@@ -27,7 +27,7 @@
  *
  * Works on a list of files rather than a directory, because a study is
  * identified by StudyInstanceUID and its files may be spread across a
- * delivery tree before they are organised.
+ * delivery tree before they are organized.
  *
  * PHP Version 8.1
  *
@@ -36,7 +36,7 @@
 
 declare(strict_types=1);
 
-namespace LORIS\Pipelines;
+namespace LORIS\Pipelines\Shared;
 
 use RuntimeException;
 
@@ -179,9 +179,26 @@ class StudyFingerprint
     public static function deliveryHash(string $sourceDir): array
     {
         $files = self::listFiles($sourceDir);
+        $hash  = self::manifestHash($files, $sourceDir);
+
+        // participants.tsv and *_sessions.tsv decide linking, and an edit to
+        // them often keeps the size (a corrected date, Male/Other). They are
+        // tiny, so their bytes are hashed too; DICOMs stay size-only.
+        $tsv = [];
+        foreach ($files as $file) {
+            if (str_ends_with(strtolower($file), '.tsv') && is_file($file)) {
+                $tsv[] = substr($file, strlen(rtrim($sourceDir, '/')) + 1)
+                    . ':' . hash_file('sha256', $file);
+            }
+        }
+
+        if ($tsv !== []) {
+            sort($tsv);
+            $hash = hash('sha256', $hash . "\n" . implode("\n", $tsv));
+        }
 
         return [
-            'hash'       => self::manifestHash($files, $sourceDir),
+            'hash'       => $hash,
             'file_count' => count($files),
         ];
     }

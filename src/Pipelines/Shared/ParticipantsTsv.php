@@ -24,7 +24,7 @@
 
 declare(strict_types=1);
 
-namespace LORIS\Pipelines;
+namespace LORIS\Pipelines\Shared;
 
 use LORIS\Utils\Dob;
 use RuntimeException;
@@ -86,8 +86,8 @@ class ParticipantsTsv
         }
 
         $instance = new self($path);
-        $instance->read($path);
-        $instance->enrich($candidateDefaults, $projectConfig);
+        $instance->_read($path);
+        $instance->_enrich($candidateDefaults, $projectConfig);
 
         return $instance;
     }
@@ -99,7 +99,8 @@ class ParticipantsTsv
      * so BIDS and DICOM never read each other's file.
      *
      * @param string $projectPath Project root.
-     * @param string $modality    'bids' or 'dicom'.
+     * @param string $modality    'bids', 'dicom', or another modality's folder
+     *                            under deidentified-raw/ (e.g. 'png', 'imaging/pngs').
      *
      * @return string|null Absolute path, or null when absent.
      */
@@ -110,37 +111,47 @@ class ParticipantsTsv
         $path = match ($modality) {
             'bids'  => $root . '/deidentified-raw/bids/participants.tsv',
             'dicom' => $root . '/deidentified-raw/imaging/dicoms/participants.tsv',
-            default => throw new RuntimeException("Unknown modality: {$modality}"),
+            // Any other modality: its folder under deidentified-raw/, e.g.
+            // 'png' or 'imaging/pngs' -> deidentified-raw/imaging/pngs/participants.tsv.
+            default => preg_match('#^[A-Za-z0-9_-]+(/[A-Za-z0-9_-]+)*$#', $modality)
+                ? $root . '/deidentified-raw/' . $modality . '/participants.tsv'
+                : throw new RuntimeException("Unknown modality: {$modality}"),
         };
 
         return file_exists($path) ? $path : null;
     }
 
     /**
-     * Parse the file.
+     * Parse a participants.tsv into rows, without judging them. Shared by every
+     * modality (DICOM, BIDS, ...): tab-separated via fgetcsv (an empty first
+     * cell stays empty - no column shift), values trimmed, short rows padded
+     * and long rows cut to the header, blank lines skipped.
+     *
+     * @return array{
+     *     columns: string[],
+     *     rows: array<int, array{line: int, row: array<string, string>}>
+     * } columns is [] when the file has no header line.
+     *
+     * @throws RuntimeException when the file cannot be opened.
      */
-    private function read(string $path): void
+    public static function readRows(string $path): array
     {
-        $handle = fopen($path, 'r');
+        $handle = @fopen($path, 'r');
         if ($handle === false) {
             throw new RuntimeException("Could not open {$path}");
         }
 
         $header = fgetcsv($handle, 0, "\t");
-        if ($header === false) {
+        if ($header === false || $header === [null]) {
             fclose($handle);
-            throw new RuntimeException("participants.tsv is empty: {$path}");
+            return ['columns' => [], 'rows' => []];
         }
 
-        $this->columns = array_map('trim', $header);
-
-        if (!in_array('participant_id', $this->columns, true)) {
-            fclose($handle);
-            throw new RuntimeException(
-                "participants.tsv has no participant_id column: {$path}"
-            );
-        }
-
+        $columns = array_map(
+            static fn ($c) => trim((string) $c, " \t\n\r\0\x0B\xEF\xBB\xBF"),
+            $header
+        );
+        $rows   = [];
         $lineNo = 1;
 
         while (($line = fgetcsv($handle, 0, "\t")) !== false) {
@@ -150,18 +161,44 @@ class ParticipantsTsv
                 continue;
             }
 
-            $values = array_map('trim', $line);
+            $values = array_map(static fn ($v) => trim((string) $v), $line);
+            if (implode('', $values) === '') {
+                continue;   // only tabs/spaces
+            }
 
             // Tolerate short and long rows rather than failing the delivery;
             // sites export these from Excel and trailing tabs are common.
-            $values = array_pad(
-                array_slice($values, 0, count($this->columns)),
-                count($this->columns),
-                ''
-            );
+            $values = array_pad(array_slice($values, 0, count($columns)), count($columns), '');
 
-            $row = array_combine($this->columns, $values);
-            $id  = $row['participant_id'] ?? '';
+            $rows[] = ['line' => $lineNo, 'row' => array_combine($columns, $values)];
+        }
+
+        fclose($handle);
+
+        return ['columns' => $columns, 'rows' => $rows];
+    }
+
+    /**
+     * Parse the file (strict: used by load()).
+     */
+    private function _read(string $path): void
+    {
+        $parsed = self::readRows($path);
+
+        if ($parsed['columns'] === []) {
+            throw new RuntimeException("participants.tsv is empty: {$path}");
+        }
+
+        $this->columns = $parsed['columns'];
+
+        if (!in_array('participant_id', $this->columns, true)) {
+            throw new RuntimeException(
+                "participants.tsv has no participant_id column: {$path}"
+            );
+        }
+
+        foreach ($parsed['rows'] as ['line' => $lineNo, 'row' => $row]) {
+            $id = $row['participant_id'] ?? '';
 
             if ($id === '') {
                 continue;
@@ -176,8 +213,6 @@ class ParticipantsTsv
             $this->rows[$id] = $row;
         }
 
-        fclose($handle);
-
         if (empty($this->rows)) {
             throw new RuntimeException("No participant rows in {$path}");
         }
@@ -189,7 +224,7 @@ class ParticipantsTsv
      * external_id defaults to participant_id with the sub- prefix stripped,
      * which is what the submission guide tells sites their identifier is.
      */
-    private function enrich(array $candidateDefaults, array $projectConfig = []): void
+    private function _enrich(array $candidateDefaults, array $projectConfig = []): void
     {
         foreach (self::DEFAULT_MAP as $defaultKey => $column) {
             if (!isset($candidateDefaults[$defaultKey])) {

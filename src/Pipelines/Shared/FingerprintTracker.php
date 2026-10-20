@@ -29,7 +29,7 @@
 
 declare(strict_types=1);
 
-namespace LORIS\Pipelines;
+namespace LORIS\Pipelines\Shared;
 
 use RuntimeException;
 
@@ -55,6 +55,11 @@ class FingerprintTracker
     private ?object $logger;
 
     /**
+     * Pre-rename name of the tracking file, or null.
+     */
+    private ?string $legacyPath = null;
+
+    /**
      * Statuses whose stored fingerprint counts as authoritative.
      *
      * A failed run must not suppress the retry, so its entry - if any - is
@@ -65,15 +70,19 @@ class FingerprintTracker
     private array $successStatuses = ['success', 'already_exists'];
 
     /**
-     * @param string      $path   Tracking JSON path.
-     * @param object|null $logger Optional logger.
+     * @param string      $path       Tracking JSON path.
+     * @param object|null $logger     Optional logger.
+     * @param string|null $legacyPath Name the file had before; read while
+     *                                $path does not exist yet, removed after
+     *                                the first write to $path.
      */
-    public function __construct(string $path, ?object $logger = null)
+    public function __construct(string $path, ?object $logger = null, ?string $legacyPath = null)
     {
-        $this->path   = $path;
-        $this->logger = $logger;
+        $this->path       = $path;
+        $this->logger     = $logger;
+        $this->legacyPath = $legacyPath;
 
-        $this->load();
+        $this->_load();
     }
 
     /**
@@ -104,7 +113,7 @@ class FingerprintTracker
         $key = rtrim($dir, '/');
 
         if (!isset($this->fileCache[$key])) {
-            $this->fileCache[$key] = $this->excludeSelf(
+            $this->fileCache[$key] = $this->_excludeSelf(
                 StudyFingerprint::listFiles($key)
             );
         }
@@ -194,7 +203,7 @@ class FingerprintTracker
      *
      * @return string[]
      */
-    private function excludeSelf(array $files): array
+    private function _excludeSelf(array $files): array
     {
         $self = realpath($this->path);
 
@@ -213,7 +222,7 @@ class FingerprintTracker
         ));
 
         if (count($filtered) !== count($files)) {
-            $this->warn(
+            $this->_warn(
                 'Tracking file is inside the directory being hashed - excluding '
                 . 'it from the fingerprint. Consider moving it outside the tree.'
             );
@@ -252,7 +261,7 @@ class FingerprintTracker
             $previous = null;
         }
 
-        return StudyFingerprint::compare($previous, $this->excludeSelf($files), $rootPath);
+        return StudyFingerprint::compare($previous, $this->_excludeSelf($files), $rootPath);
     }
 
     /**
@@ -280,16 +289,16 @@ class FingerprintTracker
             return;
         }
 
-        $this->merge(
+        $this->_merge(
             $key,
             StudyFingerprint::toTracking(
                 $comparison,
-                $this->excludeSelf($files),
+                $this->_excludeSelf($files),
                 $rootPath
             )
         );
 
-        $this->save();
+        $this->_save();
     }
 
     // =========================================================================
@@ -320,10 +329,10 @@ class FingerprintTracker
         array $fields = [],
         ?array $comparison = null
     ): void {
-        $files      = $this->excludeSelf($files);
+        $files      = $this->_excludeSelf($files);
         $comparison ??= StudyFingerprint::compare(null, $files, $rootPath);
 
-        $this->merge(
+        $this->_merge(
             $key,
             array_merge(
                 ['timestamp' => date('c')],
@@ -332,7 +341,7 @@ class FingerprintTracker
             )
         );
 
-        $this->save();
+        $this->_save();
     }
 
     /**
@@ -365,7 +374,7 @@ class FingerprintTracker
             $this->entries[$key]['hashed_at']
         );
 
-        $this->save();
+        $this->_save();
     }
 
     // =========================================================================
@@ -399,21 +408,25 @@ class FingerprintTracker
     //  PERSISTENCE
     // =========================================================================
 
-    private function merge(string $key, array $fields): void
+    private function _merge(string $key, array $fields): void
     {
         $this->entries[$key] = array_merge($this->entries[$key] ?? [], $fields);
     }
 
-    private function load(): void
+    private function _load(): void
     {
-        if (!file_exists($this->path)) {
+        $path = $this->legacyPath === null
+            ? $this->path
+            : TrackingFile::readPath($this->path, $this->legacyPath);
+
+        if (!file_exists($path)) {
             return;
         }
 
-        $raw = @file_get_contents($this->path);
+        $raw = @file_get_contents($path);
 
         if ($raw === false) {
-            $this->warn("Cannot read tracking file: {$this->path}");
+            $this->_warn("Cannot read tracking file: {$path}");
             return;
         }
 
@@ -423,8 +436,8 @@ class FingerprintTracker
             // A corrupt tracking file must not stop a run. Treating it as empty
             // means the work is redone, which is safe; failing would block the
             // pipeline on a cache.
-            $this->warn(
-                "Malformed tracking file, treating as empty: {$this->path}"
+            $this->_warn(
+                "Malformed tracking file, treating as empty: {$path}"
             );
             return;
         }
@@ -436,12 +449,12 @@ class FingerprintTracker
      * Write via a temp file and rename, so a reader never sees a partial file
      * and an interrupted run cannot leave a truncated one.
      */
-    private function save(): void
+    private function _save(): void
     {
         $dir = dirname($this->path);
 
         if (!is_dir($dir) && !@mkdir($dir, 0775, true) && !is_dir($dir)) {
-            $this->warn("Cannot create tracking directory: {$dir}");
+            $this->_warn("Cannot create tracking directory: {$dir}");
             return;
         }
 
@@ -451,24 +464,29 @@ class FingerprintTracker
         );
 
         if ($json === false) {
-            $this->warn('Cannot encode tracking file: ' . json_last_error_msg());
+            $this->_warn('Cannot encode tracking file: ' . json_last_error_msg());
             return;
         }
 
         $tmp = $this->path . '.tmp.' . getmypid();
 
         if (@file_put_contents($tmp, $json) === false) {
-            $this->warn("Cannot write tracking file: {$tmp}");
+            $this->_warn("Cannot write tracking file: {$tmp}");
             return;
         }
 
         if (!@rename($tmp, $this->path)) {
             @unlink($tmp);
-            $this->warn("Cannot rename {$tmp} to {$this->path}");
+            $this->_warn("Cannot rename {$tmp} to {$this->path}");
+            return;
+        }
+
+        if ($this->legacyPath !== null) {
+            TrackingFile::retireLegacy($this->path, $this->legacyPath);
         }
     }
 
-    private function warn(string $message): void
+    private function _warn(string $message): void
     {
         if ($this->logger !== null) {
             $this->logger->warning($message);

@@ -2,12 +2,13 @@
 
 declare(strict_types=1);
 
-namespace LORIS\Pipelines;
+namespace LORIS\Pipelines\Bids;
 
 use Monolog\Logger;
 use Monolog\Handler\StreamHandler;
 use GuzzleHttp\Client as GuzzleClient;
 use LORIS\Utils\CleanLogFormatter;
+use LORIS\Pipelines\Shared\TrackingFile;
 
 /**
  * BIDS Reidentifier Pipeline
@@ -22,7 +23,7 @@ use LORIS\Utils\CleanLogFormatter;
  *     → pipeline scans stdout for this pattern
  *
  * Per-subject tracking + incremental reidentification:
- *   {projectPath}/processed/bids/.bids_reidentifier_processed.json records
+ *   {projectPath}/processed/bids/.bids_reidentify_tracking.json records
  *   every source sub-* folder that has been reidentified into the target.
  *   On each run:
  *     - If every source sub-* is already in tracking → skip the script entirely.
@@ -71,7 +72,8 @@ class BidsReidentifier
     private const UNMAPPED_PATTERN = '/ERROR: no mapping found for (sub-\S+)/i';
 
     /** Tracking file name — stored in {projectPath}/processed/bids/ */
-    private const TRACK_FILE = '.bids_reidentifier_processed.json';
+    private const TRACK_FILE        = '.bids_reidentify_tracking.json';
+    private const LEGACY_TRACK_FILE = '.bids_reidentifier_processed.json';
 
     private array $stats = [
         'subjects_found'    => 0,
@@ -350,7 +352,7 @@ class BidsReidentifier
     // =========================================================================
     //  PER-SUBJECT TRACKING
     //
-    //  processed/bids/.bids_reidentifier_processed.json keeps a record of
+    //  processed/bids/.bids_reidentify_tracking.json keeps a record of
     //  every source sub-* directory that has been successfully reidentified
     //  into the target. The structure:
     //
@@ -383,7 +385,8 @@ class BidsReidentifier
      */
     private function _loadTracking(string $projectPath): array
     {
-        $path = rtrim($projectPath, '/') . '/processed/bids/' . self::TRACK_FILE;
+        $dir  = rtrim($projectPath, '/') . '/processed/bids/';
+        $path = TrackingFile::readPath($dir . self::TRACK_FILE, $dir . self::LEGACY_TRACK_FILE);
         if (!file_exists($path)) {
             return ['subjects' => [], 'last_run' => null];
         }
@@ -406,10 +409,13 @@ class BidsReidentifier
             @mkdir($dir, 0755, true);
         }
         $path = "{$dir}/" . self::TRACK_FILE;
-        file_put_contents(
+        $ok   = file_put_contents(
             $path,
             json_encode($tracking, JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES)
         );
+        if ($ok !== false) {
+            TrackingFile::retireLegacy($path, "{$dir}/" . self::LEGACY_TRACK_FILE);
+        }
     }
 
     /**

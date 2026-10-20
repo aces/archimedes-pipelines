@@ -4,81 +4,69 @@
  * BIDS Reidentifier Runner
  *
  * Calls POST /cbigr_api/script/bidsreidentifier (async via SPM) and
- * polls until complete. Relabels sub-{ExtStudyID} → sub-{PSCID}.
- * Run AFTER run_bids_participant_sync.php, BEFORE run_imaging_pipeline.php.
+ * polls until complete. Reidentifies sub-{ExtStudyID} → sub-{PSCID}.
+ * Run AFTER run_bids_participant_sync.php, BEFORE run_bids_import.php.
+ *
+ * Dry run is the default; --confirm executes (same as the DICOM scripts).
  *
  * Usage:
- *   php scripts/run_bids_reidentifier.php [OPTIONS]
- *
- * Examples:
- *   php scripts/run_bids_reidentifier.php --all
- *   php scripts/run_bids_reidentifier.php --collection=archimedes --project=FDG-PET
- *   php scripts/run_bids_reidentifier.php --collection=archimedes --project=FDG-PET --dry-run
- *   php scripts/run_bids_reidentifier.php --collection=archimedes --project=FDG-PET --confirm
+ *   php scripts/bids/run_bids_reidentifier.php --collection=archimedes --project=FDG-PET            # dry run
+ *   php scripts/bids/run_bids_reidentifier.php --collection=archimedes --project=FDG-PET --confirm
+ *   php scripts/bids/run_bids_reidentifier.php --all --confirm -v
  */
 
 declare(strict_types=1);
 
-require_once __DIR__ . '/../vendor/autoload.php';
+require_once __DIR__ . '/../../vendor/autoload.php';
 
-use LORIS\Pipelines\BidsReidentifier;
+use LORIS\Pipelines\Shared\Cli;
+use LORIS\Pipelines\Bids\BidsReidentifier;
 
-// ── Parse CLI options (same pattern as run_clinical_pipeline.php) ─────────────
-$opts = getopt('', [
-    'collection::',
-    'project::',
-    'all::',
-    'dry-run::',
-    'verbose::',
-    'confirm::',
-    'force::',
-    'help::',
-]);
+// ── CLI options (same as the DICOM scripts) ──────────────────────────────────
+// Dry run unless --confirm. --dry-run wins over --confirm.
+$shortOpts = 'v';
+$longOpts  = [
+    'all',
+    'collection:',
+    'project:',
+    'confirm',
+    'dry-run',
+    'force',
+    'config:',
+    'verbose',
+    'help',
+];
+$opts = getopt($shortOpts, $longOpts);
+// getopt() ignores options it does not know; a typo or a removed option
+// must not run with the default instead.
+Cli::exitOnUnknownOptions($shortOpts, $longOpts);
+
+if ($opts === false) {
+    fwrite(STDERR, "Invalid options. Run with --help.\n");
+    exit(2);
+}
 
 if (isset($opts['help'])) {
-    echo <<<'HELP'
+    echo <<<HELP
+Usage: php scripts/bids/run_bids_reidentifier.php [options]
 
-BIDS Reidentifier
+Reidentifies the BIDS delivery with LORIS identifiers (PSCID/CandID) into deidentified-lorisid/bids/.
+Run after run_bids_participant_sync.php, before run_bids_import.php.
 
-Relabels BIDS data from ExtStudyIDs to LORIS PSCIDs via CBIGR Script API (async).
-Run AFTER run_bids_participant_sync.php, BEFORE run_imaging_pipeline.php.
+Selection:
+  --all                All enabled projects
+  --collection=NAME    All enabled projects in a collection
+  --project=NAME       One project (requires --collection)
 
-Usage:
-  php scripts/run_bids_reidentifier.php [OPTIONS]
+Execution:
+  --confirm            Execute (without it, nothing is changed)
+  --dry-run            Report only (the default)
+  --force              Re-process folders already reidentified
+  --config=FILE        Config file (default: config/loris_client_config.json)
+  -v, --verbose        Detailed output
+  --help               Show this message
 
-Options:
-  --collection=NAME    Process specific collection
-  --project=NAME       Process specific project (requires --collection)
-  --all                Process all enabled projects
-  --force              Overwrite existing target directory
-  --dry-run            Test mode (no changes)
-  --confirm            Skip confirmation prompt
-  --verbose            Debug output
-  --help               Show this help
-
-Project name resolution (in order):
-  1. project.json → candidate_defaults.project  (exact LORIS Project.Name)
-  2. project.json → loris_project_name
-  3. project.json → project_common_name
-  4. project.json → project_full_name
-  5. --project flag (overrides all above)
-
-Source/target directories resolved automatically:
-  source: <collections[].base_path>/<project>/deidentified-raw/bids/
-  target: <collections[].base_path>/<project>/deidentified-lorisid/bids/
-
-Examples:
-  # Dry run first (recommended)
-  php scripts/run_bids_reidentifier.php \
-      --collection=archimedes --project=FDG-PET --dry-run -v
-
-  # Run with confirmation
-  php scripts/run_bids_reidentifier.php \
-      --collection=archimedes --project=FDG-PET --confirm
-
-  # Force overwrite existing target
-  php scripts/run_bids_reidentifier.php \
-      --collection=archimedes --project=FDG-PET --force --confirm
+Exit codes: 0 success, 1 any failures, 2 usage error
 
 HELP;
     exit(0);
@@ -86,7 +74,7 @@ HELP;
 
 try {
     // Load configuration
-    $configFile = __DIR__ . '/../config/loris_client_config.json';
+    $configFile = $opts['config'] ?? __DIR__ . '/../../config/loris_client_config.json';
     if (!file_exists($configFile)) {
         throw new Exception("Configuration file not found: {$configFile}");
     }
@@ -102,20 +90,19 @@ try {
     }
     if (isset($opts['project'])) {
         if (!isset($opts['collection'])) {
-            throw new Exception("--project requires --collection");
+            fwrite(STDERR, "--project requires --collection\n");
+            exit(2);
         }
         $filters['project'] = $opts['project'];
     }
 
     if (!isset($opts['all']) && empty($filters)) {
-        echo "Error: Must specify --all, --collection, or --collection + --project\n";
-        echo "Run with --help for usage information\n";
-        exit(1);
+        fwrite(STDERR, "Specify --all or --collection=NAME (run with --help)\n");
+        exit(2);
     }
 
-    $dryRun  = isset($opts['dry-run']);
-    $verbose = isset($opts['verbose']);
-    $confirm = isset($opts['confirm']);
+    $dryRun  = !isset($opts['confirm']) || isset($opts['dry-run']);
+    $verbose = isset($opts['verbose']) || isset($opts['v']);
     $force   = isset($opts['force']);
 
     // Find projects
@@ -138,13 +125,10 @@ try {
     }
     echo str_repeat("─", 60) . "\n";
 
-    if (!$dryRun && !$confirm) {
-        echo "Proceed? [y/N] ";
-        $answer = trim(fgets(STDIN));
-        if (strtolower($answer) !== 'y') {
-            echo "Aborted.\n";
-            exit(0);
-        }
+    if ($dryRun) {
+
+        echo "DRY RUN - nothing will be changed. Pass --confirm to execute.\n";
+
     }
 
     // Run reidentifier for each project
@@ -198,6 +182,12 @@ try {
         }
     }
     echo str_repeat("═", 60) . "\n";
+
+    if ($dryRun) {
+        $cmd = array_values(array_filter($argv, static fn ($a) => $a !== '--dry-run'));
+        echo "\nDry run complete. Nothing was changed. To execute, run:\n\n  php "
+            . implode(' ', array_map('escapeshellarg', $cmd)) . " --confirm\n\n";
+    }
 
     exit(count($totalErrors) > 0 ? 1 : 0);
 
