@@ -24,6 +24,7 @@
 namespace LORIS\Pipelines\Dicom;
 
 use LORIS\Pipelines\Shared\SessionsTsv;
+use LORIS\Pipelines\Shared\SystemFiles;
 use LORIS\Pipelines\Shared\StudyFingerprint;
 
 class DicomStudyOrganizer
@@ -111,6 +112,9 @@ class DicomStudyOrganizer
 
     /** @var array<string, array> participant_id => row from participants.tsv */
     private $participants = [];
+
+    /** @var string[] OS metadata files skipped by the last scan (Shared\SystemFiles). */
+    private array $ignoredSystemFiles = [];
 
     /** @var string Delivery root of the current organize() call. */
     private string $sourceRoot = '';
@@ -405,7 +409,12 @@ class DicomStudyOrganizer
             count($this->participants)
         ));
 
+        $this->ignoredSystemFiles = [];
         $candidates = $this->_findDicomCandidates($sourceDir);
+        $skipped    = SystemFiles::summary($this->ignoredSystemFiles, $sourceDir);
+        if ($skipped !== null) {
+            $this->_problem('warning', null, $skipped);
+        }
         if (empty($candidates)) {
             throw new \RuntimeException("No candidate files found under {$sourceDir}");
         }
@@ -620,6 +629,13 @@ class DicomStudyOrganizer
             }
 
             $name = $fileInfo->getFilename();
+
+            // OS metadata (._* from a Mac, .DS_Store, Thumbs.db): never data.
+            // Skipped before any header read, reported once as a warning.
+            if (SystemFiles::isIgnored($fileInfo->getPathname())) {
+                $this->ignoredSystemFiles[] = $fileInfo->getPathname();
+                continue;
+            }
 
             // DICOMDIR is an index, not an image; it confuses the archiver.
             if (strtoupper($name) === 'DICOMDIR') {

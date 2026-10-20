@@ -51,6 +51,12 @@ class LorisApiClientAdapter implements LorisApiClientInterface
 
     private ?string $site = null;
 
+    /** candidate_defaults.cohort: the session cohort when the participant row has none. */
+    private ?string $defaultCohort = null;
+
+    /** @var string[] project.json "visits": the visits the project declares as configured. */
+    private array $declaredVisits = [];
+
     /** Exact LORIS Project.Name, e.g. "FDG PET". */
     private ?string $projectName = null;
 
@@ -82,7 +88,6 @@ class LorisApiClientAdapter implements LorisApiClientInterface
     private array $resolved = [];
 
     /** @var string[]|null */
-    private ?array $visitLabels = null;
 
     /** @var array<string, bool> */
     private array $sessionsEnsured = [];
@@ -138,6 +143,13 @@ class LorisApiClientAdapter implements LorisApiClientInterface
         if (!empty($defaults['project'])) {
             $this->projectName = (string) $defaults['project'];
         }
+        if (!empty($defaults['cohort'])) {
+            $this->defaultCohort = (string) $defaults['cohort'];
+        }
+        $this->declaredVisits = array_values(array_filter(array_map(
+            static fn ($v): string => trim((string) $v),
+            (array) ($projectConfig['visits'] ?? [])
+        )));
 
         // ProjectExternalName defaults to the LORIS project name, since in
         // practice they usually match, but is separately overridable.
@@ -631,69 +643,20 @@ class LorisApiClientAdapter implements LorisApiClientInterface
     // =========================================================================
 
     /**
-     * Visit labels configured for the project.
+     * Visit labels configured for the project: project.json "visits".
      *
-     * @return string[]
+     * Not read from LORIS on purpose: the LORIS 26 API (GET /projects/{name}
+     * "Visits", Utility::getVisitList) lists only visit labels that existing
+     * sessions use, so a configured visit no session uses yet - every visit of
+     * a new project - is missing from it. The project declares its visits
+     * instead; LORIS checks each visit against the participant's cohort when
+     * the session is created (PUT /candidates/{CandID}/{Visit}).
+     *
+     * @return string[] Empty when project.json declares no visits.
      */
     public function getConfiguredVisitLabels(): array
     {
-        if ($this->visitLabels !== null) {
-            return $this->visitLabels;
-        }
-
-        if ($this->projectName === null) {
-            throw new RuntimeException(
-                'candidate_defaults.project must be set to resolve visit labels'
-            );
-        }
-
-        $response = $this->_raw(
-            'GET',
-            $this->baseUrl . '/api/' . $this->version . '/projects/'
-            . rawurlencode($this->projectName)
-        );
-
-        // A refusal is not "no visits": without this every study would be
-        // rejected as visit_not_configured and the site told to rename folders.
-        // 403 = no loris_api permission (CBIGR api override); 404 = no such
-        // project. The caller stops the project with this reason.
-        if ($response['status'] !== 200) {
-            throw new RuntimeException(sprintf(
-                "Cannot read the visits of project '%s': GET /projects/%s returned HTTP %d%s",
-                $this->projectName,
-                rawurlencode($this->projectName),
-                $response['status'],
-                $response['status'] === 403
-                    ? ' - the API user needs the loris_api permission'
-                    : ($response['status'] === 404 ? ' - no such project in LORIS (check candidate_defaults.project)' : '')
-            ));
-        }
-
-        $labels = [];
-        $visits = $response['body']['Visits'] ?? [];
-
-        if (is_array($visits)) {
-            foreach ($visits as $key => $value) {
-                if (is_string($key) && !is_int($key)) {
-                    $labels[] = $key;
-                } elseif (is_string($value)) {
-                    $labels[] = $value;
-                } elseif (is_array($value) && isset($value['VisitLabel'])) {
-                    $labels[] = (string) $value['VisitLabel'];
-                }
-            }
-        }
-
-        $this->visitLabels = array_values(array_unique(array_filter($labels)));
-
-        if (empty($this->visitLabels)) {
-            $this->_warn(
-                "No visit labels returned for '{$this->projectName}' - every "
-                . 'study will be treated as visit_not_configured'
-            );
-        }
-
-        return $this->visitLabels;
+        return $this->declaredVisits;
     }
 
     // -------------------------------------------------------------------------
@@ -714,32 +677,6 @@ class LorisApiClientAdapter implements LorisApiClientInterface
             throw new RuntimeException("GET /projects returned HTTP {$r['status']}");
         }
         return array_map('strval', array_keys($r['body']['Projects']));
-    }
-
-    /**
-     * Cohort titles of the resolved project. GET /api/{v}/projects/{name} ->
-     * "Cohorts" (API v0.0.4 and later; v0.0.3 has none).
-     *
-     * @return string[]|null Null when this API version does not list cohorts.
-     *
-     * @throws RuntimeException when the project is not set or LORIS does not answer.
-     */
-    public function getProjectCohorts(): ?array
-    {
-        if ($this->projectName === null) {
-            throw new RuntimeException('candidate_defaults.project must be set to read cohorts');
-        }
-        $r = $this->_raw(
-            'GET',
-            $this->baseUrl . '/api/' . $this->version . '/projects/' . rawurlencode($this->projectName)
-        );
-        if ($r['status'] !== 200 || !is_array($r['body'])) {
-            throw new RuntimeException("GET /projects/{$this->projectName} returned HTTP {$r['status']}");
-        }
-        if (!array_key_exists('Cohorts', $r['body'])) {
-            return null;
-        }
-        return array_values(array_map('strval', (array) $r['body']['Cohorts']));
     }
 
     /**
@@ -765,8 +702,15 @@ class LorisApiClientAdapter implements LorisApiClientInterface
 
     /**
      * Ensure a session exists. Idempotent.
+     *
+     * LORIS 26 PUT /candidates/{CandID}/{Visit} takes CandID, Visit, Site,
+     * the cohort title and Project at the top level of the body - all five
+     * required. The cohort key depends on the API version: v0.0.4-dev requires
+     * "Cohort" (visit_0_0_4_dev.class.inc), v0.0.3 "Battery" (visit.class.inc).
+     * Both are sent with the same value; each version ignores the other key.
+     * 201 = created, 204 = an existing, not-started visit updated.
      */
-    public function ensureSession(string $candId, string $visitLabel): void
+    public function ensureSession(string $candId, string $visitLabel, ?string $cohort = null): void
     {
         $key = $candId . '|' . $visitLabel;
 
@@ -784,17 +728,27 @@ class LorisApiClientAdapter implements LorisApiClientInterface
             return;
         }
 
-        $meta = array_filter(
-            [
-                'CandID'  => $candId,
-                'Visit'   => $visitLabel,
-                'Site'    => $this->site,
-                'Project' => $this->projectName,
-            ],
-            static fn ($v): bool => $v !== null && $v !== ''
-        );
+        $cohort = ($cohort !== null && trim($cohort) !== '') ? trim($cohort) : $this->defaultCohort;
+        $body   = [
+            'CandID'  => $candId,
+            'Visit'   => $visitLabel,
+            'Site'    => (string) $this->site,
+            'Cohort'  => (string) $cohort,
+            'Project' => (string) $this->projectName,
+        ];
+        $empty = array_keys(array_filter($body, static fn ($v): bool => $v === ''));
+        $body['Battery'] = $body['Cohort'];
+        if ($empty !== []) {
+            throw new RuntimeException(sprintf(
+                'cannot create session %s/%s: no %s (cohort: participants.tsv cohort or '
+                . 'candidate_defaults.cohort; site and project: candidate_defaults)',
+                $candId,
+                $visitLabel,
+                implode(', ', array_map(static fn ($k) => $k === 'Cohort' ? 'cohort' : strtolower($k), $empty))
+            ));
+        }
 
-        $response = $this->_raw('PUT', $url, ['Meta' => $meta]);
+        $response = $this->_raw('PUT', $url, $body);
 
         if ($response['status'] < 200 || $response['status'] >= 300) {
             throw new RuntimeException(sprintf(
@@ -840,8 +794,16 @@ class LorisApiClientAdapter implements LorisApiClientInterface
         $token = $response['body']['token'] ?? null;
 
         if (!is_string($token) || $token === '') {
+            // HTTP 0 = no answer at all: say why (DNS, refused, SSL certificate ...).
+            $why = $response['status'] === 0
+                ? ' - connection failed: ' . trim((string) $response['raw'])
+                . (stripos((string) $response['raw'], 'certificate') !== false
+                || stripos((string) $response['raw'], 'SSL') !== false
+                    ? ' (self-signed certificate on a dev server? set "verify_ssl": false in loris_client_config.json)'
+                    : '')
+                : '';
             throw new RuntimeException(
-                'LORIS login did not return a token (HTTP ' . $response['status'] . ')'
+                'LORIS login did not return a token (HTTP ' . $response['status'] . ')' . $why
             );
         }
 
@@ -879,6 +841,14 @@ class LorisApiClientAdapter implements LorisApiClientInterface
             CURLOPT_CONNECTTIMEOUT => 10,
             CURLOPT_FOLLOWLOCATION => false,
         ];
+
+        // verify_ssl (top-level config, default true) - the same switch the
+        // clinical client and the DICOM import use. false only for a dev
+        // server with a self-signed certificate.
+        if (($this->config['verify_ssl'] ?? true) === false) {
+            $options[CURLOPT_SSL_VERIFYPEER] = false;
+            $options[CURLOPT_SSL_VERIFYHOST] = 0;
+        }
 
         if ($payload !== null) {
             if ($multipart) {

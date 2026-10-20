@@ -903,12 +903,10 @@ foreach ($targets as $target) {
         $projectConfig = is_file($projectPath . '/project.json')
             ? (json_decode((string) file_get_contents($projectPath . '/project.json'), true) ?: [])
             : [];
-        $visitLabels = static function () use ($config, $projectConfig): array {
-            $api = new \LORIS\Endpoints\LorisApiClientAdapter($config);
-            $api->setSite($projectConfig['candidate_defaults']['site'] ?? null);
-            $api->resolveProject($projectConfig, $config);
-            return $api->getConfiguredVisitLabels();
-        };
+        // project.json "visits" (the LORIS API cannot list configured visits)
+        $visitLabels = static fn (): array => array_values(array_filter(
+            array_map('strval', (array) ($projectConfig['visits'] ?? []))
+        ));
 
         $pre  = \LORIS\Pipelines\Dicom\DicomPreflight::check($projectPath, $projectConfig, $visitLabels);
         $plan = \LORIS\Pipelines\Dicom\DicomPreflight::plan($projectPath, $pre['issues']);
@@ -1099,6 +1097,17 @@ foreach ($targets as $target) {
     // is never a source: importing it would overwrite reidentified archives.
     if (is_file($lorisidManifest)) {
         $sources[$lorisidSubdir] = sprintf('%d reidentified', $counts['linked']);
+    } elseif ($counts['linked'] > 0 && !$confirm) {
+        // A dry run of reidentify writes nothing, so a delivery seen for the
+        // first time has no deidentified-lorisid/ yet. That is expected, not a
+        // failure: say what --confirm would ingest.
+        fwrite(STDERR, sprintf(
+            "\n  import (dry run): would ingest %d study/studies matched to a participant, each with its session,\n"
+            . "  once reidentify has written deidentified-lorisid/ (it does with --confirm)\n",
+            $counts['linked']
+        ));
+        masterLog($masterLogPath, "dry run: would ingest {$counts['linked']} matched study/studies");
+        continue;
     } elseif ($counts['linked'] > 0) {
         stopBeforeIngestion(
             $label,

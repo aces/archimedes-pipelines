@@ -105,7 +105,7 @@ class DicomReidentifier
         LorisApiClientInterface $api,
         DicomHeaderWriter $headerWriter,
         string $targetDir,
-        $logger = null
+                                $logger = null
     ) {
         $this->api          = $api;
         $this->headerWriter = $headerWriter;
@@ -438,7 +438,15 @@ class DicomReidentifier
         }
 
         if ($candidate === null) {
-            if (!$this->createCandidates) {
+            // Dry run of a first delivery: participant sync only previewed, so
+            // the candidate it will create with --confirm does not exist yet.
+            // Not an error when the participants.tsv row is there.
+            if ($this->dryRun && !$this->createCandidates
+                && isset($participantRows['sub-' . $subject])
+            ) {
+                $this->_info("    candidate for {$externalId} would be created by participant sync (dry run)");
+                $candidate = ['pscid' => 'PSCID-PENDING', 'cand_id' => 'CANDID-PENDING'];
+            } elseif (!$this->createCandidates) {
                 return $this->_reject(
                     $studyUid,
                     "no candidate for external ID '{$externalId}' - run "
@@ -488,7 +496,11 @@ class DicomReidentifier
         // --- Session -----------------------------------------------------------
         if (!$this->dryRun) {
             try {
-                $this->api->ensureSession($candId, $visitLabel);
+                $this->api->ensureSession(
+                    $candId,
+                    $visitLabel,
+                    $participantRows['sub-' . $subject]['cohort'] ?? null
+                );
             } catch (\Throwable $e) {
                 return $this->_reject(
                     $studyUid,
@@ -542,14 +554,15 @@ class DicomReidentifier
     }
 
     /**
-     * Match a session identifier against the configured visit labels.
+     * Match a session identifier against the known visit labels (used in LORIS or
+     * declared in project.json "visits"); an unknown one is returned as is.
      *
      * Compared case-insensitively, since site folder naming is inconsistent
      * and the configured label is authoritative for the returned value.
      *
      * @param string|null $session Session identifier from the folder name.
      *
-     * @return string|null The configured label, or null when unmatched.
+     * @return string|null The known label (LORIS spelling), the label as given, or null for none.
      */
     private function _resolveVisitLabel(?string $session): ?string
     {
@@ -567,7 +580,10 @@ class DicomReidentifier
             }
         }
 
-        return null;
+        // Not known (no session uses it yet, not in project.json "visits"):
+        // the folder's label as is. LORIS checks it against the project's
+        // cohort when the session is created and rejects the study if wrong.
+        return $session;
     }
 
     /** @var array<string, true> StudyInstanceUIDs excluded by the operator. */

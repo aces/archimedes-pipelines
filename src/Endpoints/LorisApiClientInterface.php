@@ -58,17 +58,19 @@ interface LorisApiClientInterface
      *
      * @return string[]
      */
-    public function getConfiguredVisitLabels(): array;
+    public function getConfiguredVisitLabels(): array;   // project.json "visits" (the LORIS API cannot list configured visits)
 
     /**
      * Ensure a session exists for this candidate and visit.
      *
-     * @param string $candId     CandID.
-     * @param string $visitLabel Visit label.
+     * @param string      $candId     CandID.
+     * @param string      $visitLabel Visit label.
+     * @param string|null $cohort     Cohort title (LORIS visit "Cohort"); null =
+     *                                project.json candidate_defaults.cohort.
      *
      * @return void
      */
-    public function ensureSession(string $candId, string $visitLabel): void;
+    public function ensureSession(string $candId, string $visitLabel, ?string $cohort = null): void;
 
     /**
      * Where participants.tsv dob / sex differ from the candidate in LORIS.

@@ -9,14 +9,14 @@
  *
  * Read-only. Nothing in the upload, processed/, deidentified-lorisid/ or LORIS is
  * created or changed: the organizer runs as a dry run into a working folder under
- * logs/dicom/ (removed afterwards), and LORIS is only read (projects, visits,
- * cohorts, sites). The one file kept is the report, in logs/dicom/.
+ * logs/dicom/ (removed afterwards), and LORIS is only read (projects, sites,
+ * candidates). The one file kept is the report, in logs/dicom/.
  *
  * What is checked, by guide section:
  *   1 Folder structure  participants.tsv at the top; sub-<ID>/ses-<visit>/;
  *                       files or folders outside that shape
  *   2 Naming            identifiers and visit labels letters/digits only;
- *                       visits configured in LORIS for the project
+ *                       visits listed in project.json "visits" (when declared)
  *   3 Spreadsheets      tab-separated (not CSV / .xlsx); required columns;
  *                       participant_id matches the folders; sex / dob values;
  *                       sub-<ID>/sessions.tsv (or sub-<ID>_sessions.tsv) with session_id = the ses- folders;
@@ -26,7 +26,7 @@
  *                       free-text / identifying fields populated
  *   5 Examinations      unreadable files, a study in two folders, conflicting
  *                       or duplicate files (same checks as the real run)
- *   LORIS values        candidate_defaults / participants.tsv project, cohort and
+ *   LORIS values        candidate_defaults / participants.tsv project and
  *                       site exist in LORIS (LORIS 26 API v0.0.4-dev); for a
  *                       participant already in LORIS, participants.tsv dob / sex
  *                       still match the candidate
@@ -55,6 +55,7 @@ use LORIS\Pipelines\Dicom\DicomStudyOrganizer;
 use LORIS\Endpoints\LorisApiClientAdapter;
 use LORIS\Pipelines\Shared\ParticipantsTsv;
 use LORIS\Pipelines\Shared\ParticipantSync;
+use LORIS\Pipelines\Shared\ParticipantsCheck;
 use LORIS\Pipelines\Shared\SessionsTsv;
 use LORIS\Utils\Dob;
 use Monolog\Handler\StreamHandler;
@@ -109,7 +110,7 @@ Selection:
   --project=NAME       One project (requires --collection)
 
 Options:
-  --offline            Do not contact LORIS (project, visits, cohorts and sites
+  --offline            Do not contact LORIS (project and sites
                        are then not checked)
   --report=FILE        Write the report here (default, per project:
                        <project>/logs/dicom/dicom_validation_<date>.txt)
@@ -177,7 +178,7 @@ function resolveTargets(array $config, array $options): array
                 $basePath . '/' . $projectName,
                 !empty($collection['enabled']) && !empty($project['enabled']),
                 $wantProject === $projectName
-                    || (empty($collection['enabled']) && $wantCollection === $collectionName)
+                || (empty($collection['enabled']) && $wantCollection === $collectionName)
             )) {
                 continue;
             }
@@ -250,7 +251,7 @@ function patientNameFix(string $msg, array $tsvIds): string
 final class Findings
 {
     /** @var array<string, array<int, array{area: string, where: string, what: string, fix: string}>> */
-    public array $items = ['fix' => [], 'unlinked' => [], 'check' => [], 'nocheck' => []];
+    public array $items = ['fix' => [], 'unlinked' => [], 'check' => [], 'nocheck' => [], 'note' => []];
 
     public function fix(string $area, string $where, string $what, string $fix = ''): void
     {
@@ -265,6 +266,12 @@ final class Findings
     public function check(string $area, string $where, string $what, string $fix = ''): void
     {
         $this->add('check', $area, $where, $what, $fix);
+    }
+
+    /** Reported for information only: fine as it is, no action needed. */
+    public function note(string $area, string $where, string $what, string $fix = ''): void
+    {
+        $this->add('note', $area, $where, $what, $fix);
     }
 
     /** A check that could not run (LORIS unreachable / refused, validator error). */
@@ -395,9 +402,9 @@ function checkStructure(
         if (preg_match('/^participants\.(csv|xlsx?|txt)$/i', $name)) {
             is_file($tsv)
                 ? $f->check('participants.tsv', $name, 'extra participants file next to participants.tsv - only participants.tsv is read',
-                    'remove it to avoid confusion')
+                'remove it to avoid confusion')
                 : $f->fix('participants.tsv', $name, 'participants file has the wrong name or format',
-                    'save it as participants.tsv, tab-separated (guide section 3)');
+                'save it as participants.tsv, tab-separated (guide section 3)');
             continue;
         }
         $outsideRoots[] = pathinfo($name, PATHINFO_FILENAME);
@@ -705,7 +712,8 @@ function lorisHint(string $msg): string
 }
 
 /**
- * LORIS values: project, cohort, site (LORIS 26 API v0.0.4-dev).
+ * LORIS values: project, site (LORIS 26 API v0.0.4-dev); cohort and visits are checked by LORIS
+ * when the session is created.
  */
 function checkLorisValues(LorisApiClientAdapter $api, array $projectConfig, ?ParticipantsTsv $roster, Findings $f): void
 {
@@ -738,25 +746,10 @@ function checkLorisValues(LorisApiClientAdapter $api, array $projectConfig, ?Par
             lorisHint($e->getMessage()));
     }
 
-    // cohort
-    if (!empty($values['cohort'])) {
-        try {
-            $cohorts = $api->getProjectCohorts();
-            if ($cohorts === null) {
-                $f->check('LORIS', 'cohorts', 'this LORIS API version does not list cohorts - cohort values not checked');
-            } else {
-                foreach ($values['cohort'] as $v => $from) {
-                    if (!in_array($v, $cohorts, true)) {
-                        $f->fix('LORIS', $from, "cohort '{$v}' is not a cohort of project '" . $api->getProjectName() . "' in LORIS",
-                            'use one of: ' . ($cohorts ? implode(', ', $cohorts) : '(none configured)'));
-                    }
-                }
-            }
-        } catch (Throwable $e) {
-            $f->nocheck('LORIS', 'cohorts', 'cannot read the project cohorts: ' . $e->getMessage(),
-                lorisHint($e->getMessage()));
-        }
-    }
+    // cohort: not checked here. The only API call that lists a project's
+    // cohorts (GET /projects/{name}) also returns every instrument; LORIS
+    // checks the cohort when the session is created, and the run stops there
+    // if it is wrong.
 
     // participants already in LORIS: participants.tsv must still agree
     // (an edited dob / sex is not applied to LORIS by the ingestion)
@@ -784,8 +777,7 @@ function checkLorisValues(LorisApiClientAdapter $api, array $projectConfig, ?Par
 
     // site
     if (empty($values['site'])) {
-        $f->fix('participants.tsv', 'participants.tsv', 'no site: not in participants.tsv and no candidate_defaults.site',
-            'add candidate_defaults.site to project.json, or a site column');
+        // no site anywhere: reported once, by the pre-flight (ParticipantsCheck::columnSources)
     } else {
         try {
             $sites = $api->getSites();
@@ -884,6 +876,7 @@ function renderReport(string $label, string $dicomDir, Findings $f, array $studi
     $section('NOT INGESTED - cannot be matched to a participant or visit', $n['unlinked']);
     $section('PLEASE CHECK', $n['check']);
     $section('COULD NOT CHECK - for the ARCHIMEDES team, not the site', $n['nocheck']);
+    $section('FROM project.json - OK, no action needed', $n['note']);
 
     $out[] = '';
     $out[] = 'EXAMINATIONS';
@@ -1128,8 +1121,11 @@ function validateUpload(
     }
 
     // --- LORIS: reachable? (a refusal is "could not check", not the site's data) ----
-    $visitFn      = null;
-    $lorisProject = null;
+    // Visits come from project.json "visits" (the LORIS API cannot list the
+    // configured ones), so they are checked online and --offline alike.
+    $declaredVisits = array_values(array_filter(array_map('strval', (array) ($projectConfig['visits'] ?? []))));
+    $visitFn        = static fn (): array => $declaredVisits;
+    $lorisProject   = null;
     if (!$offline) {
         try {
             $api = new LorisApiClientAdapter($checkConfig, $logger);
@@ -1137,20 +1133,15 @@ function validateUpload(
             $api->setSexMappings($projectConfig['sex_mappings'] ?? []);
             $projects     = $api->getProjectNames();
             $lorisProject = $api->getProjectName();
-            if ($lorisProject !== null && in_array($lorisProject, $projects, true)) {
-                $labels  = $api->getConfiguredVisitLabels();
-                $visitFn = static fn (): array => $labels;
-            }
         } catch (Throwable $e) {
             $msg = $e->getMessage();
             if (str_contains($msg, 'candidate_defaults.project')) {
-                $f->fix('project.json', 'candidate_defaults.project', 'not set - LORIS project, visits and cohorts cannot be checked',
+                $f->fix('project.json', 'candidate_defaults.project', 'not set - the LORIS project cannot be checked',
                     'set candidate_defaults.project to the LORIS project name');
             } else {
                 $f->nocheck('LORIS', 'api', 'LORIS could not be read: ' . $msg, lorisHint($msg));
             }
-            $api     = null;
-            $visitFn = null;
+            $api = null;
         }
     }
 
@@ -1179,13 +1170,13 @@ function validateUpload(
         ) {
             continue;
         }
-        if (str_contains($msg, 'is not configured in LORIS')
+        if (str_contains($msg, 'is not in project.json "visits"')
             && preg_match("/visit '([^']*)'/", $msg, $vm) && !preg_match('/^[A-Za-z0-9]+$/', $vm[1])
         ) {
             continue;   // the label itself is invalid: fix that first
         }
-        if (str_contains($msg, 'visit') && str_contains($msg, 'not configured')) {
-            $area = 'LORIS';
+        if (str_contains($msg, 'is not in project.json "visits"')) {
+            $area = 'project.json';
         }
 
         $uid = (string) ($issue['uid'] ?? '');
@@ -1241,7 +1232,7 @@ function validateUpload(
                     continue 2;
                 }
             }
-            $f->unlinked('participants', $dir, 'cannot be matched to a participant - will not be ingested', $advice);
+            $f->unlinked('participants', $dir, 'cannot be matched to a participant and listed visit - will not be ingested', $advice);
             continue;
         }
         if (str_contains($w, 'UNLINKED')) {
@@ -1272,16 +1263,24 @@ function validateUpload(
         }
     }
 
+    // --- participants.tsv values taken from project.json (reported, OK) ------------
+    // A value missing from the file AND from candidate_defaults is a MUST FIX
+    // (pre-flight above). One missing from the file only is filled from
+    // project.json - said here, so the site knows where it came from.
+    $roster = null;
+    if ($tsvUsable) {
+        try {
+            $roster = ParticipantSync::load($tsv, $projectConfig)['roster'];
+        } catch (Throwable) {
+            // reported by the structure check / pre-flight
+        }
+    }
+    foreach ($roster !== null ? ParticipantsCheck::columnSources($roster)['defaults'] : [] as $line) {
+        $f->note('participants.tsv', 'participants.tsv', $line);
+    }
+
     // --- LORIS values -------------------------------------------------------------
     if ($api !== null) {
-        $roster = null;
-        if ($tsvUsable) {
-            try {
-                $roster = ParticipantSync::load($tsv, $projectConfig)['roster'];
-            } catch (Throwable) {
-                // reported by the structure check / pre-flight
-            }
-        }
         checkLorisValues($api, $projectConfig, $roster, $f);
     }
 

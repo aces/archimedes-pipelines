@@ -154,7 +154,8 @@ class StudyFingerprint
         );
 
         foreach ($iterator as $fileInfo) {
-            if ($fileInfo->isFile()) {
+            // OS metadata (._*, .DS_Store ...) appearing or vanishing is not a change.
+            if ($fileInfo->isFile() && !SystemFiles::isIgnored($fileInfo->getPathname())) {
                 $files[] = $fileInfo->getPathname();
             }
         }

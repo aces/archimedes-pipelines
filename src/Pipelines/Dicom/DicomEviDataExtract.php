@@ -433,7 +433,8 @@ class DicomEviDataExtract
 
             $name = $fileInfo->getFilename();
 
-            if (strtoupper($name) === 'DICOMDIR'
+            if (\LORIS\Pipelines\Shared\SystemFiles::isIgnored($fileInfo->getPathname())
+                || strtoupper($name) === 'DICOMDIR'
                 || substr($name, -4) === '.tsv'
                 || substr($name, -5) === '.json'
                 || substr($name, -4) === '.csv'

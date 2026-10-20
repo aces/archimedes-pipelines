@@ -41,7 +41,7 @@ final class ParticipantsCheck
      * @param array         $projectConfig Decoded project.json.
      * @param array         $sessions      subject (no "sub-") => visit labels (no "ses-")
      *                                     the delivery has data for.
-     * @param callable|null $visitLabels   fn(): string[] configured visit labels; null skips that check.
+     * @param callable|null $visitLabels   fn(): string[] known visit labels (used in LORIS + project.json "visits"); null skips that check.
      * @param array         $delivered     Every subject seen in the delivery, for the
      *                                     "row with no data" warning (defaults to $sessions keys).
      * @param string        $dataNoun      Word used in that warning ("imaging", "BIDS data", ...).
@@ -52,6 +52,48 @@ final class ParticipantsCheck
      *     roster: ?ParticipantsTsv
      * }
      */
+    /**
+     * Each LORIS-required value: missing everywhere (an error), or not in
+     * participants.tsv but taken from project.json (reported, OK).
+     *
+     * Shared wording for the pre-flight, the participant sync and the
+     * validator, so a site sees the same message wherever it is reported.
+     *
+     * @param ParticipantsTsv $roster Loaded (and enriched) participants.tsv.
+     *
+     * @return array{missing: string[], defaults: string[]}
+     */
+    public static function columnSources(ParticipantsTsv $roster): array
+    {
+        $out   = ['missing' => [], 'defaults' => []];
+        $total = $roster->count();
+
+        foreach ($roster->columnSources() as $column => $s) {
+            if ($s['empty_rows'] === []) {
+                continue;                               // every row has it in the file
+            }
+            $n     = count($s['empty_rows']);
+            $where = $s['in_file']
+                ? sprintf("participants.tsv: '%s' is empty for %d of %d row(s) (%s)", $column, $n, $total,
+                    implode(', ', array_slice($s['empty_rows'], 0, 5)) . ($n > 5 ? ', ...' : ''))
+                : "participants.tsv has no '{$column}' column";
+
+            if ($s['from'] === null) {
+                $out['missing'][] = "{$where}, and project.json candidate_defaults has no '{$column}'"
+                    . " - add the {$column} " . ($s['in_file'] ? 'values' : 'column')
+                    . ", or set candidate_defaults.{$column}";
+            } elseif ($s['from'] === 'participant_id') {
+                $out['defaults'][] = "{$where} - using participant_id without 'sub-' for "
+                    . ($s['in_file'] ? 'those rows' : "all {$total} participant(s)") . ' (OK)';
+            } else {
+                $out['defaults'][] = "{$where} - using project.json {$s['from']} = '{$s['value']}' for "
+                    . ($s['in_file'] ? 'those rows' : "all {$total} participant(s)") . ' (OK)';
+            }
+        }
+
+        return $out;
+    }
+
     public static function check(
         string $tsvPath,
         array $projectConfig,
@@ -66,11 +108,9 @@ final class ParticipantsCheck
 
         // --- the file and its columns ----------------------------------------
         try {
-            $roster  = ParticipantsTsv::load($tsvPath, $projectConfig['candidate_defaults'] ?? [], $projectConfig);
-            $missing = $roster->missingForLoris();
-            if (!empty($missing)) {
-                $issues[] = ['scope' => 'project', 'message' => 'participants.tsv: column(s) missing and not in candidate_defaults: '
-                    . implode(', ', $missing)];
+            $roster = ParticipantsTsv::load($tsvPath, $projectConfig['candidate_defaults'] ?? [], $projectConfig);
+            foreach (self::columnSources($roster)['missing'] as $message) {
+                $issues[] = ['scope' => 'project', 'message' => $message];
             }
         } catch (\Throwable $e) {
             $issues[] = ['scope' => 'project', 'message' => 'participants.tsv: ' . $e->getMessage()];
@@ -110,21 +150,39 @@ final class ParticipantsCheck
             }
         }
 
-        // --- visits configured in LORIS ---------------------------------------
+        // --- visits: project.json "visits" ----------------------------------------
+        // The LORIS API cannot list a project's configured visits (only those
+        // existing sessions use), so the project declares them. Declared: a
+        // delivered visit not in the list is an error before anything is
+        // created (a typo, or a visit not set up). Not declared: not checked
+        // here (one note); LORIS checks each visit against the cohort when the
+        // session is created and the run stops on a refusal.
         if (!empty($sessions) && $visitLabels !== null) {
             try {
-                $configured = array_map('strtolower', (array) $visitLabels());
+                $declared = array_map('strtolower', (array) $visitLabels());
+                $seen     = [];
                 foreach ($sessions as $subject => $visits) {
                     foreach (array_unique(array_map('strval', (array) $visits)) as $session) {
-                        if ($session !== '' && !in_array(strtolower($session), $configured, true)) {
+                        if ($session === '') {
+                            continue;
+                        }
+                        $seen[$session] = true;
+                        if ($declared !== [] && !in_array(strtolower($session), $declared, true)) {
                             $issues[] = ['scope' => 'session', 'subject' => (string) $subject, 'session' => $session,
-                                'message' => "sub-{$subject}/ses-{$session}: visit '{$session}' is not configured in "
-                                    . 'LORIS for this project - ask for it to be added, or fix the folder name'];
+                                'message' => "sub-{$subject}/ses-{$session}: visit '{$session}' is not in project.json "
+                                    . '"visits" - fix the folder name, or add the visit (it must also be set up for the '
+                                    . 'project and cohort in LORIS)'];
                         }
                     }
                 }
+                if ($declared === [] && $seen !== []) {
+                    $warnings[] = 'project.json has no "visits" - the delivered visits ('
+                        . implode(', ', array_slice(array_keys($seen), 0, 8)) . (count($seen) > 8 ? ', ...' : '')
+                        . ') are not checked before ingestion; LORIS checks each one when its session is created. '
+                        . 'Add "visits": [...] to project.json to check them first';
+                }
             } catch (\Throwable $e) {
-                $issues[] = ['scope' => 'project', 'message' => 'cannot read the configured visits from LORIS: ' . $e->getMessage()];
+                $issues[] = ['scope' => 'project', 'message' => 'cannot read the project visits: ' . $e->getMessage()];
             }
         }
 

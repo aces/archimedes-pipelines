@@ -37,10 +37,11 @@ class ParticipantsTsv
     public const SITE_REQUIRED = ['participant_id'];
 
     /**
-     * Columns LORIS needs before a candidate can be created. Any of these
+     * Columns LORIS needs before a candidate and its sessions can be created
+     * (cohort: the session "Cohort"). Any of these
      * missing from the file is filled from candidate_defaults where possible.
      */
-    public const LORIS_REQUIRED = ['participant_id', 'external_id', 'dob', 'sex', 'site'];
+    public const LORIS_REQUIRED = ['participant_id', 'external_id', 'dob', 'sex', 'site', 'cohort'];
 
     /**
      * candidate_defaults key => participants.tsv column it fills.
@@ -60,6 +61,13 @@ class ParticipantsTsv
 
     /** @var string[] Columns that were enriched rather than supplied. */
     private array $enriched = [];
+
+    /**
+     * Where each LORIS-required value came from, recorded while enriching.
+     *
+     * @var array<string, array{in_file: bool, empty_rows: string[], from: ?string, value: ?string}>
+     */
+    private array $sources = [];
 
     /** @var string Path the data was read from. */
     private string $path;
@@ -87,6 +95,7 @@ class ParticipantsTsv
 
         $instance = new self($path);
         $instance->_read($path);
+        $instance->_recordFileState($candidateDefaults);
         $instance->_enrich($candidateDefaults, $projectConfig);
 
         return $instance;
@@ -292,6 +301,54 @@ class ParticipantsTsv
                 $this->columns[] = 'external_id';
             }
         }
+    }
+
+    /**
+     * Before enrichment: which LORIS-required columns the file has, which rows
+     * leave them empty, and what will fill them.
+     */
+    private function _recordFileState(array $candidateDefaults): void
+    {
+        foreach (self::LORIS_REQUIRED as $column) {
+            if ($column === 'participant_id') {
+                continue;
+            }
+            $empty = [];
+            foreach ($this->rows as $id => $row) {
+                if (trim((string) ($row[$column] ?? '')) === '') {
+                    $empty[] = (string) $id;
+                }
+            }
+            $default = $candidateDefaults[$column] ?? null;
+            $from    = null;
+            if ($column === 'external_id') {
+                $from = 'participant_id';
+            } elseif ($default !== null && trim((string) $default) !== '') {
+                $from = "candidate_defaults.{$column}";
+            }
+            $this->sources[$column] = [
+                'in_file'    => in_array($column, $this->columns, true),
+                'empty_rows' => $empty,
+                'from'       => $empty === [] ? null : $from,
+                'value'      => ($empty !== [] && $from !== null && $column !== 'external_id') ? (string) $default : null,
+            ];
+        }
+    }
+
+    /**
+     * Where each LORIS-required value comes from, for reporting.
+     *
+     * in_file    the column is in participants.tsv
+     * empty_rows participant_ids whose value is empty in the file
+     * from       what fills those rows: "candidate_defaults.<column>",
+     *            "participant_id" (external_id), or null = nothing (missing)
+     * value      the candidate_defaults value used, when from is candidate_defaults
+     *
+     * @return array<string, array{in_file: bool, empty_rows: string[], from: ?string, value: ?string}>
+     */
+    public function columnSources(): array
+    {
+        return $this->sources;
     }
 
     /**
