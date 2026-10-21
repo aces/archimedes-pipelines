@@ -97,6 +97,7 @@ class DicomReidentifier
         'candidates_created'  => 0,
         'candidates_matched'  => 0,
         'unlinked_studies'    => 0,
+        'visit_refused'       => 0,
         'studies_degraded'    => 0,
         'files_rewritten'     => 0,
     ];
@@ -411,15 +412,25 @@ class DicomReidentifier
         // --- Visit must be configured -----------------------------------------
         $visitLabel = $this->_resolveVisitLabel($session);
 
+        if ($visitLabel === null && ($session === null || $session === '')) {
+            return $this->_reject($studyUid, "sub-{$subject}: no visit (ses- folder) - not processed");
+        }
+
         if ($visitLabel === null) {
-            // A participant study in a visit LORIS does not have: a mismatch,
-            // not an unlinked study. Rejected (the pre-flight in participant
-            // sync normally stops the run before this point).
-            return $this->_reject($studyUid, sprintf(
-                "sub-%s: visit label '%s' is not configured in LORIS - not processed",
-                $subject,
-                $session ?? '?'
+            // project.json "visits" is declared and this ses- folder matches
+            // none of them. Hold back this study only (warning; not recorded,
+            // so it is retried) - the rest of the delivery goes in. Nothing is
+            // created for it in LORIS.
+            $this->stats['visit_refused']++;
+            $this->_problem('warning', $studyUid, sprintf(
+                "VISIT NOT IN project.json %s: not reidentified, not ingested - visit '%s' is not in "
+                . 'project.json "visits" (%s). Fix the ses- folder name, or add the visit to "visits" '
+                . '(and set it up in LORIS), then re-run',
+                $study['directory_name'] ?? $studyUid,
+                $session,
+                implode(', ', $this->configuredVisits ?? [])
             ));
+            return null;
         }
 
         // --- Candidate ---------------------------------------------------------
@@ -502,10 +513,24 @@ class DicomReidentifier
                     $participantRows['sub-' . $subject]['cohort'] ?? null
                 );
             } catch (\Throwable $e) {
-                return $this->_reject(
-                    $studyUid,
-                    "session creation failed for {$candId}/{$visitLabel}: " . $e->getMessage()
-                );
+                if ($e->getCode() !== \LORIS\Endpoints\LorisApiClientInterface::VISIT_REFUSED) {
+                    return $this->_reject(
+                        $studyUid,
+                        "session creation failed for {$candId}/{$visitLabel}: " . $e->getMessage()
+                    );
+                }
+                // Visit not set up in LORIS for this cohort: hold back this
+                // study only (warning; not tracked, so the next run retries it
+                // once the visit exists) - the rest of the delivery goes in.
+                $this->stats['visit_refused']++;
+                $this->_problem('warning', $studyUid, sprintf(
+                    "VISIT NOT IN LORIS %s: not reidentified, not ingested - %s. Set up visit '%s' for the "
+                    . 'project and cohort in LORIS (or fix the ses- folder name), then re-run',
+                    $study['directory_name'] ?? $studyUid,
+                    $e->getMessage(),
+                    $visitLabel
+                ));
+                return null;
             }
         }
 
@@ -580,10 +605,11 @@ class DicomReidentifier
             }
         }
 
-        // Not known (no session uses it yet, not in project.json "visits"):
-        // the folder's label as is. LORIS checks it against the project's
-        // cohort when the session is created and rejects the study if wrong.
-        return $session;
+        // project.json "visits" is declared and this folder matches none of
+        // them: a typo or a visit not set up - held back (caller), never
+        // guessed. Not declared: the folder's label as is; LORIS checks it
+        // against the cohort when the session is created.
+        return $this->configuredVisits === [] ? $session : null;
     }
 
     /** @var array<string, true> StudyInstanceUIDs excluded by the operator. */

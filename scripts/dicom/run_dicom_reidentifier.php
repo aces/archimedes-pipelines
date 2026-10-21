@@ -164,7 +164,7 @@ function resolveTargets(array $config, array $options): array
                 $basePath . '/' . $projectName,
                 !empty($collection['enabled']) && !empty($project['enabled']),
                 $wantProject === $projectName
-                    || (empty($collection['enabled']) && $wantCollection === $collectionName)
+                || (empty($collection['enabled']) && $wantCollection === $collectionName)
             )) {
                 continue;
             }
@@ -227,11 +227,11 @@ function confirmCommand(array $argv): string
     return 'php ' . $argv[0] . ' ' . implode(' ', array_map(
         // Quote anything outside the plain set, so a path with a space in it
         // still produces a line that can be pasted and run.
-        static fn (string $a): string => preg_match('~^[A-Za-z0-9=_./-]+$~', $a) === 1
-            ? $a
-            : escapeshellarg($a),
-        $args
-    ));
+            static fn (string $a): string => preg_match('~^[A-Za-z0-9=_./-]+$~', $a) === 1
+                ? $a
+                : escapeshellarg($a),
+            $args
+        ));
 }
 
 // -----------------------------------------------------------------------------
@@ -402,12 +402,15 @@ foreach ($targets as $target) {
         $stats = $reidentifier->getStats();
 
         fwrite(STDERR, sprintf(
-            "  %d/%d mapped, %d matched, %d created, %d unlinked (not processed)\n",
+            "  %d/%d mapped, %d matched, %d created, %d unlinked (not processed)%s\n",
             $stats['studies_mapped'],
             $stats['studies_total'],
             $stats['candidates_matched'],
             $stats['candidates_created'],
-            $stats['unlinked_studies']
+            $stats['unlinked_studies'],
+            ($stats['visit_refused'] ?? 0) > 0
+                ? sprintf(', %d held (visit not in project.json "visits" or not in LORIS)', $stats['visit_refused'])
+                : ''
         ));
 
         fwrite(STDERR, sprintf(

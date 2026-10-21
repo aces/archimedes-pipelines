@@ -27,6 +27,14 @@ namespace LORIS\Endpoints;
 interface LorisApiClientInterface
 {
     /**
+     * Exception code of the RuntimeException ensureSession() throws when LORIS
+     * refuses the visit for the candidate's cohort ("This visit label is not
+     * valid for this cohort."): a data problem for that visit only, so the
+     * caller holds back its studies and carries on with the rest.
+     */
+    public const VISIT_REFUSED = 4001;
+
+    /**
      * Find a candidate by the site's own identifier.
      *
      * @param string $externalId Site identifier (the sub- value).

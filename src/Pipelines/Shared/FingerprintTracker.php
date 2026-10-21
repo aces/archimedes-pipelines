@@ -399,6 +399,20 @@ class FingerprintTracker
         return $this->entries;
     }
 
+    /**
+     * Re-read the tracking file, after another writer has saved it.
+     *
+     * The entries are loaded once; a caller that also writes the same file
+     * itself must call this after each of its saves, or the next save here
+     * writes the old entries back and drops what the caller recorded. File
+     * lists stay cached (the directories have not changed).
+     */
+    public function reload(): void
+    {
+        $this->entries = [];
+        $this->_load();
+    }
+
     public function status(string $key): ?string
     {
         return $this->entries[$key]['status'] ?? null;

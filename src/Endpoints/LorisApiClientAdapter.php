@@ -750,6 +750,20 @@ class LorisApiClientAdapter implements LorisApiClientInterface
 
         $response = $this->_raw('PUT', $url, $body);
 
+        // The visit is not set up for this cohort in LORIS: a data problem for
+        // this visit only (the caller holds its studies back), not a failure.
+        if ($response['status'] === 400
+            && stripos($response['raw'], 'not valid for this cohort') !== false
+        ) {
+            throw new RuntimeException(sprintf(
+                "LORIS refused visit '%s' for candidate %s (cohort '%s'): %s",
+                $visitLabel,
+                $candId,
+                $cohort,
+                substr($response['raw'], 0, 300)
+            ), self::VISIT_REFUSED);
+        }
+
         if ($response['status'] < 200 || $response['status'] >= 300) {
             throw new RuntimeException(sprintf(
                 'HTTP %d creating session %s/%s: %s',

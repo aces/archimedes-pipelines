@@ -1096,7 +1096,31 @@ foreach ($targets as $target) {
     // Ingest ONLY reidentified output. processed/ holds site identifiers and
     // is never a source: importing it would overwrite reidentified archives.
     if (is_file($lorisidManifest)) {
-        $sources[$lorisidSubdir] = sprintf('%d reidentified', $counts['linked']);
+        // A dry run of an update: organize and reidentify only preview the new
+        // or changed studies, so deidentified-lorisid/ still holds what the
+        // last real run wrote, and the import below sees only those. Count what
+        // is really there and say what --confirm will add.
+        $ready = $counts['linked'];
+        if (!$confirm) {
+            $m     = json_decode((string) @file_get_contents($lorisidManifest), true);
+            $ready = count(array_filter(
+                (array) ($m['studies'] ?? []),
+                static fn ($s): bool => is_array($s)
+                    && ($s['link_status'] ?? '') === 'linked'
+                    && is_dir((string) ($s['directory'] ?? ''))
+            ));
+            if ($counts['linked'] > $ready) {
+                $more = $counts['linked'] - $ready;
+                fwrite(STDERR, sprintf(
+                    "\n  import (dry run): %d study/studies already reidentified are checked below; %d more matched\n"
+                    . "  study/studies new in this delivery are organized, reidentified and ingested with --confirm\n",
+                    $ready,
+                    $more
+                ));
+                masterLog($masterLogPath, "dry run: {$more} new matched study/studies not yet reidentified");
+            }
+        }
+        $sources[$lorisidSubdir] = sprintf('%d reidentified', $ready);
     } elseif ($counts['linked'] > 0 && !$confirm) {
         // A dry run of reidentify writes nothing, so a delivery seen for the
         // first time has no deidentified-lorisid/ yet. That is expected, not a

@@ -152,15 +152,18 @@ final class ParticipantsCheck
 
         // --- visits: project.json "visits" ----------------------------------------
         // The LORIS API cannot list a project's configured visits (only those
-        // existing sessions use), so the project declares them. Declared: a
-        // delivered visit not in the list is an error before anything is
-        // created (a typo, or a visit not set up). Not declared: not checked
-        // here (one note); LORIS checks each visit against the cohort when the
-        // session is created and the run stops on a refusal.
+        // existing sessions use), so the project may declare them. The list is
+        // optional. Declared: folder names are matched to its spellings, and a
+        // delivered visit not in it is a warning here and its studies are held
+        // back by the reidentifier (the rest go in) - never the whole project.
+        // Not declared: LORIS validates each visit against the cohort when the
+        // session is created; a refused visit's studies are held back the same way.
         if (!empty($sessions) && $visitLabels !== null) {
             try {
-                $declared = array_map('strtolower', (array) $visitLabels());
-                $seen     = [];
+                $declaredRaw = array_values(array_map('strval', (array) $visitLabels()));
+                $declared    = array_map('strtolower', $declaredRaw);
+                $seen        = [];
+                $unlisted    = [];
                 foreach ($sessions as $subject => $visits) {
                     foreach (array_unique(array_map('strval', (array) $visits)) as $session) {
                         if ($session === '') {
@@ -168,18 +171,25 @@ final class ParticipantsCheck
                         }
                         $seen[$session] = true;
                         if ($declared !== [] && !in_array(strtolower($session), $declared, true)) {
-                            $issues[] = ['scope' => 'session', 'subject' => (string) $subject, 'session' => $session,
-                                'message' => "sub-{$subject}/ses-{$session}: visit '{$session}' is not in project.json "
-                                    . '"visits" - fix the folder name, or add the visit (it must also be set up for the '
-                                    . 'project and cohort in LORIS)'];
+                            $unlisted[$session][] = "sub-{$subject}";
                         }
                     }
+                }
+                foreach ($unlisted as $session => $subjects) {
+                    $warnings[] = sprintf(
+                        "visit '%s' (%s) is not in project.json \"visits\" (%s) - its studies are held back "
+                        . '(not ingested; the rest go in). Fix the ses- folder name, or add the visit to "visits" '
+                        . '(and set it up in LORIS), then re-run',
+                        $session,
+                        implode(', ', array_slice($subjects, 0, 5)) . (count($subjects) > 5 ? ', ...' : ''),
+                        implode(', ', $declaredRaw)
+                    );
                 }
                 if ($declared === [] && $seen !== []) {
                     $warnings[] = 'project.json has no "visits" - the delivered visits ('
                         . implode(', ', array_slice(array_keys($seen), 0, 8)) . (count($seen) > 8 ? ', ...' : '')
-                        . ') are not checked before ingestion; LORIS checks each one when its session is created. '
-                        . 'Add "visits": [...] to project.json to check them first';
+                        . ') are checked by LORIS when each session is created. Optional: add "visits": [...] '
+                        . 'to project.json to list them here';
                 }
             } catch (\Throwable $e) {
                 $issues[] = ['scope' => 'project', 'message' => 'cannot read the project visits: ' . $e->getMessage()];

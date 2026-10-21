@@ -979,7 +979,7 @@ class DicomImportPipeline
                 }
 
                 if (!$isRetry && (preg_match(self::NOT_INSERTED_PATTERN, $errorDetail)
-                    || preg_match(self::ALREADY_INSERTED_PATTERN, $errorDetail))
+                        || preg_match(self::ALREADY_INSERTED_PATTERN, $errorDetail))
                 ) {
                     // Keep the first attempt's script output in the run log, so a
                     // retry that then fails still shows both attempts.
@@ -1215,13 +1215,13 @@ class DicomImportPipeline
         foreach (['http_status', 'job_id', 'pid', 'state', 'exit_code', 'end_time'] as $k) {
             if (isset($response[$k]) && $response[$k] !== '') {
                 $this->_writeErrorDetail("{$k}: " . (is_scalar($response[$k])
-                    ? (string) $response[$k] : json_encode($response[$k])));
+                        ? (string) $response[$k] : json_encode($response[$k])));
             }
         }
         if (!empty($response['errors'])) {
             $this->_writeErrorDetail('errors: ' . json_encode(
-                $response['errors'], JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES
-            ));
+                    $response['errors'], JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES
+                ));
         }
         $seen = [];
         foreach (['error_detail', 'output', 'stdout', 'stderr', 'progress', 'raw_body'] as $k) {
@@ -1379,6 +1379,14 @@ class DicomImportPipeline
             return;
         }
         TrackingFile::retireLegacy($path, TrackingFile::legacy($path, self::LEGACY_TRACK_FILE));
+
+        // The fingerprint tracker writes this same file (on a skip). It loaded
+        // the file once, so without this a skip after an import in the same
+        // run wrote the old entries back: the import was lost, and the next
+        // run imported the study again (refused as already in LORIS).
+        if ($this->fingerprintTracker !== null && $this->fingerprintTrackerPath === $path) {
+            $this->fingerprintTracker->reload();
+        }
     }
 
     private function _markProcessed(
@@ -1653,9 +1661,9 @@ class DicomImportPipeline
             $this->abortReason !== null
                 ? 'ABORTED — ' . $this->abortReason
                 : ($s['studies_failed'] > 0
-                    ? 'COMPLETED WITH ERRORS'
-                    : 'COMPLETED SUCCESSFULLY')
-        ));
+                ? 'COMPLETED WITH ERRORS'
+                : 'COMPLETED SUCCESSFULLY')
+            ));
         $this->_log("========================================");
     }
 
@@ -1749,8 +1757,8 @@ class DicomImportPipeline
         // import is the last step, so its email is the run's one summary.
         $prep = [];
         foreach (['processed/imaging/dicom_studies.json',
-                  'processed/imaging/dicom_participant_sync.json',
-                  'deidentified-lorisid/imaging/dicom_studies_lorisid.json'] as $rel) {
+                     'processed/imaging/dicom_participant_sync.json',
+                     'deidentified-lorisid/imaging/dicom_studies_lorisid.json'] as $rel) {
             $m = rtrim($projectDir, '/') . '/' . $rel;
             $d = is_file($m) ? (json_decode((string) file_get_contents($m), true) ?: []) : [];
             foreach ($d['problems'] ?? [] as $pr) {
@@ -1771,7 +1779,7 @@ class DicomImportPipeline
             $this->_log(($r['link_status'] ?? '') === 'linked'
                 ? "  ingested with session {$r['session']}: {$study}"
                 : "  ingested WITHOUT session ({$r['link_status']}"
-                    . (!empty($r['link_reason']) ? ", {$r['link_reason']}" : '') . "): {$study}");
+                . (!empty($r['link_reason']) ? ", {$r['link_reason']}" : '') . "): {$study}");
         }
         foreach ($failed as $study => $r) {
             $this->_log("  FAILED, not ingested: {$study}: " . ($r['reason'] ?? 'unknown'));

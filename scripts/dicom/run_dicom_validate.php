@@ -251,7 +251,20 @@ function patientNameFix(string $msg, array $tsvIds): string
 final class Findings
 {
     /** @var array<string, array<int, array{area: string, where: string, what: string, fix: string}>> */
-    public array $items = ['fix' => [], 'unlinked' => [], 'check' => [], 'nocheck' => [], 'note' => []];
+    public array $items = ['fix' => [], 'unlinked' => [], 'held' => [], 'check' => [], 'nocheck' => [], 'note' => []];
+
+    /**
+     * VALUES summary: what ingestion will use, one row per item.
+     *
+     * @var array<int, array{item: string, value: string, status: string}>
+     */
+    public array $values = [];
+
+    /** OK | FIX | HELD | CHECK | LORIS (checked by LORIS at session creation) | NOT CHECKED */
+    public function value(string $item, string $value, string $status): void
+    {
+        $this->values[] = compact('item', 'value', 'status');
+    }
 
     public function fix(string $area, string $where, string $what, string $fix = ''): void
     {
@@ -261,6 +274,12 @@ final class Findings
     public function unlinked(string $area, string $where, string $what, string $fix = ''): void
     {
         $this->add('unlinked', $area, $where, $what, $fix);
+    }
+
+    /** Should be fixed: these examinations are held back, the rest go in. */
+    public function held(string $area, string $where, string $what, string $fix = ''): void
+    {
+        $this->add('held', $area, $where, $what, $fix);
     }
 
     public function check(string $area, string $where, string $what, string $fix = ''): void
@@ -715,8 +734,13 @@ function lorisHint(string $msg): string
  * LORIS values: project, site (LORIS 26 API v0.0.4-dev); cohort and visits are checked by LORIS
  * when the session is created.
  */
-function checkLorisValues(LorisApiClientAdapter $api, array $projectConfig, ?ParticipantsTsv $roster, Findings $f): void
+/**
+ * @return array{project: array<string, string>, site: array<string, string>, existing: array<string, string>}
+ *         per value / participant: OK | FIX | NOT CHECKED, and existing: match | differs | new | error
+ */
+function checkLorisValues(LorisApiClientAdapter $api, array $projectConfig, ?ParticipantsTsv $roster, Findings $f): array
 {
+    $result   = ['project' => [], 'site' => [], 'existing' => []];
     $defaults = $projectConfig['candidate_defaults'] ?? [];
     $values   = ['project' => [], 'cohort' => [], 'site' => []];
 
@@ -736,12 +760,14 @@ function checkLorisValues(LorisApiClientAdapter $api, array $projectConfig, ?Par
     try {
         $projects = $api->getProjectNames();
         foreach ($values['project'] as $v => $from) {
+            $result['project'][$v] = in_array($v, $projects, true) ? 'OK' : 'FIX';
             if (!in_array($v, $projects, true)) {
                 $f->fix('LORIS', $from, "project '{$v}' does not exist in LORIS",
                     'use the exact LORIS project name: ' . implode(', ', $projects));
             }
         }
     } catch (Throwable $e) {
+        $result['project'] = array_fill_keys(array_keys($values['project']), 'NOT CHECKED');
         $f->nocheck('LORIS', 'projects', 'cannot read the LORIS projects: ' . $e->getMessage(),
             lorisHint($e->getMessage()));
     }
@@ -759,9 +785,11 @@ function checkLorisValues(LorisApiClientAdapter $api, array $projectConfig, ?Par
         try {
             $existing = $api->findCandidateByExternalId($extId);
             if ($existing === null) {
+                $result['existing'][$pid] = 'new';
                 continue;    // new participant: created by the participant sync
             }
             $diff = ParticipantSync::lorisDifferences($api, $existing, $row);
+            $result['existing'][$pid] = $diff === [] ? 'match' : 'differs';
             if ($diff !== []) {
                 $f->fix('LORIS', "participants.tsv ({$pid})",
                     "already in LORIS as {$existing['pscid']}, but " . implode('; ', $diff)
@@ -769,6 +797,7 @@ function checkLorisValues(LorisApiClientAdapter $api, array $projectConfig, ?Par
                     'correct participants.tsv, or ask the ARCHIMEDES team to correct the candidate in LORIS');
             }
         } catch (Throwable $e) {
+            $result['existing'][$pid] = 'error';
             $f->nocheck('LORIS', "participants.tsv ({$pid})", 'cannot compare with LORIS: ' . $e->getMessage(),
                 lorisHint($e->getMessage()));
             break;
@@ -783,6 +812,7 @@ function checkLorisValues(LorisApiClientAdapter $api, array $projectConfig, ?Par
             $sites = $api->getSites();
             $names = array_column($sites, 'Name');
             foreach ($values['site'] as $v => $from) {
+                $result['site'][$v] = in_array($v, $names, true) ? 'OK' : 'FIX';
                 if (in_array($v, $names, true)) {
                     continue;
                 }
@@ -797,9 +827,132 @@ function checkLorisValues(LorisApiClientAdapter $api, array $projectConfig, ?Par
                     $hint !== null ? "use the site name '{$hint}'" : 'use one of: ' . implode(', ', $names));
             }
         } catch (Throwable $e) {
+            $result['site'] = array_fill_keys(array_keys($values['site']), 'NOT CHECKED');
             $f->nocheck('LORIS', 'sites', 'cannot read the LORIS sites: ' . $e->getMessage(),
                 lorisHint($e->getMessage()));
         }
+    }
+
+    return $result;
+}
+
+/**
+ * The VALUES table: what ingestion will use for project, site, cohort, visits,
+ * sex and dob, where each came from, and whether it is good.
+ *
+ * @param array      $linked         Organized participant studies.
+ * @param string[]   $declaredVisits project.json "visits".
+ * @param array|null $loris          checkLorisValues() result; null = offline / LORIS unreadable.
+ */
+function summariseValues(
+    Findings $f,
+    array $projectConfig,
+    ?ParticipantsTsv $roster,
+    array $linked,
+    array $declaredVisits,
+    ?array $loris
+): void {
+    $rows     = $roster?->all() ?? [];
+    $n        = count($rows);
+    $defaults = $projectConfig['candidate_defaults'] ?? [];
+
+    // project / site / cohort: each distinct value, where it came from, LORIS check
+    foreach (['project', 'site', 'cohort'] as $col) {
+        $seen = [];
+        foreach ($rows as $row) {
+            $v = trim((string) ($row[$col] ?? ''));
+            if ($v !== '') {
+                $seen[$v] = ($seen[$v] ?? 0) + 1;
+            }
+        }
+        if ($seen === [] && !empty($defaults[$col])) {
+            $seen[(string) $defaults[$col]] = $n;
+        }
+        if ($seen === []) {
+            $f->value($col, 'not set (participants.tsv or candidate_defaults) - see MUST FIX', 'FIX');
+            continue;
+        }
+        $fromFile = $roster !== null && !in_array($col, $roster->enrichedColumns(), true);
+        foreach ($seen as $v => $count) {
+            $where = $fromFile ? 'participants.tsv' : 'project.json candidate_defaults';
+            $text  = sprintf("'%s'  (%s, %d of %d participant(s))", $v, $where, $count, $n);
+            if ($col === 'cohort') {
+                $f->value($col, $text . ' - checked by LORIS when each session is created', 'LORIS');
+            } else {
+                $status = $loris === null ? 'NOT CHECKED' : ($loris[$col][$v] ?? 'NOT CHECKED');
+                $f->value($col, $text . ($status === 'OK' ? ' - exists in LORIS' : ($status === 'FIX' ? ' - see MUST FIX' : ' - LORIS not reachable')), $status);
+            }
+        }
+    }
+
+    // visits: delivered vs project.json "visits"
+    $perVisit = [];
+    foreach ($linked as $st) {
+        $perVisit[(string) ($st['session'] ?? '?')][(string) ($st['subject'] ?? '?')] = true;
+    }
+    ksort($perVisit);
+    $declaredLc = array_map('strtolower', $declaredVisits);
+    if ($perVisit === []) {
+        $f->value('visits', 'no examinations matched to a participant', 'CHECK');
+    }
+    foreach ($perVisit as $visit => $subjects) {
+        $text = sprintf('%s  (%d participant(s))', $visit, count($subjects));
+        if (!preg_match('/^[A-Za-z0-9]+$/', $visit)) {
+            $f->value('visits', $text . ' - label not letters and digits only (see MUST FIX)', 'FIX');
+        } elseif ($declaredVisits === []) {
+            $f->value('visits', $text . ' - project.json has no "visits"; checked by LORIS when the session is created', 'LORIS');
+        } elseif (in_array(strtolower($visit), $declaredLc, true)) {
+            $f->value('visits', $text . ' - in project.json "visits"', 'OK');
+        } else {
+            $f->value('visits', $text . ' - NOT in project.json "visits" (' . implode(', ', $declaredVisits) . '): held back', 'HELD');
+        }
+    }
+
+    // sex
+    if ($rows !== []) {
+        $mappings = $projectConfig['sex_mappings'] ?? [];
+        $counts   = [];
+        $bad      = [];
+        foreach ($rows as $pid => $row) {
+            $raw  = (string) ($row['sex'] ?? '');
+            $norm = LorisApiClientAdapter::normaliseSexValue($raw, $mappings);
+            $norm === null ? $bad[] = "{$pid} '{$raw}'" : $counts[$norm] = ($counts[$norm] ?? 0) + 1;
+        }
+        ksort($counts);
+        $parts = [];
+        foreach ($counts as $k => $c) {
+            $parts[] = "{$k} {$c}";
+        }
+        $f->value('sex', ($parts ? implode(', ', $parts) : 'none valid')
+            . ($bad ? ' - cannot be mapped: ' . implode(', ', array_slice($bad, 0, 5)) . ' (see MUST FIX)' : ' - all valid'),
+            $bad ? 'FIX' : 'OK');
+
+        // dob
+        $order = Dob::dateOrder($projectConfig);
+        $good  = [];
+        $badD  = [];
+        foreach ($rows as $pid => $row) {
+            $raw  = (string) ($row['dob'] ?? '');
+            $norm = Dob::normalize($raw, $order);
+            Dob::problem($norm) === null ? $good[] = $norm : $badD[] = "{$pid} '{$raw}'";
+        }
+        sort($good);
+        $f->value('dob', sprintf('%d of %d valid', count($good), $n)
+            . ($good ? sprintf(' (%s ... %s, date order %s)', $good[0], end($good), $order) : '')
+            . ($badD ? ' - invalid: ' . implode(', ', array_slice($badD, 0, 5)) . ' (see MUST FIX)' : ' - all valid'),
+            $badD ? 'FIX' : 'OK');
+    }
+
+    // participants already in LORIS
+    if ($loris !== null && $loris['existing'] !== []) {
+        $c = array_count_values($loris['existing']);
+        $f->value('in LORIS', sprintf('%d already in LORIS (dob/sex %s), %d new - created at ingestion',
+                ($c['match'] ?? 0) + ($c['differs'] ?? 0),
+                ($c['differs'] ?? 0) > 0 ? ($c['differs'] . ' differ - see MUST FIX') : 'match',
+                $c['new'] ?? 0) . (($c['error'] ?? 0) > 0 ? ' - some could not be checked' : ''),
+            ($c['differs'] ?? 0) > 0 ? 'FIX' : (($c['error'] ?? 0) > 0 ? 'NOT CHECKED' : 'OK'));
+    } elseif ($loris === null && $rows !== []) {
+        $f->value('in LORIS', 'not checked (offline or LORIS not reachable)', 'NOT CHECKED');
     }
 }
 
@@ -816,7 +969,8 @@ function renderReport(string $label, string $dicomDir, Findings $f, array $studi
 {
     $n       = $f->items;
     $ready   = array_filter($studies, static fn ($s) => $s['status'] === 'READY');
-    $blocked = array_filter($studies, static fn ($s) => $s['status'] !== 'READY');
+    $held    = array_filter($studies, static fn ($s) => $s['status'] === 'HELD');
+    $blocked = array_filter($studies, static fn ($s) => $s['status'] !== 'READY' && $s['status'] !== 'HELD');
     $nFix    = count($n['fix']);
 
     // READY only when every examination will go in: nothing to fix, nothing
@@ -836,7 +990,10 @@ function renderReport(string $label, string $dicomDir, Findings $f, array $studi
     $out[] = " Upload: {$dicomDir}";
     $out[] = str_repeat('=', 78);
     $out[] = match ($status) {
-        'READY'      => sprintf(' RESULT: READY - all %d examination(s) can be ingested', count($ready)),
+        'READY'      => empty($held)
+            ? sprintf(' RESULT: READY - all %d examination(s) can be ingested', count($ready))
+            : sprintf(' RESULT: READY - %d examination(s) can be ingested; %d held back until fixed (see HELD BACK)',
+                count($ready), count($held)),
         'INCOMPLETE' => sprintf(' RESULT: NO PROBLEMS FOUND, BUT NOT EVERYTHING COULD BE CHECKED - %d examination(s)', count($ready)),
         default      => empty($studies) && $nFix === 0
             ? ' RESULT: NOT READY - no examination can be ingested'
@@ -874,9 +1031,19 @@ function renderReport(string $label, string $dicomDir, Findings $f, array $studi
 
     $section('MUST FIX - blocks ingestion of the affected data', $n['fix']);
     $section('NOT INGESTED - cannot be matched to a participant or visit', $n['unlinked']);
+    $section('HELD BACK - should be fixed; these are not ingested, everything else is', $n['held']);
     $section('PLEASE CHECK', $n['check']);
     $section('COULD NOT CHECK - for the ARCHIMEDES team, not the site', $n['nocheck']);
     $section('FROM project.json - OK, no action needed', $n['note']);
+
+    if (!empty($f->values)) {
+        $out[] = '';
+        $out[] = 'VALUES - what ingestion will use';
+        $out[] = '--------------------------------';
+        foreach ($f->values as $v) {
+            $out[] = sprintf('  %-12s %-10s %s', $v['item'], $v['status'], str_replace($dicomDir . '/', '', $v['value']));
+        }
+    }
 
     $out[] = '';
     $out[] = 'EXAMINATIONS';
@@ -886,6 +1053,9 @@ function renderReport(string $label, string $dicomDir, Findings $f, array $studi
     }
     foreach ($ready as $s) {
         $out[] = '  READY    ' . $s['line'];
+    }
+    foreach ($held as $s) {
+        $out[] = '  HELD     ' . $s['line'] . '  - ' . $s['why'];
     }
     foreach ($blocked as $s) {
         $out[] = '  BLOCKED  ' . $s['line'] . '  - ' . $s['why'];
@@ -1170,14 +1340,6 @@ function validateUpload(
         ) {
             continue;
         }
-        if (str_contains($msg, 'is not in project.json "visits"')
-            && preg_match("/visit '([^']*)'/", $msg, $vm) && !preg_match('/^[A-Za-z0-9]+$/', $vm[1])
-        ) {
-            continue;   // the label itself is invalid: fix that first
-        }
-        if (str_contains($msg, 'is not in project.json "visits"')) {
-            $area = 'project.json';
-        }
 
         $uid = (string) ($issue['uid'] ?? '');
         if (preg_match('/in more than one participant\/visit folder \(([^)]*)\)/', $msg, $mm)) {
@@ -1238,6 +1400,18 @@ function validateUpload(
         if (str_contains($w, 'UNLINKED')) {
             continue;   // the same study, reported once above
         }
+        if (str_starts_with($w, 'project.json has no "visits"')) {
+            continue;   // shown per visit in the VALUES table
+        }
+        if (str_contains($w, 'is not in project.json "visits"')
+            && preg_match("/^visit '([^']*)' \\(([^)]*)\\)/", $w, $vm)
+        ) {
+            $f->held('project.json', "ses-{$vm[1]} ({$vm[2]})",
+                "visit '{$vm[1]}' is not in project.json \"visits\" (" . implode(', ', $declaredVisits) . ')'
+                . ' - its examinations are held back (not ingested); everything else goes in',
+                'fix the ses- folder name, or add the visit to "visits" (and set it up in LORIS for the project and cohort)');
+            continue;
+        }
         $f->check(str_starts_with($w, 'organize: ') ? 'files' : 'participants', 'dicoms/', preg_replace('/^organize: /', '', $w));
     }
 
@@ -1280,9 +1454,8 @@ function validateUpload(
     }
 
     // --- LORIS values -------------------------------------------------------------
-    if ($api !== null) {
-        checkLorisValues($api, $projectConfig, $roster, $f);
-    }
+    $lorisResult = $api !== null ? checkLorisValues($api, $projectConfig, $roster, $f) : null;
+    summariseValues($f, $projectConfig, $roster, $linked, $declaredVisits, $lorisResult);
 
     // --- every examination: READY or BLOCKED ----------------------------------------
     $excluded = array_flip($plan['exclude_uids'] ?? []);
@@ -1302,6 +1475,10 @@ function validateUpload(
             $studiesOut[$uid] = ['line' => $line, 'status' => 'BLOCKED', 'why' => 'visit label not letters and digits'];
         } elseif (isset($excluded[$uid]) || isset($badPn[$uid])) {
             $studiesOut[$uid] = ['line' => $line, 'status' => 'BLOCKED', 'why' => 'see MUST FIX'];
+        } elseif ($declaredVisits !== []
+            && !in_array(strtolower((string) ($st['session'] ?? '')), array_map('strtolower', $declaredVisits), true)
+        ) {
+            $studiesOut[$uid] = ['line' => $line, 'status' => 'HELD', 'why' => 'visit not in project.json "visits" - see HELD BACK'];
         } else {
             $studiesOut[$uid] = ['line' => $line, 'status' => 'READY', 'why' => ''];
         }
