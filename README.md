@@ -389,20 +389,41 @@ The BIDS pipeline automates candidate creation, reidentification, and imaging im
 
 ### Required participants.tsv Format
 
-Participant metadata must be in BIDS `participants.tsv` file with required columns:
+Participant metadata must be in the BIDS `participants.tsv` file at
+`deidentified-raw/bids/participants.tsv`:
 
 ```tsv
-participant_id	age	sex	group	external_id	site	dob
-sub-EXTERNAL001	28	Female	control	EXTERNAL-001	UOHI	1995-01-15
-sub-EXTERNAL002	34	Male	patient	EXTERNAL-002	UOHI	1989-06-20
+participant_id	sex	dob	group	site	project
+sub-EXTERNAL001	Female	1995-01-15	control	UOHI	FDG PET
+sub-EXTERNAL002	Male	1989-06-20	patient	UOHI	FDG PET
 ```
 
-**Required columns:**
-- `participant_id` - BIDS subject ID (e.g., sub-EXTERNAL001)
-- `external_id` - External study identifier
-- `sex` - Male/Female (required by ARCHIMEDES)
-- `site` - ARCHIMEDES site name (must match database)
-- `dob` - Date of birth in YYYY-MM-DD format
+**Columns:**
+
+| Column | Required | Notes |
+|---|---|---|
+| `participant_id` | Yes | BIDS subject ID, e.g. `sub-EXTERNAL001`. Must match the `sub-*` folder names. |
+| `sex` | Yes | `Male`/`Female` (also `M`/`F`). Falls back to `candidate_defaults.sex`. |
+| `dob` | Yes | Date of birth, `YYYY-MM-DD` preferred. Falls back to `candidate_defaults.dob`. A participant with no valid DoB is not created. |
+| `site` | Yes | ARCHIMEDES site name (must match the database). Falls back to `candidate_defaults.site`. |
+| `project` | Yes | ARCHIMEDES project name, exactly as in LORIS (`FDG PET`, not `FDG-PET`). Can come from the `--project` flag or `candidate_defaults.project` instead. |
+| `external_id` | No | Defaults to `participant_id` without `sub-`. If supplied, it **must equal** that value (e.g. `EXTERNAL001`). |
+| `group` / `cohort` | No | Cohort label. Falls back to `candidate_defaults.cohort`. |
+
+> **Note:** BIDS labels cannot contain hyphens, so an `external_id` such as
+> `EXTERNAL-001` will never match `sub-EXTERNAL001` files. The reidentifier
+> derives its file-matching pattern from `external_id`, so a mismatched value
+> causes re-identification to match no files. Omit the column or keep it
+> identical to the label.
+
+**Minimal file**, with `site` and `project` set in `project.json` under
+`candidate_defaults`:
+
+```tsv
+participant_id	sex	dob
+sub-EXTERNAL001	Female	1995-01-15
+sub-EXTERNAL002	Male	1989-06-20
+```
 - `project` - ARCHIMEDES project name (optional if in project.json)
 
 ---
