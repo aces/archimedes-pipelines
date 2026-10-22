@@ -1264,7 +1264,6 @@ php scripts/run_participant_metadata_pipeline.php --all --force
 │   ├── clinical/
 │   ├── imaging/
 │   ├── bids/         
-│   │   └── derivatives/
 │   ├── participant_metadata/             # Participant metadata hash tracking
 │   └── freesurfer-output/                # Converted & cleaned data (NIfTI, MINC)
 │
