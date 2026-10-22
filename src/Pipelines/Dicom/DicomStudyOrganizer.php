@@ -6,7 +6,7 @@
  *
  * Walks a delivered upload laid out as sub-<id>/ses-<visit>/..., groups the
  * DICOMs by StudyInstanceUID, validates the delivery against the submission
- * guide, and writes an organised copy plus a manifest.
+ * guide, and writes an organized copy plus a manifest.
  *
  * Modality-agnostic: MR, PT, CT and anything else group identically. Modality
  * is recorded, never used to decide grouping.
@@ -21,7 +21,11 @@
  * @package  Archimedes
  */
 
-namespace LORIS\Pipelines;
+namespace LORIS\Pipelines\Dicom;
+
+use LORIS\Pipelines\Shared\SessionsTsv;
+use LORIS\Pipelines\Shared\SystemFiles;
+use LORIS\Pipelines\Shared\StudyFingerprint;
 
 class DicomStudyOrganizer
 {
@@ -33,9 +37,6 @@ class DicomStudyOrganizer
 
     /** Handoff to the next pipeline stage. */
     const MANIFEST_FILE = 'dicom_studies.json';
-
-    /** Subject folders starting with this are treated as phantoms. */
-    const PHANTOM_PREFIX = 'phantom';
 
     /**
      * DICOM tags read from every file, as [group, element, label].
@@ -59,7 +60,7 @@ class DicomStudyOrganizer
      * How headers are read: 'dcmdump' (default), 'pydicom', or
      * 'get_dicom_info'.
      *
-     * pydicom is what import_dicom_study.py uses, so the organiser and the
+     * pydicom is what import_dicom_study.py uses, so the organizer and the
      * importer agree by construction. It also avoids the Perl environment
      * that the LORIS-MRI install script sets up - PERL5LIB, NeuroDB/, a
      * writable temp directory - none of which a pipeline host is guaranteed
@@ -93,9 +94,6 @@ class DicomStudyOrganizer
     /** @var bool */
     private $move = false;
 
-    /** @var bool Treat every subject in this run as a phantom. */
-    private $phantomRun = false;
-
     /** @var bool Abort on the first study-level error rather than skipping. */
     private $strict = false;
 
@@ -104,15 +102,23 @@ class DicomStudyOrganizer
 
     /**
      * When true (the default), a study that cannot be resolved to a
-     * participant and visit is carried forward as a phantom rather than
-     * skipped. The reason is recorded in the manifest as phantom_reason.
+     * participant and visit is carried forward as unlinked (reported, never
+     * ingested) rather than rejected. The reason is in the manifest as
+     * link_reason.
      *
      * @var bool
      */
-    private $fallbackToPhantom = true;
+    private $fallbackToUnlinked = true;
 
     /** @var array<string, array> participant_id => row from participants.tsv */
     private $participants = [];
+
+    /** @var string[] OS metadata files skipped by the last scan (Shared\SystemFiles). */
+    private array $ignoredSystemFiles = [];
+
+    /** @var string Delivery root of the current organize() call. */
+    private string $sourceRoot = '';
+
 
     /** @var array<int, array> Problems found, for the caller to report. */
     private $problems = [];
@@ -141,7 +147,6 @@ class DicomStudyOrganizer
         'studies_skipped' => 0,
         'series_found'    => 0,
         'files_organized' => 0,
-        'phantom_studies' => 0,
         'unlinked_studies' => 0,
         'studies_degraded' => 0,
         'studies_relocated' => 0,
@@ -172,11 +177,6 @@ class DicomStudyOrganizer
     public function setMove(bool $v): void
     {
         $this->move = $v;
-    }
-
-    public function setPhantomRun(bool $v): void
-    {
-        $this->phantomRun = $v;
     }
 
     /**
@@ -264,10 +264,23 @@ class DicomStudyOrganizer
         $this->force = $v;
     }
 
+    /** @var bool Ignore participants.tsv (every study unlinked). Validator only. */
+    private bool $ignoreParticipants = false;
+
+    /**
+     * Organize as if there were no participants.tsv. Used only by
+     * run_dicom_validate.php when participants.tsv itself is unusable, so the
+     * files can still be checked. Never set by the pipeline.
+     */
+    public function setIgnoreParticipants(bool $v): void
+    {
+        $this->ignoreParticipants = $v;
+    }
+
     /**
      * Carry unresolvable studies forward as unlinked instead of skipping them.
      *
-     * Unlinked means archived with no participant link - not phantom.
+     * Unlinked means reported with no participant link, never ingested.
      *
      * @param bool $v Whether to degrade rather than skip.
      *
@@ -275,7 +288,7 @@ class DicomStudyOrganizer
      */
     public function setFallbackToUnlinked(bool $v): void
     {
-        $this->fallbackToPhantom = $v;
+        $this->fallbackToUnlinked = $v;
     }
 
     public function getStats(): array
@@ -309,7 +322,7 @@ class DicomStudyOrganizer
     // =========================================================================
 
     /**
-     * Organise every DICOM under $sourceDir.
+     * Organize every DICOM under $sourceDir.
      *
      * @param string $sourceDir Root of the delivered upload.
      *
@@ -389,13 +402,19 @@ class DicomStudyOrganizer
 
         $this->_ensureTargetDir();
 
-        $this->participants = $this->_loadParticipants($sourceDir);
+        $this->participants = $this->ignoreParticipants ? [] : $this->_loadParticipants($sourceDir);
+        $this->sourceRoot     = rtrim($sourceDir, '/');
         $this->_info(sprintf(
             'Loaded %d participant row(s) from participants.tsv',
             count($this->participants)
         ));
 
+        $this->ignoredSystemFiles = [];
         $candidates = $this->_findDicomCandidates($sourceDir);
+        $skipped    = SystemFiles::summary($this->ignoredSystemFiles, $sourceDir);
+        if ($skipped !== null) {
+            $this->_problem('warning', null, $skipped);
+        }
         if (empty($candidates)) {
             throw new \RuntimeException("No candidate files found under {$sourceDir}");
         }
@@ -408,6 +427,8 @@ class DicomStudyOrganizer
             throw new \RuntimeException('No readable DICOM files found');
         }
 
+        $headers = $this->_checkInstances($candidates, $headers);
+
         $this->_checkEmptyVisitFolders($sourceDir, $headers);
 
         $studies = $this->_groupByStudy($headers);
@@ -418,6 +439,15 @@ class DicomStudyOrganizer
         $tracking = $this->_readTracking();
         $manifest = [];
         $usedDirs = [];
+
+        // A study keeps the folder it was first organized into. Reserve those
+        // names up front so a new study can never take one, and so re-organizing
+        // (or --force) rewrites in place instead of creating MR_2, MR_3, ...
+        foreach ($tracking['studies'] ?? [] as $trackedStudy) {
+            if (!empty($trackedStudy['directory_name'])) {
+                $usedDirs[$trackedStudy['directory_name']] = true;
+            }
+        }
 
         foreach ($studies as $studyUid => $seriesMap) {
             // Change detection. The old behaviour - "seen this StudyInstanceUID
@@ -434,8 +464,18 @@ class DicomStudyOrganizer
                 }
             }
 
+            // A study that was removed from an earlier delivery and is back
+            // has no processed/ folder any more: organize it again. Its hashes
+            // are unchanged, so the later steps recognise it and nothing is
+            // re-imported.
+            $returned = $tracked !== null && !empty($tracked['removed_at']);
+            if ($returned) {
+                $this->_info("  {$studyUid}: back in the delivery (removed {$tracked['removed_at']})");
+                $this->stats['studies_returned'] = ($this->stats['studies_returned'] ?? 0) + 1;
+            }
+
             $comparison = StudyFingerprint::compare(
-                $this->force ? null : $tracked,
+                ($this->force || $returned) ? null : $tracked,
                 $studyFiles,
                 $sourceDir
             );
@@ -455,41 +495,88 @@ class DicomStudyOrganizer
                     $this->stats['studies_baselined']++;
                 }
 
-                // Refresh the stored hashes even when skipping, so a renamed
-                // copy does not force a byte read on every future run.
-                $tracking['studies'][$studyUid] = array_merge(
+                // The files are unchanged, but participants.tsv may not be: a
+                // subject added to it since the last run turns an unlinked study
+                // into a linked one. Link status is therefore re-evaluated every
+                // run; only the copy is skipped.
+                $current = $this->_buildEntry(
+                    $studyUid,
+                    $seriesMap,
+                    $usedDirs,
+                    $tracked['directory_name'] ?? null
+                );
+
+                $entry = array_merge(
                     $tracked,
                     StudyFingerprint::toTracking($comparison, $studyFiles, $sourceDir)
                 );
+
+                if ($current !== null) {
+                    $entry = $this->_refreshLink($studyUid, $entry, $current);
+
+                    $old = $tracked['directory_name'] ?? null;
+                    if ($old !== null && $old !== $current['directory_name']) {
+                        $this->_info("    renamed {$old} -> {$current['directory_name']}");
+                        if (!$this->dryRun && is_dir($this->_studyRoot() . '/' . $old)) {
+                            rename(
+                                $this->_studyRoot() . '/' . $old,
+                                $current['directory']
+                            );
+                        }
+                        $entry['directory_name'] = $current['directory_name'];
+                        $entry['directory']      = $current['directory'];
+                    }
+                }
+
+                // Refresh the stored hashes even when skipping, so a renamed
+                // copy does not force a byte read on every future run.
+                $tracking['studies'][$studyUid] = $entry;
 
                 if (!$this->dryRun) {
                     $this->_writeTracking($tracking);
                 }
 
-                $manifest[] = $tracked;
+                $manifest[] = $entry;
                 continue;
             }
 
             if ($tracked !== null) {
                 $this->stats['studies_rechanged']++;
                 $this->_warn(sprintf(
-                    '%s: %s - re-organising',
+                    '%s: %s - re-organizing',
                     $studyUid,
                     $comparison['reason']
                 ));
             }
 
-            $entry = $this->_buildEntry($studyUid, $seriesMap, $usedDirs);
+            $entry = $this->_buildEntry(
+                $studyUid,
+                $seriesMap,
+                $usedDirs,
+                $tracked['directory_name'] ?? null
+            );
 
             if ($entry === null) {
                 $this->stats['studies_skipped']++;
                 continue;
             }
 
+            if ($tracked !== null && !$this->dryRun) {
+                // Rewriting the same folder: clear the previous copy so changed
+                // or removed files do not linger, and unchanged ones are not
+                // duplicated as name_1.dcm.
+                $this->_removeStudyDir($entry['directory_name']);
+                if (($tracked['directory_name'] ?? '') !== ''
+                    && $tracked['directory_name'] !== $entry['directory_name']
+                ) {
+                    $this->_removeStudyDir($tracked['directory_name']);
+                }
+            }
+
             $this->_writeStudy($entry, $seriesMap);
 
             // Hashes are stored only after a successful write, so a stored
-            // fingerprint always means "this study was organised".
+            // fingerprint always means "this study was organized".
             $entry = array_merge(
                 $entry,
                 StudyFingerprint::toTracking($comparison, $studyFiles, $sourceDir)
@@ -502,6 +589,8 @@ class DicomStudyOrganizer
                 $this->_writeTracking($tracking);
             }
         }
+
+        $this->_handleRemovedStudies($tracking, $studies);
 
         // The manifest is written even in a dry run, marked as such, so the
         // downstream steps have something to read and the whole chain can be
@@ -540,6 +629,13 @@ class DicomStudyOrganizer
             }
 
             $name = $fileInfo->getFilename();
+
+            // OS metadata (._* from a Mac, .DS_Store, Thumbs.db): never data.
+            // Skipped before any header read, reported once as a warning.
+            if (SystemFiles::isIgnored($fileInfo->getPathname())) {
+                $this->ignoredSystemFiles[] = $fileInfo->getPathname();
+                continue;
+            }
 
             // DICOMDIR is an index, not an image; it confuses the archiver.
             if (strtoupper($name) === 'DICOMDIR') {
@@ -644,6 +740,10 @@ class DicomStudyOrganizer
                 );
         }
 
+        // SOPInstanceUID too (this reader only), to catch the same instance
+        // delivered twice - see _checkInstances().
+        $filter .= ' +P ' . escapeshellarg('0008,0018');
+
         $rows      = [];
         $scanned   = 0;
         $unreadable = 0;
@@ -679,6 +779,12 @@ class DicomStudyOrganizer
             $row['subject'] = $context['subject'];
             $row['session'] = $context['session'];
             $row['srcdir']  = $context['srcdir'];
+
+            foreach ($output as $line) {
+                if (preg_match('/^\s*\(0008,0018\)\s+UI\s+\[([^\]]*)\]/i', $line, $sm)) {
+                    $row['sop_instance_uid'] = trim($sm[1]);
+                }
+            }
 
             $rows[] = $row;
         }
@@ -975,7 +1081,8 @@ class DicomStudyOrganizer
     private function _buildEntry(
         string $studyUid,
         array $seriesMap,
-        array &$usedDirs
+        array &$usedDirs,
+        ?string $fixedDirName = null
     ): ?array {
         $allRows = [];
         foreach ($seriesMap as $rows) {
@@ -988,14 +1095,29 @@ class DicomStudyOrganizer
         $subject = $sample['subject'];
         $session = $sample['session'];
 
-        // Three states, not two:
+        // One examination belongs to one participant and one visit. Files of
+        // the same StudyInstanceUID under several sub-/ses- folders mean a
+        // copy or a misfiling; taking the first file's folder would ingest it
+        // under a participant chosen by sort order. Not organized - the error
+        // stops the project before anything is ingested.
+        $places = [];
+        foreach ($allRows as $row) {
+            $places[sprintf('sub-%s/ses-%s', $row['subject'] ?? '?', $row['session'] ?? '?')] = true;
+        }
+        if (count($places) > 1) {
+            $this->_problem('error', $studyUid, sprintf(
+                'StudyInstanceUID %s is in more than one participant/visit folder (%s) - '
+                . 'one examination must be in one place; not organized. Remove the extra copy.',
+                $studyUid,
+                implode(', ', array_keys($places))
+            ));
+            return null;
+        }
+
+        // Two states:
         //   linked   - resolvable to a participant and visit
-        //   unlinked - archived with no participant link (the default today)
-        //   phantom  - genuinely a phantom acquisition, IsPhantom = 1
-        // An unresolvable subject scan is unlinked, never phantom: setting
-        // IsPhantom on real patient data is far harder to undo later.
-        $isPhantom  = $this->_isPhantom($subject);
-        $linkStatus = $isPhantom ? 'phantom' : 'linked';
+        //   unlinked - no matching participant/visit: reported, never ingested
+        $linkStatus = 'linked';
         $linkReason = null;
 
         $where = sprintf(
@@ -1004,20 +1126,17 @@ class DicomStudyOrganizer
             $session ?? '?'
         );
 
-        // Phantom status is decided only by declaration. Everything below can
-        // downgrade a study to unlinked, never to phantom.
-
         // --- Subject derivable from the path ---------------------------------
-        if ($subject === null && !$isPhantom) {
+        if ($subject === null) {
             $degraded = $this->_degrade(
                 $studyUid,
-                'upload is not organised into sub- folders'
+                'upload is not organized into sub- folders'
             );
             if ($degraded === null) {
                 return null;
             }
             $linkStatus = 'unlinked';
-            $linkReason = 'not_organised';
+            $linkReason = 'not_organized';
         }
 
         // --- Session derivable from the path ----------------------------------
@@ -1058,9 +1177,40 @@ class DicomStudyOrganizer
             }
         }
 
+        // --- sub-<ID>_sessions.tsv ---------------------------------------------
+        // The guide asks for one row per visit. A ses- folder the site has not
+        // listed is not ingested until it is: like a participant folder without
+        // its participants.tsv row, it is reported and picked up on the run
+        // after the row is added. (Shared rule: Shared\SessionsTsv.)
+        if ($linkStatus === 'linked' && !$this->ignoreParticipants) {
+            $listed = SessionsTsv::listed($this->sourceRoot, (string) $subject);
+            $file   = "sub-{$subject}/" . basename(SessionsTsv::path($this->sourceRoot, (string) $subject));
+
+            if ($listed === null) {
+                $degraded = $this->_degrade(
+                    $studyUid,
+                    "{$where}: no sessions file (sessions.tsv or sub-{$subject}_sessions.tsv) in sub-{$subject}/"
+                );
+                if ($degraded === null) {
+                    return null;
+                }
+                $linkStatus = 'unlinked';
+                $linkReason = 'no_sessions_tsv';
+            } elseif (!in_array((string) $session, $listed, true)) {
+                $degraded = $this->_degrade(
+                    $studyUid,
+                    "{$where}: ses-{$session} is not listed in {$file}"
+                );
+                if ($degraded === null) {
+                    return null;
+                }
+                $linkStatus = 'unlinked';
+                $linkReason = 'not_in_sessions_tsv';
+            }
+        }
+
         // --- PatientName: informational only ------------------------------------
-        // Never affects link status. A phantom may legitimately carry a site
-        // external ID here.
+        // Never affects link status on its own; a mismatch is an error below.
         $names = [];
         foreach ($allRows as $row) {
             if ($row['patient_name'] !== '') {
@@ -1070,7 +1220,24 @@ class DicomStudyOrganizer
 
         $patientName = empty($names) ? '' : (string) array_key_first($names);
 
-        if (count($names) > 1) {
+        // PatientName is how the guide checks that files belong to the
+        // participant whose folder they are in. For a participant study a
+        // mismatch means misfiled or mixed data: flagged as an error, the study
+        // is not organized and the project stops before anything is ingested.
+        // Compared ignoring case and DICOM PN component separators (^).
+        $norm = static fn (string $v): string => strtolower(trim(rtrim(trim($v), '^')));
+
+        if (count($names) > 1 && $linkStatus === 'linked'
+            && count(array_unique(array_map($norm, array_keys($names)))) > 1
+        ) {
+            $this->_problem('error', $studyUid, sprintf(
+                '%s: PATIENTNAME MISMATCH - more than one PatientName within a single study (%s); '
+                . 'not organized, nothing is ingested until fixed',
+                $where,
+                implode(', ', array_keys($names))
+            ));
+            return null;
+        } elseif (count($names) > 1 && $linkStatus !== 'linked') {
             $this->_problem('warning', $studyUid, sprintf(
                 '%s: more than one PatientName within a single study (%s)',
                 $where,
@@ -1080,22 +1247,23 @@ class DicomStudyOrganizer
             $this->_problem(
                 'warning',
                 $studyUid,
-                "{$where}: PatientName is empty; using the sub- folder as external ID"
+                "{$where}: PatientName is empty; using the sub- folder as external ID (cannot be checked)"
             );
-        } elseif ($linkStatus === 'linked' && $subject !== null && $patientName !== $subject) {
-            $this->_problem('warning', $studyUid, sprintf(
-                '%s: PatientName "%s" differs from the sub- folder; using the folder',
+        } elseif ($linkStatus === 'linked' && $subject !== null && $norm($patientName) !== $norm($subject)) {
+            $this->_problem('error', $studyUid, sprintf(
+                '%s: PATIENTNAME MISMATCH - PatientName "%s" does not match the folder sub-%s; '
+                . 'misfiled or mixed data? Not organized, nothing is ingested until fixed',
                 $where,
-                $patientName
+                $patientName,
+                $subject
             ));
+            return null;
         }
 
         // For a linked subject the folder wins; otherwise keep the header value.
         $externalId = $linkStatus === 'linked'
             ? ($subject ?? $patientName)
             : ($patientName !== '' ? $patientName : ($subject ?? ''));
-
-        $isPhantom = ($linkStatus === 'phantom');
 
         // --- Build the entry ---------------------------------------------------
         $modalities = [];
@@ -1123,7 +1291,10 @@ class DicomStudyOrganizer
 
         $preservedName = null;
 
-        if ($this->preserveSourceNames && count($sourceDirs) === 1) {
+        // Only outside a sub-/ses- layout: inside one, the leaf folder is the
+        // site's grouping (MR/, PET/, ...), not its name for the study, and
+        // keeping it produces MR, MR_2, MR_3 across subjects and visits.
+        if ($this->preserveSourceNames && count($sourceDirs) === 1 && $subject === null) {
             $only = (string) array_key_first($sourceDirs);
             $base = basename($only);
 
@@ -1132,7 +1303,18 @@ class DicomStudyOrganizer
             }
         }
 
-        $dirName = $preservedName !== null
+        // Keep the tracked folder name across runs, unless the link status it
+        // spells out changed: sub-ARCHI0003 added to participants.tsv must not
+        // stay in unlinked-sub-ARCHI0003_ses-V01_MR.
+        if ($fixedDirName !== null && $subject !== null
+            && $this->_statusPrefix($fixedDirName) !== ($linkStatus === 'linked' ? '' : $linkStatus . '-')
+        ) {
+            $fixedDirName = null;
+        }
+
+        $dirName = $fixedDirName !== null && $fixedDirName !== ''
+            ? $fixedDirName
+            : ($preservedName !== null
             ? $this->_uniqueName($this->_slugPart($preservedName), $usedDirs)
             : $this->_studyDirName(
                 $subject,
@@ -1142,12 +1324,10 @@ class DicomStudyOrganizer
                 $linkStatus,
                 $sample['study_date'],
                 $studyUid
-            );
+            ));
         $usedDirs[$dirName] = true;
 
-        if ($linkStatus === 'phantom') {
-            $this->stats['phantom_studies']++;
-        } elseif ($linkStatus === 'unlinked') {
+        if ($linkStatus === 'unlinked') {
             $this->stats['unlinked_studies']++;
         }
 
@@ -1177,12 +1357,233 @@ class DicomStudyOrganizer
             'modalities'         => $modalities,
             'link_status'        => $linkStatus,
             'link_reason'        => $linkReason,
-            'is_phantom'         => $isPhantom,
             'series_count'       => count($seriesEntries),
             'file_count'         => count($allRows),
             'organized_at'       => date('c'),
             'series'             => $seriesEntries,
         ];
+    }
+
+    /**
+     * Apply a freshly computed link status to a tracked (unchanged) study.
+     *
+     * @param string $studyUid StudyInstanceUID.
+     * @param array  $tracked  Stored entry.
+     * @param array  $current  Entry rebuilt from the current participants.tsv.
+     *
+     * @return array Entry to store and hand downstream.
+     */
+    private function _refreshLink(string $studyUid, array $tracked, array $current): array
+    {
+        $fields = ['link_status', 'link_reason', 'external_id',
+                   'subject', 'session', 'patient_name'];
+
+        $before = $tracked['link_status'] ?? '?';
+        $entry  = array_merge($tracked, array_intersect_key($current, array_flip($fields)));
+
+        if ($before !== $entry['link_status']
+            || ($tracked['external_id'] ?? null) !== ($entry['external_id'] ?? null)
+        ) {
+            $entry['relinked_at'] = date('c');
+            $this->stats['studies_relinked'] = ($this->stats['studies_relinked'] ?? 0) + 1;
+            $this->_info(sprintf(
+                '  %s: link updated %s -> %s%s',
+                $studyUid,
+                $before,
+                $entry['link_status'],
+                $entry['link_reason'] ? " ({$entry['link_reason']})" : ''
+            ));
+        }
+
+        return $entry;
+    }
+
+    /**
+     * Delete one organized study folder (processed/ only).
+     *
+     * @param string $dirName Study directory name.
+     *
+     * @return void
+     */
+    /**
+     * Studies organized by an earlier run that are no longer in the delivery.
+     *
+     * The delivery is the source of truth for the working copies: the
+     * processed/ folder is removed so later steps cannot import it again.
+     * The tracking entry is KEPT (marked removed_at) so a re-deposit of the
+     * same study is recognised instead of treated as new. LORIS is never
+     * touched here - the import step reports what LORIS still holds.
+     *
+     * @param array $tracking Tracking state, updated in place.
+     * @param array $studies  Studies found in this delivery, keyed by UID.
+     */
+    private function _handleRemovedStudies(array &$tracking, array $studies): void
+    {
+        foreach ($tracking['studies'] ?? [] as $uid => $tracked) {
+            if (isset($studies[$uid]) || !empty($tracked['removed_at'])) {
+                continue;
+            }
+
+            $dir = $tracked['directory_name'] ?? '?';
+            $this->stats['studies_removed'] = ($this->stats['studies_removed'] ?? 0) + 1;
+            $this->_problem('warning', $uid, sprintf(
+                'REMOVED from delivery: %s (%s) - %s; LORIS is not changed',
+                $uid,
+                $dir,
+                $this->dryRun ? 'would remove processed copy' : 'processed copy removed'
+            ));
+
+            if ($this->dryRun) {
+                continue;
+            }
+
+            if ($dir !== '?') {
+                $this->_removeStudyDir($dir);
+            }
+            $tracking['studies'][$uid]['removed_at'] = date('c');
+        }
+
+        if (!$this->dryRun) {
+            $this->_writeTracking($tracking);
+        }
+    }
+
+    /**
+     * Files that must not be archived silently.
+     *
+     *   - A file that looks like DICOM (DICM marker, or a .dcm/.ima name) but
+     *     could not be read is truncated or corrupt. Archiving the study without
+     *     it would lose a slice without anyone knowing: error.
+     *   - The same SOPInstanceUID twice: a byte-identical copy (a folder copied
+     *     twice) is dropped with a warning; different bytes under one instance
+     *     UID is a conflict: error.
+     *
+     * Errors stop the project before anything is ingested.
+     *
+     * @param array $candidates Path => context, every file considered.
+     * @param array $headers    Readable rows.
+     *
+     * @return array Rows with byte-identical duplicate instances removed.
+     */
+    private function _checkInstances(array $candidates, array $headers): array
+    {
+        $read = [];
+        foreach ($headers as $row) {
+            $read[$row['path']] = true;
+        }
+
+        // Grouped by the sub-/ses- folder they are in, so the studies of that
+        // folder (only) can be excluded if the operator continues without them.
+        $corrupt = [];
+        foreach ($candidates as $path => $context) {
+            if (isset($read[$path])) {
+                continue;
+            }
+            $ext  = strtolower(pathinfo($path, PATHINFO_EXTENSION));
+            $head = @file_get_contents($path, false, null, 128, 4);
+            if ($head === 'DICM' || in_array($ext, ['dcm', 'ima', 'dicom'], true)) {
+                $key = ($context['subject'] ?? '') . '|' . ($context['session'] ?? '');
+                $corrupt[$key]['subject'] = $context['subject'] ?? null;
+                $corrupt[$key]['session'] = $context['session'] ?? null;
+                $corrupt[$key]['files'][] = $path;
+            }
+        }
+
+        foreach ($corrupt as $place) {
+            $where = $place['subject'] !== null
+                ? sprintf('sub-%s/ses-%s', $place['subject'], $place['session'] ?? '?')
+                : 'outside sub-/ses- folders';
+            $this->_problem('error', null, sprintf(
+                '%s: %d file(s) look like DICOM but could not be read (truncated, empty or corrupt) - '
+                . 'fix or remove them: %s%s',
+                $where,
+                count($place['files']),
+                implode(', ', array_map('basename', array_slice($place['files'], 0, 5))),
+                count($place['files']) > 5 ? ' ...' : ''
+            ), $place['subject'] !== null
+                ? ['place_subject' => $place['subject'], 'place_session' => $place['session']]
+                : []);
+        }
+
+        $seen  = [];
+        $place = [];
+        $kept  = [];
+        foreach ($headers as $row) {
+            $sop = $row['sop_instance_uid'] ?? '';
+            if ($sop === '') {
+                $kept[] = $row;
+                continue;
+            }
+            if (!isset($seen[$sop])) {
+                $seen[$sop]  = $row['path'];
+                $place[$sop] = ($row['subject'] ?? '') . '/' . ($row['session'] ?? '');
+                $kept[]      = $row;
+                continue;
+            }
+            // A copy under ANOTHER participant or visit is not a harmless
+            // duplicate: which one is right is unknown. Keep both rows so the
+            // one-study-one-place check rejects it with both locations.
+            $samePlace = $place[$sop] === (($row['subject'] ?? '') . '/' . ($row['session'] ?? ''));
+            if ($samePlace && @hash_file('sha256', $seen[$sop]) === @hash_file('sha256', $row['path'])) {
+                $this->_problem('warning', $row['study_instance_uid'] ?? null, sprintf(
+                    'duplicate copy of instance %s ignored: %s (same as %s)',
+                    $sop,
+                    $row['path'],
+                    $seen[$sop]
+                ));
+                $this->stats['duplicate_files'] = ($this->stats['duplicate_files'] ?? 0) + 1;
+                continue;
+            }
+            if (!$samePlace) {
+                $kept[] = $row;
+                continue;
+            }
+            $this->_problem('error', $row['study_instance_uid'] ?? null, sprintf(
+                'SOPInstanceUID %s is used by two different files (%s, %s) - conflicting '
+                . 'instances; fix the delivery',
+                $sop,
+                $seen[$sop],
+                $row['path']
+            ));
+            $kept[] = $row;
+        }
+
+        return $kept;
+    }
+
+    /**
+     * Link-status prefix a study folder name carries ('unlinked-' or '').
+     */
+    private function _statusPrefix(string $dirName): string
+    {
+        foreach (['unlinked-'] as $prefix) {
+            if (str_starts_with($dirName, $prefix)) {
+                return $prefix;
+            }
+        }
+
+        return '';
+    }
+
+    private function _removeStudyDir(string $dirName): void
+    {
+        $root = realpath($this->_studyRoot());
+        $dir  = realpath($this->_studyRoot() . '/' . $dirName);
+
+        if ($root === false || $dir === false || !str_starts_with($dir, $root . '/')) {
+            return;
+        }
+
+        $it = new \RecursiveIteratorIterator(
+            new \RecursiveDirectoryIterator($dir, \FilesystemIterator::SKIP_DOTS),
+            \RecursiveIteratorIterator::CHILD_FIRST
+        );
+
+        foreach ($it as $file) {
+            $file->isDir() ? rmdir($file->getPathname()) : unlink($file->getPathname());
+        }
+
+        rmdir($dir);
     }
 
     /**
@@ -1220,26 +1621,6 @@ class DicomStudyOrganizer
     }
 
     /**
-     * Is this subject a phantom?
-     *
-     * @param string|null $subject Subject identifier.
-     *
-     * @return bool
-     */
-    private function _isPhantom(?string $subject): bool
-    {
-        if ($this->phantomRun) {
-            return true;
-        }
-
-        if ($subject === null) {
-            return false;
-        }
-
-        return stripos($subject, self::PHANTOM_PREFIX) === 0;
-    }
-
-    /**
      * Record a study-level error and skip the study.
      *
      * @param string $studyUid StudyInstanceUID.
@@ -1263,9 +1644,9 @@ class DicomStudyOrganizer
     /**
      * Handle a failed resolution check.
      *
-     * With the phantom fallback on, this records a warning and returns true so
-     * the caller carries the study forward as a phantom. With it off, the
-     * study is rejected outright.
+     * With the unlinked fallback on (the default), this records a warning and
+     * returns true so the caller carries the study forward as unlinked. With
+     * it off, the study is rejected outright.
      *
      * @param string $studyUid StudyInstanceUID.
      * @param string $message  What could not be resolved.
@@ -1281,7 +1662,7 @@ class DicomStudyOrganizer
             throw new \RuntimeException("Strict mode: {$message}");
         }
 
-        if (!$this->fallbackToPhantom) {
+        if (!$this->fallbackToUnlinked) {
             $this->_problem('error', $studyUid, $message);
             return null;
         }
@@ -1290,19 +1671,19 @@ class DicomStudyOrganizer
         $this->_problem(
             'warning',
             $studyUid,
-            $message . ' - archiving UNLINKED (no participant link)'
+            $message . ' - UNLINKED: not processed or ingested until it matches a participant'
         );
 
         return true;
     }
 
-    private function _problem(string $level, ?string $studyUid, string $message): void
+    private function _problem(string $level, ?string $studyUid, string $message, array $extra = []): void
     {
         $this->problems[] = [
             'level'              => $level,
             'study_instance_uid' => $studyUid,
             'message'            => $message,
-        ];
+        ] + $extra;
 
         if ($level === 'error') {
             $this->_error($message);
@@ -1316,7 +1697,7 @@ class DicomStudyOrganizer
     // =========================================================================
 
     /**
-     * Copy or move a study's files into its organised layout.
+     * Copy or move a study's files into its organized layout.
      *
      * @param array $entry     Manifest entry from _buildEntry().
      * @param array $seriesMap SeriesInstanceUID => rows.
@@ -1327,9 +1708,8 @@ class DicomStudyOrganizer
     {
         $this->_info("  {$entry['study_instance_uid']}");
         $this->_info(sprintf(
-            '    -> %s%s',
-            $entry['directory_name'],
-            $entry['is_phantom'] ? '   [phantom]' : ''
+            '    -> %s',
+            $entry['directory_name']
         ));
 
         foreach ($entry['series'] as $seriesEntry) {
@@ -1433,15 +1813,10 @@ class DicomStudyOrganizer
             ? 'NA'
             : implode('-', array_map([$this, '_slugPart'], $modalities));
 
-        $prefix = '';
-        if ($linkStatus === 'phantom') {
-            $prefix = 'phantom-';
-        } elseif ($linkStatus === 'unlinked') {
-            $prefix = 'unlinked-';
-        }
+        $prefix = $linkStatus === 'unlinked' ? 'unlinked-' : '';
 
         if ($subject === null) {
-            // Unorganised upload: nothing in the path identifies it, so fall
+            // Unorganized upload: nothing in the path identifies it, so fall
             // back to the study's own attributes.
             $parts = explode('.', $studyUid);
             $tail  = substr(end($parts), 0, 12);
@@ -1539,8 +1914,8 @@ class DicomStudyOrganizer
     /**
      * Load participants.tsv from the upload root.
      *
-     * Absence is not fatal here - it is reported per study instead, so a
-     * phantom-only delivery works without one.
+     * Absence is not fatal here - it is reported per study instead (every
+     * study is then unlinked).
      *
      * @param string $sourceDir Upload root.
      *
@@ -1697,7 +2072,13 @@ class DicomStudyOrganizer
      */
     private function _atomicWriteJson(string $path, array $data): void
     {
-        $json = json_encode($data, JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES);
+        // Header text in another character set (SpecificCharacterSet ISO_IR 100,
+        // a Latin-1 SeriesDescription) is not valid UTF-8 and would make
+        // json_encode fail, stopping the whole delivery. Substitute instead.
+        $json = json_encode(
+            $data,
+            JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES | JSON_INVALID_UTF8_SUBSTITUTE
+        );
 
         if ($json === false) {
             throw new \RuntimeException(
@@ -1746,5 +2127,119 @@ class DicomStudyOrganizer
         } else {
             $this->logger->warning($message);
         }
+    }
+
+    // =========================================================================
+    //  Project selection, shared by every DICOM script and the bundle:
+    //  enabled in the config + Imaging in project.json; upload quiet period.
+    // =========================================================================
+
+    /**
+     * Why this project must not be processed for DICOM, or null if it may.
+     *
+     * @param string $projectPath Project root (holds project.json).
+     */
+    public static function projectSkipReason(string $projectPath): ?string
+    {
+        $json = rtrim($projectPath, '/') . '/project.json';
+
+        if (!is_file($json)) {
+            return "no project.json at {$json}";
+        }
+
+        $config = json_decode((string) file_get_contents($json), true);
+
+        if (!is_array($config)) {
+            return "project.json is not valid JSON: {$json}";
+        }
+
+        $modalities = array_map(
+            static fn ($m) => strtolower((string) $m),
+            (array) ($config['modalities'] ?? [])
+        );
+
+        if (!in_array('imaging', $modalities, true)) {
+            return 'project.json "modalities" does not include "Imaging"';
+        }
+
+        return null;
+    }
+
+    /**
+     * Is the delivery still being written?
+     *
+     * A run that starts while a site is uploading would organize half a study
+     * and read a half-written participants.tsv. If anything under the raw
+     * delivery changed within the quiet period, the project is left for the
+     * next run. Stat calls only.
+     *
+     * @param string $rawDir  deidentified-raw/imaging/dicoms
+     * @param int    $minutes Quiet period; 0 disables the check.
+     *
+     * @return string|null Reason to wait, or null.
+     */
+    public static function uploadInProgress(string $rawDir, int $minutes): ?string
+    {
+        if ($minutes <= 0 || !is_dir($rawDir)) {
+            return null;
+        }
+
+        $newest = 0;
+        $it = new \RecursiveIteratorIterator(
+            new \RecursiveDirectoryIterator($rawDir, \FilesystemIterator::SKIP_DOTS),
+            \RecursiveIteratorIterator::SELF_FIRST
+        );
+        foreach ($it as $f) {
+            $newest = max($newest, (int) $f->getMTime());
+        }
+
+        $age = time() - $newest;
+        if ($newest > 0 && $age < $minutes * 60) {
+            return sprintf(
+                'delivery changed %ds ago (quiet period %d min) - probably still uploading; '
+                . 'left for the next run',
+                $age,
+                $minutes
+            );
+        }
+
+        return null;
+    }
+
+    /**
+     * Apply both rules to one configured project.
+     *
+     * @param string $label            collection/project, for messages.
+     * @param string $projectPath      Project root.
+     * @param bool   $enabled          Collection AND project enabled in the config.
+     * @param bool   $namedExplicitly  Selected by --project (or its collection by
+     *                                 --collection, for a disabled collection).
+     *
+     * @return bool True when the project should be processed. Writes the reason
+     *              to STDERR when it is skipped or run despite being disabled.
+     */
+    public static function acceptProject(
+        string $label,
+        string $projectPath,
+        bool $enabled,
+        bool $namedExplicitly
+    ): bool {
+        if (!$enabled && !$namedExplicitly) {
+            return false;   // silent: --all / --collection only cover enabled projects
+        }
+
+        $reason = self::projectSkipReason($projectPath);
+
+        if ($reason !== null) {
+            fwrite(STDERR, "  SKIP {$label}: {$reason}\n");
+            return false;
+        }
+
+        if (!$enabled) {
+            fwrite(STDERR, "  WARNING {$label} is disabled in the config - "
+                . "running only because it was named explicitly\n");
+        }
+
+        return true;
     }
 }

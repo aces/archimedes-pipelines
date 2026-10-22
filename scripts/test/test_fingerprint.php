@@ -1,7 +1,8 @@
 <?php
-require __DIR__ . '/../../src/Pipelines/StudyFingerprint.php';
-require __DIR__ . '/../../src/Pipelines/FingerprintTracker.php';
-use LORIS\Pipelines\{StudyFingerprint, FingerprintTracker};
+require __DIR__ . '/../../src/Pipelines/Shared/StudyFingerprint.php';
+require __DIR__ . '/../../src/Pipelines/Shared/FingerprintTracker.php';
+use LORIS\Pipelines\Shared\StudyFingerprint;
+use LORIS\Pipelines\Shared\FingerprintTracker;
 
 $pass=0; $fail=0;
 function ok($cond,$label){ global $pass,$fail; if($cond){$pass++; printf("  PASS  %s\n",$label);} else {$fail++; printf("  FAIL  %s\n",$label);} }

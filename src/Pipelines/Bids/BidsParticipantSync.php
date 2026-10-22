@@ -2,7 +2,11 @@
 
 declare(strict_types=1);
 
-namespace LORIS\Pipelines;
+namespace LORIS\Pipelines\Bids;
+
+use LORIS\Endpoints\LorisApiClientAdapter;
+use LORIS\Pipelines\Shared\ParticipantSync;
+use LORIS\Pipelines\Shared\ParticipantsTsv;
 
 use Monolog\Logger;
 use Monolog\Handler\StreamHandler;
@@ -16,9 +20,19 @@ use LORIS\Utils\Dob;
  * ExtStudyIDs. Continues processing all participants even on individual
  * failures. All errors written to a dedicated error log.
  *
- * Log files in {projectPath}/logs/:
- *   bids_sync_run_{timestamp}.log    — full run log
- *   bids_sync_errors_{timestamp}.log — errors only (created on first error)
+ * Log files in {projectPath}/logs/bids/ (same folder as the BIDS reidentifier and import):
+ *   bids_participant_sync_run_{timestamp}.log    — full run log
+ *   bids_participant_sync_errors_{timestamp}.log — errors only (created on first error)
+ *
+ * Shared with DICOM and other modalities (see docs/dicom.md section 13):
+ *   participants.tsv parsing  ParticipantsTsv::readRows()
+ *   sex normalisation         LorisApiClientAdapter::normaliseSexValue()
+ *                             (+ project.json sex_mappings)
+ *   external ID columns       ParticipantSync::EXTERNAL_ID_COLUMNS
+ *   orphan folders / rows     ParticipantSync::orphanFolders()
+ * BIDS-specific and unchanged: PSCID = external ID, CandidatesPlus with the
+ * legacy fallback, LORIS project validation, per-field default warnings,
+ * subject containment (file-name prefix), per-participant skip on errors.
  *
  * DoB (shared policy: LORIS\Utils\Dob, same as clinical and DICOM):
  *   Source participants.tsv, then candidate_defaults.dob; normalised to
@@ -110,12 +124,12 @@ class BidsParticipantSync
 
     private function _openLogs(string $projectPath): void
     {
-        $this->logDir = "{$projectPath}/logs";
+        $this->logDir = "{$projectPath}/logs/bids";
         if (!is_dir($this->logDir)) {
             @mkdir($this->logDir, 0755, true);
         }
 
-        $this->runLogPath = "{$this->logDir}/bids_sync_run_{$this->runTimestamp}.log";
+        $this->runLogPath = "{$this->logDir}/bids_participant_sync_run_{$this->runTimestamp}.log";
         $this->runLogFh   = @fopen($this->runLogPath, 'a');
 
         if ($this->runLogFh) {
@@ -141,7 +155,7 @@ class BidsParticipantSync
         if ($this->errorFh !== null || $this->logDir === null) {
             return;
         }
-        $this->errorLogPath = "{$this->logDir}/bids_sync_errors_{$this->runTimestamp}.log";
+        $this->errorLogPath = "{$this->logDir}/bids_participant_sync_errors_{$this->runTimestamp}.log";
         $this->errorFh      = @fopen($this->errorLogPath, 'a');
         if ($this->errorFh) {
             $sep = str_repeat('=', 72);
@@ -481,28 +495,21 @@ class BidsParticipantSync
             $this->_error("PARTICIPANTS_TSV", "File not found: {$tsvFile}");
             return [];
         }
-        $handle = fopen($tsvFile, 'r');
-        if ($handle === false) {
+        // Shared parser (ParticipantsTsv::readRows, same as DICOM and other
+        // modalities): fgetcsv on tabs, so an empty first cell no longer shifts
+        // the row's columns. Messages and per-row skipping are unchanged.
+        try {
+            $parsed = ParticipantsTsv::readRows($tsvFile);
+        } catch (\RuntimeException $e) {
             $this->_error("PARTICIPANTS_TSV", "Cannot open: {$tsvFile}");
             return [];
         }
-        $headerLine = fgets($handle);
-        if ($headerLine === false) {
-            fclose($handle);
+        if ($parsed['columns'] === []) {
             $this->_error("PARTICIPANTS_TSV", "Empty file: {$tsvFile}");
             return [];
         }
-        $headers      = array_map('trim', explode("\t", $headerLine));
         $participants = [];
-        $lineNum      = 1;
-
-        while (($line = fgets($handle)) !== false) {
-            $lineNum++;
-            $line = trim($line);
-            if ($line === '') continue;
-            $fields = array_map('trim', explode("\t", $line));
-            $row    = [];
-            foreach ($headers as $i => $header) $row[$header] = $fields[$i] ?? '';
+        foreach ($parsed['rows'] as ['line' => $lineNum, 'row' => $row]) {
             if (empty($row['participant_id'])) {
                 $this->_error("PARTICIPANTS_TSV",
                     "Line {$lineNum}: missing participant_id — skipping row"
@@ -511,7 +518,6 @@ class BidsParticipantSync
             }
             $participants[] = $row;
         }
-        fclose($handle);
         $this->_log("  Parsed " . count($participants) . " participants from participants.tsv");
         return $participants;
     }
@@ -526,8 +532,7 @@ class BidsParticipantSync
 
     private function _extractExternalID(array $row): ?string
     {
-        foreach (['external_id','ExternalID','externalid','study_id','StudyID',
-                     'studyid','ext_study_id','ExtStudyID'] as $col) {
+        foreach (ParticipantSync::EXTERNAL_ID_COLUMNS as $col) {
             if (!empty($row[$col])) return trim($row[$col]);
         }
         $pid = $row['participant_id'] ?? '';
@@ -537,14 +542,13 @@ class BidsParticipantSync
 
     private function _extractSex(array $row): ?string
     {
-        $raw = strtolower(trim($row['sex'] ?? $row['Sex'] ?? $row['gender'] ?? ''));
-        return match ($raw) {
-            'm', 'male'                        => 'Male',
-            'f', 'female'                      => 'Female',
-            'o', 'other', 'nb', 'non-binary',
-            'nonbinary', 'unknown', 'u', 'n/a' => 'Other',
-            default                             => null,
-        };
+        // Shared with DICOM and other modalities: same baseline as before
+        // (m/male, f/female, o/other/nb/unknown/u/n/a) plus project.json
+        // sex_mappings, e.g. {"1": "Male", "2": "Female"}.
+        return LorisApiClientAdapter::normaliseSexValue(
+            (string) ($row['sex'] ?? $row['Sex'] ?? $row['gender'] ?? ''),
+            $this->projectDefaults['sex_mappings'] ?? []
+        );
     }
 
     // =========================================================================
@@ -930,27 +934,28 @@ class BidsParticipantSync
         $this->_log("───────────────────────────────────────────────────────────");
         $this->_log("Validating BIDS structure...");
 
-        foreach ($bidsSubjects as $subDir) {
-            if (!isset($participantMap[$subDir])) {
-                $this->stats['orphan_directories'][] = $subDir;
-                $this->_error("ORPHAN_DIR",
-                    "{$subDir} — directory exists in BIDS but NOT in participants.tsv."
-                    . " Cannot determine ExtStudyID. Will be skipped by reidentifier."
-                );
-            }
+        // Shared orphan check (ParticipantSync::orphanFolders): exact folder
+        // names, as BIDS requires participant_id = the sub-* folder name.
+        $orphans = ParticipantSync::orphanFolders(array_keys($participantMap), $bidsDir);
+
+        foreach ($orphans['dirs'] as $subDir) {
+            $this->stats['orphan_directories'][] = $subDir;
+            $this->_error("ORPHAN_DIR",
+                "{$subDir} — directory exists in BIDS but NOT in participants.tsv."
+                . " Cannot determine ExtStudyID. Will be skipped by reidentifier."
+            );
         }
 
-        foreach ($participantMap as $pid => $row) {
-            if (!in_array($pid, $bidsSubjects)) {
-                $this->stats['missing_directories'][] = $pid;
-                $extID = $this->_extractExternalID($row);
-                $this->_error("MISSING_DIR",
-                    "{$pid} — listed in participants.tsv"
-                    . ($extID ? " (ExtStudyID={$extID})" : "")
-                    . " but no sub-* directory found in {$bidsDir}."
-                    . " Candidate will be created but no BIDS data exists to reidentify."
-                );
-            }
+        foreach ($orphans['rows'] as $pid) {
+            $row = $participantMap[$pid];
+            $this->stats['missing_directories'][] = $pid;
+            $extID = $this->_extractExternalID($row);
+            $this->_error("MISSING_DIR",
+                "{$pid} — listed in participants.tsv"
+                . ($extID ? " (ExtStudyID={$extID})" : "")
+                . " but no sub-* directory found in {$bidsDir}."
+                . " Candidate will be created but no BIDS data exists to reidentify."
+            );
         }
 
         if (empty($this->stats['orphan_directories'])

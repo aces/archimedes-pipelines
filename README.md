@@ -343,6 +343,11 @@ php scripts/run_clinical_pipeline.php --collection=COLLECTION_NAME --project=PRO
 
 ## BIDS/Imaging Ingestion Workflow
 
+> **Shared participant logic.** BIDS participant sync reads `participants.tsv`, maps sex
+> (including `project.json` `sex_mappings`), finds the external-ID column and checks orphan
+> folders with the same code as DICOM and the other modalities. See
+> [docs/dicom.md §13](docs/dicom.md#13-reusing-the-participant-step-for-other-modalities).
+
 The BIDS pipeline automates candidate creation, reidentification, and imaging import in three distinct steps:
 
 ```
@@ -358,7 +363,7 @@ The BIDS pipeline automates candidate creation, reidentification, and imaging im
    └── For each enabled Project:
        ├── Load project.json configuration
        ├── Check if modality (imaging) is enabled
-       ├── Setup logging to project logs/bids_*_YYYY-MM-DD.log
+       ├── Setup logging to the project's logs/bids/
        └── Continue to BIDS processing
 
 3. STEP 1: Participant Sync (Create ARCHIMEDES Candidates)
@@ -368,7 +373,7 @@ The BIDS pipeline automates candidate creation, reidentification, and imaging im
    ├── Check if candidate exists (CBIGR mapper)
    ├── Create candidate (ARCHIMEDES API)
    ├── Link ExternalID to candidate 
-   └── Log to logs/bids_participant_sync_YYYY-MM-DD.log
+   └── Log to logs/bids/bids_participant_sync_run_<timestamp>.log (+ _errors_ on errors)
 
 4. STEP 2: BIDS Reidentification (Map ExternalID → PSCID)
    ├── Script: run_bids_reidentifier.php
@@ -376,14 +381,14 @@ The BIDS pipeline automates candidate creation, reidentification, and imaging im
    ├── Execute CBIGR Script API: bidsreidentifier
    ├── Rename: sub-{ExternalID} → sub-{PSCID}
    ├── Copy to deidentified-lorisid/bids/
-   └── Log to logs/bids_reidentifier_YYYY-MM-DD.log
+   └── Log to logs/bids/bids_reidentifier_run_<timestamp>.log (+ _errors_ on errors)
 
 5. STEP 3: BIDS Import (Ingest into LORIS-MRI)
-   ├── Script: run_imaging_pipeline.php
+   ├── Script: run_bids_import.php
    ├── Scan deidentified-lorisid/bids/ for new sessions
    ├── Execute CBIGR Script API: bidsimport
    ├── Mark sessions as processed
-   ├── Log to logs/imaging_YYYY-MM-DD.log
+   ├── Log to logs/bids/bids_import_run_<timestamp>.log (+ _errors_ on errors)
    └── Send email notification (if enabled)
 ```
 
@@ -437,15 +442,15 @@ Source/target directories are resolved automatically from `project.json → data
 
 ```bash
 # Dry run (recommended first)
-php scripts/run_bids_participant_sync.php \
+php scripts/bids/run_bids_participant_sync.php \
     --collection=COLLECTION --project=PROJECT --dry-run -v
 
 # Live run
-php scripts/run_bids_participant_sync.php \
+php scripts/bids/run_bids_participant_sync.php \
     --collection=COLLECTION --project=PROJECT --confirm
 
 # All projects
-php scripts/run_bids_participant_sync.php --all --confirm
+php scripts/bids/run_bids_participant_sync.php --all --confirm
 ```
 
 ### Step 2: BIDS Reidentification
@@ -455,19 +460,19 @@ Source/target directories are resolved automatically from `project.json → data
 
 ```bash
 # Dry run (recommended first)
-php scripts/run_bids_reidentifier.php \
+php scripts/bids/run_bids_reidentifier.php \
     --collection=COLLECTION --project=PROJECT --dry-run -v
 
 # Live run
-php scripts/run_bids_reidentifier.php \
+php scripts/bids/run_bids_reidentifier.php \
     --collection=COLLECTION --project=PROJECT --confirm
 
 # Force overwrite existing target directory
-php scripts/run_bids_reidentifier.php \
+php scripts/bids/run_bids_reidentifier.php \
     --collection=COLLECTION --project=PROJECT --confirm --force
 
 # All projects
-php scripts/run_bids_reidentifier.php --all --confirm
+php scripts/bids/run_bids_reidentifier.php --all --confirm
 ```
 
 ### Step 3: BIDS Import
@@ -479,15 +484,15 @@ Skips automatically if already successfully imported (tracked per project).
 
 ```bash
 # Dry run (recommended first)
-php scripts/run_bids_import_pipeline.php \
+php scripts/bids/run_bids_import.php \
     --collection=COLLECTION --project=PROJECT --dry-run -v
 
 # Live run
-php scripts/run_bids_import_pipeline.php \
+php scripts/bids/run_bids_import.php \
     --collection=COLLECTION --project=PROJECT --confirm
 
 # All projects
-php scripts/run_bids_import_pipeline.php --all --confirm
+php scripts/bids/run_bids_import.php --all --confirm
 ```
 
 ---
@@ -532,560 +537,73 @@ php scripts/run_bids_import_pipeline.php --all --confirm
 | `-v, --verbose` | Detailed output |
 | `--help` | Show help |
 
+All three also take `--config=FILE`. An option a script does not know stops it with exit `2`
+(it is never silently ignored). Exit codes: `0` success, `1` errors, `2` usage error.
+
+Tracking: `processed/bids/.bids_reidentify_tracking.json` and `.bids_import_tracking.json`
+(read from the earlier names `.bids_reidentifier_processed.json` / `.bids_import_processed.json`
+until a real run next records something). Delete one to redo that step.
+
 ---
 
 ## DICOM Ingestion Workflow
 
-Takes a DICOM delivery, regroups it into studies, matches those studies to LORIS
-candidates, and hands the result to the importer. Four scripts and a bundle that
-runs them in order.
+> **Full guide — every script, option, example, rule and message: [docs/dicom.md](docs/dicom.md).**
+> This section is a summary.
+
+Takes a site's DICOM upload, checks it, matches each examination to a LORIS
+participant and visit, and archives it in LORIS through the CBIGR script API
+(`/cbigr_api/script/importdicomstudy`). Only enabled projects that list `Imaging` in
+`project.json` are processed.
 
 ```
-run_all_dicom_scripts_bundle.php     bundle — runs the four below
-  ├─ run_dicom_organize.php          EviData check + group by StudyInstanceUID
-  ├─ run_dicom_participant_sync.php  create candidates
-  ├─ run_dicom_reidentifier.php      LORIS IDs onto folders and headers
-  └─ run_dicom_import.php            archive into LORIS   ← only write to LORIS
-```
-
-| Step | Writes to | Talks to LORIS |
-|---|---|---|
-| organise | `processed/imaging/` | no |
-| participant sync | nothing on disk | yes — creates candidates |
-| relabel | `deidentified-lorisid/` | yes — reads and creates sessions |
-| import | LORIS imaging tables | **yes — the import** |
-
-The first three are reversible: delete their output and start again, nothing has
-reached the imaging tables. The import is the point of no return, and the bundle
-asks before it.
-
-Dry run is the default everywhere. Every dry run prints the exact `--confirm`
-command to copy.
-
-**A delivery does not have to be well-formed.** Grouping comes from the headers,
-so it works with no `sub-`/`ses-` folders and no `participants.tsv`. What is
-missing only affects whether a study can be matched to a person:
-
-| Delivery | Result |
-|---|---|
-| Organised, `participants.tsv` present | `linked` — candidates created, folders and headers relabelled |
-| No `participants.tsv`, or subject not in it | `unlinked` — organised and importable, warning per study, no LORIS ID |
-| Not organised into `sub-`/`ses-` folders | `unlinked` — grouped by header UID, folder name generated |
-
-Nothing is dropped. Unlinked studies still archive, with a NULL `SessionID` and
-the site's identifier left in `PatientName`. The participant sync and relabel
-steps are skipped by name when nothing can be linked, and the bundle stops and
-asks before importing them:
-
-```
-NOT REIDENTIFIED: 3 of 3 study/studies
-  3 unlinked - no LORIS ID could be resolved
-Ingest them anyway, with no linked LORIS ID? [y/N]:
-```
-
-| Section | |
-|---|---|
-| [What one run does](#what-one-run-does) | The four steps, start to finish |
-| [Why regroup](#why-regroup-a-delivery) · [Organise](#organise) · [Relabel](#relabel) | The idea behind each |
-| [Where a study travels](#where-a-study-travels) | Which directory the import reads |
-| [Link status](#link-status) · [EviData](#evidata-check-optional) | linked/unlinked, privacy check |
-| [Hashing and tracking](#hashing-and-tracking) | Why a repeat run is cheap, and what state is kept |
-| [Scripts and usage](#scripts-and-usage) | Every script, every flag, examples |
-| [Layout](#layout) · [Config](#config) | Paths and settings |
-
----
-
-### How it works
-
-#### What one run does
-
-```bash
-php scripts/run_all_dicom_scripts_bundle.php \
-    --collection=archimedes --project=FDG-PET --confirm -v
-```
-
-**Before anything.** The delivery is stat-ed — sizes and paths, nothing opened —
-and compared to the last successful run. Unchanged means the project is skipped
-in about a second.
-
-**Step 1 — organise.** Every file's headers are read, files grouped by
-`StudyInstanceUID` then `SeriesInstanceUID`, one folder per study written to
-`processed/imaging/dicoms/`. Grouping comes from headers, so it works whatever
-the site sent. Each study is marked `linked`, `unlinked` or `phantom`. Nothing
-is dropped. (If EviData is enabled it runs first, on the raw delivery,
-read-only.)
-
-**Step 2 — candidates.** Only for `linked` studies. Reads `participants.tsv`,
-creates missing candidates, links their ExternalIDs. Skipped entirely when
-nothing is linked.
-
-**Step 3 — relabel.** Also only for `linked` studies. Copies to
-`deidentified-lorisid/imaging/dicoms/` as `PSCID_CandID_Visit_MODALITIES` and
-rewrites `PatientName`, moving the site's identifier to `OtherPatientNames`.
-
-**Then it asks.** If anything is unlinked, the bundle stops before the import:
-
-```
-NOT REIDENTIFIED: 3 of 3 study/studies
-Ingest them anyway, with no linked LORIS ID? [y/N]:
-```
-
-Everything above is reversible — delete the output and start again. The import
-is not.
-
-**Step 4 — import.** Reads from wherever each study ended up:
-`deidentified-lorisid/` for relabelled studies, `processed/` for unlinked ones.
-Runs once per directory that has studies.
-
-| Delivery | What happens |
-|---|---|
-| With `participants.tsv` | All four steps; import from `deidentified-lorisid/` |
-| Without it | Organise, skip 2 and 3, ask, import from `processed/` |
-| Some subjects missing from it | All four steps; import runs twice, one directory each |
-
----
-
-#### Why regroup a delivery
-
-A DICOM study is identified by `StudyInstanceUID` inside every file's header —
-not by the folder a site put it in. The two do not have to agree, and often
-don't:
-
-| What arrives | What it actually is |
-|---|---|
-| One folder, several UIDs | Several studies in one folder |
-| Several folders, one UID | One study split up |
-| A flat pile of files | No grouping at all |
-| One folder, one UID | Already correct — most common |
-
-`import_dicom_study.py` takes **one directory = one study**. Give it a folder
-holding two UIDs and the archive is wrong; split one UID across two folders and
-you import the same study twice.
-
-A PET/CT is the case that makes this concrete. The PET series and the CT used to
-correct it share **one** `StudyInstanceUID`. They are one study, archived as one
-unit, and must end up in one folder even though the scanner may have written
-them separately.
-
-So every file's headers are read, files are grouped by UID, and one folder per
-study is written. When a delivery was already correct this is just a copy — the
-check is cheap and the alternative is trusting folder layout you did not create.
-
----
-
-#### Organise
-
-Headers are read with `dcmdump`, grouped by `StudyInstanceUID`, then by
-`SeriesInstanceUID`. Modality is recorded, never used to decide grouping.
-
-The delivered folder name is kept when a study came from a single folder — that
-name is the site's identifier for it. Names are generated only for flat dumps
-or studies split across folders.
-
-```
-deidentified-raw/imaging/dicoms/TST02_ROM_00000001_02_SE01_MR/
-processed/imaging/dicoms/TST02_ROM_00000001_02_SE01_MR/
-    ├── series-0001_MR_T1w-MPRAGE/
-    ├── series-0002_PT_AC-3D/
-    └── series-0003_CT_LowDoseCT/
-```
-
-`sub-`/`ses-` folders are read for subject and visit, because the visit label
-exists only in the path — never in the headers.
-
-A study that gains a series between deliveries changes folder name
-(`..._PT` → `..._CT-PT`). The old folder is not removed.
-
----
-
-#### Relabel
-
-Copies to `deidentified-lorisid/` as `PSCID_CandID_Visit_MODALITIES`, then
-rewrites with `dcmodify`:
-
-| Tag | Before | After |
-|---|---|---|
-| `(0010,0010)` PatientName | `ARCHI0001` | `QPN0000474_718905_V01` |
-| `(0010,1001)` OtherPatientNames | — | `ARCHI0001` |
-
-Numeric tags, not keywords. `-nb` always, or `dcmodify` leaves a `.bak` beside
-every file and they end up in the tarchive. Originals are never modified.
-
----
-
-#### Where a study travels
-
-```
-deidentified-raw/imaging/dicoms/     as delivered
-        │  organise: regroup by StudyInstanceUID
-        ▼
-processed/imaging/dicoms/            one folder per study
+deidentified-raw/imaging/dicoms/  ──validate──►  report for the site (read-only)
         │
-        ├── can be linked? ──yes──►  relabel: LORIS IDs on folder + headers
-        │                                    │
-        │                                    ▼
-        │                            deidentified-lorisid/imaging/dicoms/
-        │                                    │
-        └── no ──────────────────────────────┤
-                                             ▼
-                                        import → tarchive
+        ├─organize──►  processed/imaging/          one folder per examination (StudyInstanceUID)
+        ├─sync──────►  LORIS candidates            from participants.tsv (+ candidate_defaults)
+        ├─reidentify►  deidentified-lorisid/       sessions + PatientName = PSCID_CandID_Visit
+        └─import────►  LORIS imaging               only from deidentified-lorisid/
 ```
 
-So the import reads from `deidentified-lorisid/` when a study was relabelled,
-and from `processed/` when it could not be. Never from `deidentified-raw/`:
-
-| Study | Import from |
-|---|---|
-| `linked` | `deidentified-lorisid/imaging/dicoms/` — relabelled folder and headers |
-| `unlinked` or `phantom` | `processed/imaging/dicoms/` — grouped, not relabelled |
-
-Importing from `deidentified-raw/` would archive the original files with the
-site identifier still in `PatientName`, silently discarding the relabelling —
-and the files are still in whatever grouping the site sent, so a folder holding
-two `StudyInstanceUID`s archives as one wrong study.
-
-**The bundle handles this.** After relabelling it reads the manifest and invokes
-the importer once per source that has studies, passing `--source-subdir`:
-
-```
-importing 2 relabelled from deidentified-lorisid/imaging/dicoms
-importing 1 unlinked/phantom from processed/imaging/dicoms
-```
-
-A delivery where nothing could be linked imports once, from `processed/`.
-
-Running the importer by hand needs the flag given explicitly — it still defaults
-to `deidentified-raw/imaging/dicoms` so existing callers are unaffected:
-
-```bash
-php scripts/run_dicom_import.php --collection=archimedes --project=FDG-PET \
-    --source-subdir=deidentified-lorisid/imaging/dicoms --confirm -v
-```
-
----
-
-#### Link status
-
-| State | | In LORIS |
+| Step | Script (`scripts/dicom/`) | Writes to LORIS |
 |---|---|---|
-| `linked` | Matched to a candidate and visit | Normal session |
-| `unlinked` | Nobody to match it to | Archived, no session |
-| `phantom` | Test object, not a person | Attached to the scanner |
-
-Phantom sets a LORIS flag meant for test objects — wrong, and awkward to undo,
-on a patient scan. Unlinked just means we do not know whose it is.
-
-Unlinked studies are still organised and importable. Reason recorded as
-`not_organised`, `no_session_folder`, `no_participants_tsv`,
-`not_in_participants_tsv`, `visit_not_configured` or `declared`.
-
-Status is **not** in the folder name when the delivered name is preserved. Read
-it from the manifest or the per-study `.provenance.json`:
+| 0 | `run_dicom_validate.php` — checks the upload against the DICOM user guide, fix-it report | no (reads only) |
+| 1 | `run_dicom_organize.php` — groups files into examinations | no |
+| 2 | `run_dicom_participant_sync.php` — pre-flight of every mismatch, then creates missing candidates | candidates |
+| 3 | `run_dicom_reidentifier.php` — creates sessions, reidentifies headers | sessions |
+| 4 | `run_dicom_import.php` — archives each examination (async job, polled) | the import |
+| — | `run_dicom_bundle.php` — runs 1→4, ingests only if 1–3 succeeded | — |
 
 ```bash
-jq -r '.studies[] | "\(.link_status)\t\(.link_reason // "-")\t\(.directory_name)"' \
-  PROJECT/processed/imaging/dicom_studies.json
+php scripts/dicom/run_dicom_validate.php            --collection=archimedes --project=FDG-PET
+php scripts/dicom/run_dicom_bundle.php  --collection=archimedes --project=FDG-PET            # dry run
+php scripts/dicom/run_dicom_bundle.php  --collection=archimedes --project=FDG-PET --confirm
 ```
 
----
-
-#### EviData check (optional)
-
-Estimates how identifiable a dataset is. Reads headers, writes a CSV — one row
-per study, one column per header field. Changes nothing.
-
-Off unless all three are true:
-
-| Setting | Where |
-|---|---|
-| `evidata.enabled` | `config/evidata_config.json` |
-| `evidata.enabled` not false | `project.json` |
-| `evidata.imaging.enabled` true | `project.json` |
-
-Enabling it for clinical does not enable it for DICOM. When on it is a gate: if
-the check cannot be produced, the project is skipped and nothing imported.
-
----
-
-#### Hashing and tracking
-
-Three files record what has been done. They answer different questions and are
-written at different points, so they can disagree — and when they do, the
-disagreement is the useful information.
-
-| File | Answers | Written by |
-|---|---|---|
-| `processed/imaging/.dicom_delivery_state.json` | Has this delivery changed since we last organised it? | organise, on success |
-| `processed/imaging/.dicom_organize_tracking.json` | Which studies are organised, and did their bytes change? | organise, per study |
-| `processed/imaging/.dicom_import_processed.json` | Which studies reached LORIS? | import |
-
-A study organised but not imported shows in the second and not the third. That
-is a normal state after answering `n` at the prompt, or after an import failure.
-
-##### What is hashed, exactly
-
-A DICOM study is thousands of files, so hashing all of them on every run is not
-viable. Hence two tiers, and what each covers:
-
-| | Manifest hash | Content hash |
-|---|---|---|
-| Input | relative path + byte size of every file | the bytes of every file |
-| Method | sorted list, SHA-256 of the list | SHA-256 per file, digests sorted, SHA-256 of those |
-| Files opened | none | all |
-| Detects | files added, removed, resized | any byte change |
-| Misses | a file edited in place at the same size | nothing |
-| Run | every time | only when the manifest differs |
-
-Sorting the per-file digests rather than the paths is what makes a rename
-invisible: the same bytes under a different filename produce the same content
-hash, so a re-copied study is not reprocessed.
-
-Paths are stored relative to the delivery root, so moving the whole delivery
-does not invalidate anything.
-
-Note the consequence of the delivery check being size-based: a file edited in
-place at the same size stops the run before the per-study content hash ever
-runs, so it is not caught at either level. DICOM files are not normally edited
-in place.
-
-##### Two levels of checking
-
-**Whole delivery, first.** The source tree is manifest-hashed and compared to
-the last successful run. Unchanged skips the project entirely — before the
-EviData scan, before any header is read:
-
-```
-UNCHANGED since 2026-09-08T16:30:06+00:00 - 6540 file(s), nothing to re-ingest
-Pass --force to re-organise anyway.
-```
-
-**Per study**, only if the delivery changed:
-
-| Comparison | Action |
-|---|---|
-| Manifest matches | Skip |
-| Manifest differs, content matches | Skip — renamed or re-copied; refresh the manifest hash |
-| Content differs | Re-organise |
-| No stored hash | Record a baseline, skip |
-
-The baseline row matters once: the first run after this ships finds no hashes on
-studies already imported, and records them rather than reprocessing everything.
-
-##### Rules
-
-Hashes are written **only after a successful run**, so a stored fingerprint
-always means "this was organised", never "we looked at it". A dry run, or a run
-with errors, leaves the state alone and the next run repeats the work.
-
-`--force` bypasses both levels. Deleting the state files has the same effect and
-is the way to start genuinely clean:
-
-```bash
-rm PROJECT/processed/imaging/.dicom_delivery_state.json
-rm PROJECT/processed/imaging/.dicom_organize_tracking.json
-```
-
-The import keeps its own tracking, so clearing the two above re-organises but
-does not re-import. Clearing the LORIS database means clearing
-`.dicom_import_processed.json` too, or nothing re-ingests.
-
----
-
-### Scripts and usage
-
-#### Options common to every script
-
-| Option | |
-|---|---|
-| `--all` | All enabled collections and projects |
-| `--collection=NAME` | One collection |
-| `--project=NAME` | One project (needs `--collection`) |
-| `--confirm` | Execute |
-| `--dry-run` | Explicit dry run; wins if both given |
-| `--force` | Ignore tracking and hashes |
-| `--config=FILE` | Default `config/loris_client_config.json` |
-| `-v` | Verbose |
-| `--help` | Usage |
-
-Dry run is the default everywhere; each one prints the exact `--confirm`
-command to copy. Names match case-insensitively; a name matching nothing lists
-what exists.
-
-Exit: `0` ok · `1` usage · `2` failure · `3` nothing found or declined ·
-`4` finished with failures.
-
-#### run_all_dicom_scripts_bundle.php — the bundle
-
-| Option | |
-|---|---|
-| `--yes` | Auto-answer the pre-import prompt. Required off a terminal. |
-| `--no-unlinked` | Refuse unrelabelled studies instead of asking |
-| `--steps=LIST` | Only these: `organize,sync,reidentify,import` |
-| `--skip=LIST` | All except these |
-| `--no-organize` … `--no-import` | Shorthand for one `--skip` |
-| `--stop-after=STEP` | `organize` \| `sync` \| `reidentify` |
-
-```bash
-B="php scripts/run_all_dicom_scripts_bundle.php --collection=archimedes --project=FDG-PET"
-
-$B -v                          # preview
-$B --confirm -v                # run
-$B --confirm --no-import       # prepare, import nothing
-$B --confirm --skip=organize   # reuse existing manifest
-$B --confirm --force -v        # redo everything
-
-php scripts/run_all_dicom_scripts_bundle.php --all --confirm --yes   # cron
-```
-
-Sequences the four steps, stops a project at the first failure, keeps a master
-log at `logs/dicom/dicom_bundle_<date>.log` with a copy of every step's output.
-Steps are subprocesses, so each stays independently runnable.
-
-#### run_dicom_organize.php
-
-Writes `processed/imaging/`. No LORIS calls.
-
-| Option | |
-|---|---|
-| `--move` | Move instead of copy (default: copy) |
-| `--phantom` | Treat the whole run as test-object scans |
-| `--no-unlinked` | Skip unlinkable studies instead of carrying them forward |
-| `--evidata` / `--no-evidata` | Force the privacy check on / off |
-| `--strict` | Stop at the first problem |
-
-```bash
-O="php scripts/run_dicom_organize.php --collection=archimedes --project=FDG-PET"
-
-$O -v                    # preview
-$O --confirm -v          # organise
-$O --evidata -v          # privacy check only, writes nothing else
-$O --confirm --force     # ignore hashes
-$O --confirm --phantom   # test scans
-```
-
-Exit `3` = no readable DICOMs. Exit `4` = studies failed a check, including
-"most of the delivery was unreadable", which fails rather than reporting
-success on incomplete studies.
-
-#### run_dicom_participant_sync.php
-
-Creates candidates. Writes nothing to disk.
-
-| Option | |
-|---|---|
-| `--all-participants` | Every TSV row, not just subjects with imaging |
-
-```bash
-S="php scripts/run_dicom_participant_sync.php --collection=archimedes --project=FDG-PET"
-
-$S -v          # who exists already
-$S --confirm
-```
-
-Reports folders with no `participants.tsv` row and rows with no folder, before
-creating anything. Neither is fatal.
-
-#### run_dicom_reidentifier.php
-
-Writes `deidentified-lorisid/`. Rewrites headers.
-
-| Option | |
-|---|---|
-| `--create-candidates` | Create unresolved candidates here (off by default — sync owns it) |
-
-```bash
-R="php scripts/run_dicom_reidentifier.php --collection=archimedes --project=FDG-PET"
-
-$R -v
-$R --confirm -v
-```
-
-#### run_dicom_import.php
-
-The only step that writes to LORIS. Scans a directory for study folders and
-calls `POST /cbigr_api/script/importdicomstudy` for each one, which archives the
-DICOMs into a `.tar.gz`, computes MD5 checksums and inserts or updates the
-tarchive record.
-
-Each study is classified `SUCCESS`, `ALREADY_EXISTS` (not an error) or `FAILED`,
-and recorded in `.dicom_import_processed.json` so it is not re-imported.
-Previously failed studies are retried automatically; successful ones need
-`--force`.
-
-| Option | |
-|---|---|
-| `--update` | `--update` instead of `--insert` |
-| `--session` | Associate with a LORIS session |
-| `--overwrite` | Overwrite existing archive files |
-| `--source-subdir=PATH` | Directory to scan, relative to the project root. Default `deidentified-raw/imaging/dicoms`. |
-| `--profile=NAME` | Python config file. Default `database_config.py`. |
-
-```bash
-I="php scripts/run_dicom_import.php --collection=archimedes --project=FDG-PET"
-
-$I --confirm -v                                                # default source
-$I --confirm --source-subdir=deidentified-lorisid/imaging/dicoms -v
-$I --confirm --update --session --overwrite -v
-$I --confirm --force -v                                        # re-import
-```
-
-Run through the bundle and `--source-subdir` is set for you. Run it alone and it
-defaults to the raw delivery, which is only correct if the delivery was already
-one folder per study.
-
----
-
-### Layout
-
-```
-PROJECT/
-├── deidentified-raw/imaging/dicoms/   as delivered — never modified
-├── processed/imaging/                 organise output + state + manifest
-├── deidentified-lorisid/imaging/      relabel output + provenance
-└── logs/dicom/                        per-step logs + bundle master log
-```
-
-```bash
-M=PROJECT/processed/imaging/dicom_studies.json
-
-jq -r '.studies[].series[].modality' $M | sort | uniq -c   # modalities present
-jq -r '.problems[] | "\(.level)\t\(.message)"' $M          # warnings and errors
-tail -f PROJECT/logs/dicom/dicom_bundle_$(date +%F).log    # whole run
-```
-
----
-
-### Config
-
-`loris_client_config.json`:
-
-```json
-"imaging": {
-    "header_reader": "dcmdump",
-    "dcmdump_path": "/usr/bin/dcmdump",
-    "dcmodify_path": "/usr/bin/dcmodify"
-}
-```
-
-`project.json`:
-
-```json
-"candidate_defaults": {
-    "site": "University of Ottawa Heart Institute (UOHI)",
-    "cohort": "Control",
-    "project": "FDG PET",
-},
-"evidata": { "enabled": true, "imaging": { "enabled": true } }
-```
-
-`candidate_defaults.project` must match the LORIS project name exactly —
-`"FDG PET"`, not the folder name `"FDG-PET"`.
-
-`participants.tsv`: sites send `participant_id`, `dob`, `sex`. The rest comes
-from `candidate_defaults`; `external_id` defaults to `participant_id` minus
-`sub-`.
-
-Requires PHP >= 8.1 and DCMTK (`apt install dcmtk`).
+**Key rules**
+- Everything is a dry run unless `--confirm` is given.
+- Re-running is incremental: only new or changed examinations are ingested; nothing is
+  duplicated or overwritten (`--force` only when you ask for it).
+- An examination is processed only when its `sub-` folder matches a `participants.tsv` row and
+  its `ses-` folder is a visit configured in LORIS. Anything else is reported as **unlinked**
+  and never ingested.
+- All data issues are reported together before any candidate is created; the bundle then asks
+  whether to continue with the good examinations only (`--continue-good` when unattended).
+- An examination removed from the upload is reported, never deleted from LORIS.
+- The participant step (`participants.tsv`, `candidate_defaults`, sex/dob normalisation,
+  orphans, candidate creation) is shared with BIDS and other modalities — `src/Pipelines/Shared/`.
+
+**On the LORIS server** the pipeline API user needs `loris_api`, `data_entry` (or
+`access_all_profiles`) with affiliation to the project and site, and `pipeline_imaging_scripts`
+(current branch) or `imaging_uploader_allsites` (older branch). Details:
+[docs/dicom.md §11](docs/dicom.md#11-settings).
+
+**Logs** are in `<project>/logs/dicom/`: the bundle log, `dicom_import_run_<ts>.log` and
+`dicom_import_errors_<ts>.log` (full script-API detail for every failed examination), and
+`dicom_validation_<date>.txt`. Email: one short summary per project run.
+
+**Code**: `src/Pipelines/Dicom/`, shared parts in `src/Pipelines/Shared/`, scripts in
+`scripts/dicom/` ([docs/dicom.md §14](docs/dicom.md#14-where-the-code-is)).
 
 ---
 
@@ -1270,7 +788,8 @@ php scripts/run_participant_metadata_pipeline.php --all --force
 │
 ├── logs/                                 # Execution logs
 │   ├── clinical/                         # Clinical pipeline logs
-│   ├── dicom/                            # DICOM import pipeline logs
+│   ├── bids/                             # BIDS pipeline logs
+│   ├── dicom/                            # DICOM pipeline logs
 │   └── participant_metadata/             # Participant metadata pipeline logs
 │
 └── documentation/
@@ -1288,8 +807,8 @@ Source files are never moved, renamed or deleted — what lands in `processed/` 
 
 **Read-write (the pipeline must be able to create and write files here):**
 - `processed/` and all its subdirectories (`clinical/`, `imaging/`, `bids/`, `participant_metadata/`, etc.)
-- `logs/` and all its subdirectories (`clinical/`, `dicom/`, `evidata/`, `participant_metadata/`)
-- In-place tracking files: `.clinical_tracking.json` under `processed/clinical/`, `.dicom_import_processed.json` under `deidentified-raw/imaging/dicoms/`, `.participant_metadata_tracking.json` under `processed/participant_metadata/`
+- `logs/` and all its subdirectories (`clinical/`, `bids/`, `dicom/`, `evidata/`, `participant_metadata/`)
+- In-place tracking files: `.clinical_tracking.json` under `processed/clinical/`, the DICOM tracking files (`.dicom_*_tracking.json`) under `processed/imaging/` and `deidentified-lorisid/imaging/`, the BIDS tracking files (`.bids_*_tracking.json`) under `processed/bids/`, `.participant_metadata_tracking.json` under `processed/participant_metadata/`
 
 ```bash
 # Owner + group read/write/execute, others read/execute; setgid for inheritance.
@@ -1312,10 +831,10 @@ Logs are stored in each project's `logs/` directory.
 tail -f PROJECT/logs/clinical/clinical_run_*.log
 
 # View today's DICOM run log
-tail -f PROJECT/logs/dicom/dicom_run_*.log
+tail -f PROJECT/logs/dicom/dicom_import_run_*.log
 
 # View DICOM error log (only exists if errors occurred)
-cat PROJECT/logs/dicom/dicom_errors_*.log
+cat PROJECT/logs/dicom/dicom_import_errors_*.log
 
 # View today's imaging log
 tail -f PROJECT/logs/imaging_$(date +%Y-%m-%d).log

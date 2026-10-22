@@ -2,7 +2,10 @@
 
 declare(strict_types=1);
 
-namespace LORIS\Pipelines;
+namespace LORIS\Pipelines\Bids;
+
+use LORIS\Pipelines\Shared\FingerprintTracker;
+use LORIS\Pipelines\Shared\TrackingFile;
 
 use Monolog\Logger;
 use Monolog\Handler\StreamHandler;
@@ -84,7 +87,8 @@ class BidsImportPipeline
     private bool $notificationSent = false;
 
     /** Tracking file name — stored in {projectPath}/processed/bids/ */
-    private const TRACK_FILE = '.bids_import_processed.json';
+    private const TRACK_FILE        = '.bids_import_tracking.json';
+    private const LEGACY_TRACK_FILE = '.bids_import_processed.json';
 
     /** Shared tracking-file handler, built on first use. */
     private ?FingerprintTracker $fingerprintTracker = null;
@@ -545,7 +549,8 @@ class BidsImportPipeline
 
     private function _loadTracking(string $projectPath): array
     {
-        $path = rtrim($projectPath, '/') . '/processed/bids/' . self::TRACK_FILE;
+        $dir  = rtrim($projectPath, '/') . '/processed/bids/';
+        $path = TrackingFile::readPath($dir . self::TRACK_FILE, $dir . self::LEGACY_TRACK_FILE);
         if (!file_exists($path)) {
             return [];
         }
@@ -559,7 +564,9 @@ class BidsImportPipeline
             @mkdir($dir, 0755, true);
         }
         $path = "{$dir}/" . self::TRACK_FILE;
-        file_put_contents($path, json_encode($tracking, JSON_PRETTY_PRINT));
+        if (file_put_contents($path, json_encode($tracking, JSON_PRETTY_PRINT)) !== false) {
+            TrackingFile::retireLegacy($path, "{$dir}/" . self::LEGACY_TRACK_FILE);
+        }
     }
 
     private function _markTracked(
@@ -647,7 +654,11 @@ class BidsImportPipeline
         if ($this->fingerprintTracker === null
             || $this->fingerprintTrackerPath !== $path
         ) {
-            $this->fingerprintTracker     = new FingerprintTracker($path, $this->logger);
+            $this->fingerprintTracker     = new FingerprintTracker(
+                $path,
+                $this->logger,
+                TrackingFile::legacy($path, self::LEGACY_TRACK_FILE)
+            );
             $this->fingerprintTrackerPath = $path;
         }
 
@@ -1028,7 +1039,7 @@ class BidsImportPipeline
 
         // Load tracking — skip if already successfully imported
         // To reimport, delete the tracking file:
-        //   {projectPath}/processed/bids/.bids_import_processed.json
+        //   {projectPath}/processed/bids/.bids_import_tracking.json
         $tracking   = $this->_loadTracking($projectPath);
         $lastRun    = $tracking['last_run'] ?? null;
         $lastStatus = $lastRun['status']    ?? '';
@@ -1056,7 +1067,7 @@ class BidsImportPipeline
                     'last_run', $bidsPath, $comparison
                 );
                 $this->_log("  To reimport, delete:"
-                    . " {$projectPath}/processed/bids/.bids_import_processed.json");
+                    . " {$projectPath}/processed/bids/" . self::TRACK_FILE);
                 $this->stats['scans_skipped']    = $this->stats['scans_found'];
                 $this->stats['skip_reason']      = 'already processed';
                 $this->stats['last_imported_at'] = $lastTs;
