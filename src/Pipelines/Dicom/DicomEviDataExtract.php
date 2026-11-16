@@ -45,7 +45,7 @@
 
 declare(strict_types=1);
 
-namespace LORIS\Pipelines;
+namespace LORIS\Pipelines\Dicom;
 
 use LORIS\Endpoints\EviDataClient;
 use RuntimeException;
@@ -352,7 +352,7 @@ class DicomEviDataExtract
         }
 
         $sourceDir = rtrim($sourceDir, '/');
-        $files     = $this->collectFiles($sourceDir);
+        $files     = $this->_collectFiles($sourceDir);
 
         if (empty($files)) {
             throw new RuntimeException("No readable files under {$sourceDir}");
@@ -367,17 +367,17 @@ class DicomEviDataExtract
             $this->filesScanned++;
 
             if (($this->filesScanned % 1000) === 0) {
-                $this->info(sprintf('    dumped %d files', $this->filesScanned));
+                $this->_info(sprintf('    dumped %d files', $this->filesScanned));
             }
 
-            $dump = $this->dump($file);
+            $dump = $this->_dump($file);
 
             if ($dump === null) {
                 $this->filesUnreadable++;
                 continue;
             }
 
-            $values   = $this->parseDump($dump);
+            $values   = $this->_parseDump($dump);
             $studyUid = $values['StudyInstanceUID'] ?? '';
 
             if ($studyUid === '') {
@@ -406,7 +406,7 @@ class DicomEviDataExtract
         $this->rows             = array_values($byStudy);
         $this->studiesExtracted = count($this->rows);
 
-        $this->write($outputPath);
+        $this->_write($outputPath);
 
         return $outputPath;
     }
@@ -416,7 +416,7 @@ class DicomEviDataExtract
      *
      * @return string[]
      */
-    private function collectFiles(string $root): array
+    private function _collectFiles(string $root): array
     {
         $files    = [];
         $seenDirs = [];
@@ -433,7 +433,8 @@ class DicomEviDataExtract
 
             $name = $fileInfo->getFilename();
 
-            if (strtoupper($name) === 'DICOMDIR'
+            if (\LORIS\Pipelines\Shared\SystemFiles::isIgnored($fileInfo->getPathname())
+                || strtoupper($name) === 'DICOMDIR'
                 || substr($name, -4) === '.tsv'
                 || substr($name, -5) === '.json'
                 || substr($name, -4) === '.csv'
@@ -466,7 +467,7 @@ class DicomEviDataExtract
      *
      * @return string[]|null Null when dcmdump failed.
      */
-    private function dump(string $file): ?array
+    private function _dump(string $file): ?array
     {
         $filter = '';
 
@@ -496,7 +497,7 @@ class DicomEviDataExtract
      *
      * @return array<string, string>
      */
-    private function parseDump(array $dump): array
+    private function _parseDump(array $dump): array
     {
         $byTag = [];
 
@@ -540,7 +541,7 @@ class DicomEviDataExtract
      * set is not the same as withholding it, and EviData needs to see the
      * data to score it. Drop a column entirely by removing it from COLUMNS.
      */
-    private function write(string $path): void
+    private function _write(string $path): void
     {
         $dir = dirname($path);
 
@@ -566,7 +567,7 @@ class DicomEviDataExtract
         fclose($handle);
     }
 
-    private function info(string $message): void
+    private function _info(string $message): void
     {
         if ($this->logger !== null) {
             $this->logger->info($message);

@@ -8,17 +8,18 @@
  *
  * Runs upstream of the DICOM import pipeline. Reads each project's
  * deidentified-raw/imaging/dicoms/ tree, validates it against the ARCHIMEDES
- * submission guide, and writes organised studies plus a manifest under
+ * submission guide, and writes organized studies plus a manifest under
  * processed/imaging/.
  *
- * No database connection. DICOM headers are read via get_dicom_info.pl.
+ * No database connection. DICOM headers are read with dcmdump by default
+ * (imaging.header_reader: dcmdump | pydicom | get_dicom_info).
  *
  * Dry run is the default, consistent with the other pipelines. Pass --confirm
  * to write.
  *
  * Usage:
- *   php scripts/run_dicom_organize.php --all --verbose
- *   php scripts/run_dicom_organize.php --collection=archimedes --project=FDG-PET --confirm -v
+ *   php scripts/dicom/run_dicom_organize.php --all --verbose
+ *   php scripts/dicom/run_dicom_organize.php --collection=archimedes --project=FDG-PET --confirm -v
  *
  * PHP Version 8.1
  *
@@ -28,12 +29,12 @@
 
 declare(strict_types=1);
 
-require_once __DIR__ . '/../vendor/autoload.php';
+require_once __DIR__ . '/../../vendor/autoload.php';
 
-use LORIS\Pipelines\DicomEviDataExtract;
-use LORIS\Pipelines\DicomOrganizeClient;
-use LORIS\Pipelines\DicomStudyOrganizer;
-use LORIS\Pipelines\StudyFingerprint;
+use LORIS\Pipelines\Shared\Cli;
+use LORIS\Pipelines\Dicom\DicomEviDataExtract;
+use LORIS\Pipelines\Dicom\DicomStudyOrganizer;
+use LORIS\Pipelines\Shared\StudyFingerprint;
 use Monolog\Handler\RotatingFileHandler;
 use Monolog\Handler\StreamHandler;
 use Monolog\Level;
@@ -43,7 +44,7 @@ const EXIT_OK      = 0;
 const EXIT_FAILURE = 1;
 const EXIT_USAGE   = 2;
 
-const DEFAULT_CONFIG = __DIR__ . '/../config/loris_client_config.json';
+const DEFAULT_CONFIG = __DIR__ . '/../../config/loris_client_config.json';
 
 /**
  * Print usage and exit.
@@ -53,7 +54,7 @@ function usage(int $code = EXIT_USAGE): void
     fwrite(
         $code === EXIT_OK ? STDOUT : STDERR,
         <<<TXT
-Usage: php scripts/run_dicom_organize.php [options]
+Usage: php scripts/dicom/run_dicom_organize.php [options]
 
 Groups delivered DICOMs by StudyInstanceUID into one directory per study.
 Runs before run_dicom_import.php.
@@ -68,17 +69,13 @@ Execution:
   --dry-run            Report without changing anything (the default)
   --force              Reprocess studies already in the tracking file
   --move               Move files instead of copying (default: copy)
-  --phantom            Treat every subject in this run as a phantom
-  --no-unlinked        Skip studies that cannot be resolved to a participant,
-                       instead of archiving them unlinked
+  --no-unlinked        Skip studies with no matching participant entirely,
+                       instead of organizing and reporting them as unlinked
   --evidata            Run the EviData header extract even when project.json
                        has not enabled it. Read-only; writes a CSV.
                        When enabled it is a GATE: if the extract fails, the
-                       project is skipped and nothing is organised.
+                       project is skipped and nothing is organized.
   --no-evidata         Skip it even when project.json enables it
-  --no-api             Do not use the dicomorganize endpoint. Off by default:
-                       organising needs only the data and pydicom, so it runs
-                       where the data is. Set imaging.organize_via_api to opt in.
   --config=FILE        Config file (default: config/loris_client_config.json)
   -v, --verbose        Detailed output
   --help               Show this message
@@ -150,7 +147,11 @@ function resolveTargets(array $config, array $options): array
 
         $collectionWanted = $matches($wantCollection, $collectionName);
 
-        if (empty($collection['enabled']) && !$collectionWanted) {
+        // Named explicitly only when --collection was given; matches() is also
+        // true when no name was given, which made --all include disabled ones.
+        $collectionNamed = $wantCollection !== null && $collectionWanted;
+
+        if (empty($collection['enabled']) && !$collectionNamed) {
             continue;
         }
 
@@ -173,7 +174,14 @@ function resolveTargets(array $config, array $options): array
                 continue;
             }
 
-            if (empty($project['enabled']) && !$projectWanted) {
+            $projectNamed = $wantProject !== null && $projectWanted;
+
+            if (!\LORIS\Pipelines\Dicom\DicomStudyOrganizer::acceptProject(
+                "{$collectionName}/{$projectName}",
+                $basePath . '/' . $projectName,
+                !empty($collection['enabled']) && !empty($project['enabled']),
+                $projectNamed || ($collectionNamed && empty($collection['enabled']))
+            )) {
                 continue;
             }
 
@@ -246,26 +254,26 @@ function confirmCommand(array $argv): string
 //  Arguments
 // -----------------------------------------------------------------------------
 
-$options = getopt(
-    'v',
-    [
-        'all',
-        'collection:',
-        'project:',
-        'confirm',
-        'dry-run',
-        'force',
-        'move',
-        'phantom',
-        'no-unlinked',
-        'evidata',
-        'no-evidata',
-        'no-api',
-        'config:',
-        'verbose',
-        'help',
-    ]
-);
+$shortOpts = 'v';
+$longOpts  = [
+    'all',
+    'collection:',
+    'project:',
+    'confirm',
+    'dry-run',
+    'force',
+    'move',
+    'no-unlinked',
+    'evidata',
+    'no-evidata',
+    'config:',
+    'verbose',
+    'help',
+];
+$options = getopt($shortOpts, $longOpts);
+// getopt() ignores options it does not know; a typo or a removed option
+// must not run with the default instead.
+Cli::exitOnUnknownOptions($shortOpts, $longOpts);
 
 if ($options === false || isset($options['help'])) {
     usage(isset($options['help']) ? EXIT_OK : EXIT_USAGE);
@@ -287,11 +295,9 @@ if (isset($options['confirm']) && isset($options['dry-run'])) {
 }
 $force      = isset($options['force']);
 $move       = isset($options['move']);
-$phantom    = isset($options['phantom']);
 $unlinked   = !isset($options['no-unlinked']);
 $forceAudit = isset($options['evidata']);
 $skipAudit  = isset($options['no-evidata']);
-$noApi      = isset($options['no-api']);
 $verbose    = isset($options['v']) || isset($options['verbose']);
 $configPath = $options['config'] ?? DEFAULT_CONFIG;
 
@@ -344,7 +350,7 @@ $dicomInfoPath = $config['imaging']['get_dicom_info_path']
     . '/dicom-archive/get_dicom_info.pl';
 
 // Only the get_dicom_info reader needs the Perl script. dcmdump and pydicom
-// check their own tools in the organiser's preflight, so demanding this one
+// check their own tools in the organizer's preflight, so demanding this one
 // up front would fail a run that never intends to use it.
 if (($config['imaging']['header_reader'] ?? 'dcmdump') === 'get_dicom_info'
     && !is_executable($dicomInfoPath)
@@ -360,7 +366,7 @@ if (($config['imaging']['header_reader'] ?? 'dcmdump') === 'get_dicom_info'
 
 // Global EviData service config, shared by every project on this host.
 $evidataGlobal = [];
-$evidataPath   = __DIR__ . '/../config/evidata_config.json';
+$evidataPath   = __DIR__ . '/../../config/evidata_config.json';
 
 if (file_exists($evidataPath)) {
     try {
@@ -404,14 +410,18 @@ foreach ($targets as $target) {
         continue;
     }
 
-    $modalities = $projectConfig['modalities'] ?? [];
-    if (!empty($modalities) && !in_array('Imaging', $modalities, true)) {
-        fwrite(STDERR, "  SKIP project does not declare the Imaging modality\n\n");
-        continue;
-    }
 
     $sourceDir = $projectPath . '/deidentified-raw/imaging/dicoms';
     $targetDir = $projectPath . '/processed/imaging';
+
+    $waitReason = \LORIS\Pipelines\Dicom\DicomStudyOrganizer::uploadInProgress(
+        $sourceDir,
+        (int) ($config['imaging']['delivery_quiet_minutes'] ?? 5)
+    );
+    if ($waitReason !== null && !$force) {
+        fwrite(STDERR, "  WAIT {$waitReason} (--force to organize anyway)\n\n");
+        continue;
+    }
 
     if (!is_dir($sourceDir)) {
         fwrite(STDERR, "  SKIP no DICOM directory at {$sourceDir}\n\n");
@@ -451,7 +461,7 @@ foreach ($targets as $target) {
         ));
         fwrite(
             STDERR,
-            "  Pass --force to re-organise anyway.\n\n"
+            "  Pass --force to re-organize anyway.\n\n"
         );
         continue;
     }
@@ -467,7 +477,7 @@ foreach ($targets as $target) {
 
     $logger = buildLogger($projectPath, $verbose);
 
-    // De-identification audit runs BEFORE organising, on the original
+    // De-identification audit runs BEFORE organizing, on the original
     // delivery - that is what the site actually sent, and it is the version
     // worth auditing. Read-only, so it runs in dry mode too. Never blocks.
     $evidataState = DicomEviDataExtract::explainEnabled(
@@ -500,7 +510,7 @@ foreach ($targets as $target) {
     if ($auditWanted) {
         // EviData check runs on the original delivery, before anything is
         // grouped or copied. When enabled it is a gate: if the extract cannot
-        // be produced, this project is not organised or ingested.
+        // be produced, this project is not organized or ingested.
         $checkFailure = null;
 
         try {
@@ -560,79 +570,16 @@ foreach ($targets as $target) {
         if ($checkFailure !== null) {
             fwrite(STDERR, "  ERROR {$checkFailure}\n");
             fwrite(STDERR, "  ABORT EviData check did not complete - skipping "
-                . "{$label}, nothing organised or ingested\n\n");
+                . "{$label}, nothing organized or ingested\n\n");
             $logger->error("EviData check failed, aborting {$label}: {$checkFailure}");
             $exitCode = EXIT_FAILURE;
             continue;
         }
     }
 
-    // --- Script API first, direct run as fallback --------------------------
-    // The endpoint runs inside LORIS as www-data, on the host that owns the
-    // mounts and the virtualenv - the same reason bidsimport and
-    // importdicomstudy go through the Script API rather than shelling out.
-    //
-    // Fallback happens ONLY when the endpoint is absent (404). An auth
-    // failure, a timeout or a job that failed are real problems and must
-    // surface: quietly running somewhere else would hide a broken endpoint
-    // for as long as the two hosts happen to be the same machine.
-    $ranViaApi = false;
-
-    if (($config['imaging']['organize_via_api'] ?? false) && !$noApi) {
-        try {
-            $apiClient = new DicomOrganizeClient($config, $logger);
-
-            if ($apiClient->available()) {
-                $logger->info('Organising via the dicomorganize endpoint');
-
-                $apiClient->organize([
-                    'source_dir'  => $sourceDir,
-                    'target_dir'  => $targetDir,
-                    'move'        => $move,
-                    'phantom'     => $phantom,
-                    'no_unlinked' => !$unlinked,
-                    'force'       => $force,
-                    'dry_run'     => !$confirm,
-                ]);
-
-                $ranViaApi = true;
-            } else {
-                fwrite(
-                    STDERR,
-                    "  dicomorganize endpoint not deployed - running directly\n"
-                );
-            }
-        } catch (Throwable $e) {
-            if ($e->getMessage() === DicomOrganizeClient::NOT_DEPLOYED) {
-                fwrite(
-                    STDERR,
-                    "  dicomorganize endpoint not deployed - running directly\n"
-                );
-            } else {
-                // Not a deployment gap. Surface it.
-                fwrite(STDERR, '  ERROR ' . $e->getMessage() . "\n\n");
-                $logger->error('dicomorganize failed: ' . $e->getMessage());
-                $exitCode = EXIT_FAILURE;
-                continue;
-            }
-        }
-    }
-
-    if ($ranViaApi) {
-        $manifestPath = $targetDir . '/dicom_studies.json';
-
-        if (file_exists($manifestPath)) {
-            $manifest = readJson($manifestPath);
-            fwrite(STDERR, sprintf(
-                "  %d study/studies organised via API\n",
-                $manifest['study_count'] ?? 0
-            ));
-        }
-
-        fwrite(STDERR, "\n");
-        continue;
-    }
-
+    // Organizing runs here, where the data is: it needs only the files and a
+    // header reader. (There is no organize endpoint in the LORIS script API;
+    // the earlier opt-in imaging.organize_via_api path was removed.)
     try {
         $organizer = new DicomStudyOrganizer($dicomInfoPath, $targetDir, $logger);
         $organizer->setPerl5Lib($config['imaging']['perl5lib'] ?? null);
@@ -655,7 +602,7 @@ foreach ($targets as $target) {
                     $config['imaging']['python_bin']
                     ?? '/opt/LorisMRI/bin/mri/python_virtualenvs/loris-mri-python/bin/python',
                     $config['imaging']['header_dump_script']
-                    ?? dirname(__DIR__) . '/bin/dicom_header_dump.py'
+                    ?? dirname(__DIR__, 2) . '/bin/dicom_header_dump.py'
                 );
                 break;
 
@@ -666,7 +613,6 @@ foreach ($targets as $target) {
         }
         $organizer->setDryRun(!$confirm);
         $organizer->setMove($move);
-        $organizer->setPhantomRun($phantom);
         $organizer->setFallbackToUnlinked($unlinked);
         $organizer->setForce($force);
 
@@ -676,11 +622,10 @@ foreach ($targets as $target) {
         $summary[$label] = $stats;
 
         fwrite(STDERR, sprintf(
-            "  %d study/studies, %d linked, %d unlinked, %d phantom\n",
+            "  %d study/studies, %d matched to a participant, %d unlinked (no matching participant or session)\n",
             $stats['studies_found'],
-            $stats['studies_found'] - $stats['unlinked_studies'] - $stats['phantom_studies'],
-            $stats['unlinked_studies'],
-            $stats['phantom_studies']
+            $stats['studies_found'] - $stats['unlinked_studies'],
+            $stats['unlinked_studies']
         ));
 
         // Modality breakdown - the quick answer to "is there CT in here".
@@ -752,7 +697,7 @@ if (count($summary) > 1) {
 
 if (!$confirm) {
     fwrite(STDERR, "\nDry run complete. No studies were written.\n");
-    fwrite(STDERR, "To organise for real, run:\n\n");
+    fwrite(STDERR, "To organize for real, run:\n\n");
     fwrite(STDERR, '  ' . confirmCommand($argv) . "\n\n");
 }
 

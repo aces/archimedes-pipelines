@@ -12,14 +12,14 @@
  * modified - this step only adds.
  *
  * Runs after run_dicom_organize.php and before run_dicom_reidentifier.php.
- * Only participants that actually have organised studies are synced, so a
+ * Only participants that actually have organized studies are synced, so a
  * delivery is not used to create candidates for subjects who sent no imaging.
  *
  * Dry run is the default; --confirm creates.
  *
  * Usage:
- *   php scripts/run_dicom_participant_sync.php --collection=archimedes --project=FDG-PET -v
- *   php scripts/run_dicom_participant_sync.php --collection=archimedes --project=FDG-PET --confirm
+ *   php scripts/dicom/run_dicom_participant_sync.php --collection=archimedes --project=FDG-PET -v
+ *   php scripts/dicom/run_dicom_participant_sync.php --collection=archimedes --project=FDG-PET --confirm
  *
  * PHP Version 8.1
  *
@@ -29,10 +29,11 @@
 
 declare(strict_types=1);
 
-require_once __DIR__ . '/../vendor/autoload.php';
+require_once __DIR__ . '/../../vendor/autoload.php';
 
-use LORIS\Pipelines\LorisApiClientAdapter;
-use LORIS\Pipelines\ParticipantsTsv;
+use LORIS\Pipelines\Shared\Cli;
+use LORIS\Endpoints\LorisApiClientAdapter;
+use LORIS\Pipelines\Shared\ParticipantsTsv;
 use Monolog\Handler\RotatingFileHandler;
 use Monolog\Handler\StreamHandler;
 use Monolog\Level;
@@ -42,7 +43,7 @@ const EXIT_OK      = 0;
 const EXIT_FAILURE = 1;
 const EXIT_USAGE   = 2;
 
-const DEFAULT_CONFIG = __DIR__ . '/../config/loris_client_config.json';
+const DEFAULT_CONFIG = __DIR__ . '/../../config/loris_client_config.json';
 
 /**
  * Print usage and exit.
@@ -52,7 +53,7 @@ function usage(int $code = EXIT_USAGE): void
     fwrite(
         $code === EXIT_OK ? STDOUT : STDERR,
         <<<TXT
-Usage: php scripts/run_dicom_participant_sync.php [options]
+Usage: php scripts/dicom/run_dicom_participant_sync.php [options]
 
 Creates LORIS candidates for participants in a DICOM delivery, linked by
 ExternalID. Existing candidates are matched, never modified.
@@ -65,8 +66,10 @@ Selection:
 Execution:
   --confirm            Create candidates
   --dry-run            Report without creating anything (the default)
+  --exclude-file=FILE  Participants to leave out (written by the bundle when the
+                       operator continues with the good studies only)
   --all-participants   Sync every row in participants.tsv, not only those
-                       with organised studies
+                       with organized studies
   --config=FILE        Config file (default: config/loris_client_config.json)
   -v, --verbose        Detailed output
   --help               Show this message
@@ -150,7 +153,13 @@ function resolveTargets(array $config, array $options): array
                 continue;
             }
 
-            if (empty($project['enabled']) && $wantProject !== $projectName) {
+            if (!\LORIS\Pipelines\Dicom\DicomStudyOrganizer::acceptProject(
+                "{$collectionName}/{$projectName}",
+                $basePath . '/' . $projectName,
+                !empty($collection['enabled']) && !empty($project['enabled']),
+                $wantProject === $projectName
+                    || (empty($collection['enabled']) && $wantCollection === $collectionName)
+            )) {
                 continue;
             }
 
@@ -196,28 +205,7 @@ function buildLogger(string $projectPath, bool $verbose): Logger
 }
 
 /**
- * Subject directories present in the raw delivery.
- *
- * Read from disk rather than the manifest, so a sub- folder that produced no
- * readable DICOM is still seen as present. That is the orphan case worth
- * reporting: a directory was delivered and nothing came of it.
- *
- * @return array<string, bool> subject identifier => true
- */
-function subjectDirectories(string $projectPath): array
-{
-    $root = $projectPath . '/deidentified-raw/imaging/dicoms';
-    $dirs = [];
-
-    foreach (glob($root . '/sub-*', GLOB_ONLYDIR) ?: [] as $path) {
-        $dirs[substr(basename($path), 4)] = true;
-    }
-
-    return $dirs;
-}
-
-/**
- * Subjects that actually have organised studies, from the stage 2 manifest.
+ * Subjects that actually have organized studies, from the stage 2 manifest.
  *
  * @return array<string, bool> subject identifier => true
  */
@@ -236,8 +224,8 @@ function subjectsWithStudies(string $manifestPath): array
     }
 
     foreach ($manifest['studies'] ?? [] as $study) {
-        // Only linked studies need a candidate. Unlinked and phantom studies
-        // are archived without one by design.
+        // Only matched studies need a candidate. Unlinked studies are only
+        // reported, never synced or ingested.
         if (($study['link_status'] ?? 'linked') !== 'linked') {
             continue;
         }
@@ -284,20 +272,23 @@ function confirmCommand(array $argv): string
 //  Arguments
 // -----------------------------------------------------------------------------
 
-$options = getopt(
-    'v',
-    [
-        'all',
-        'collection:',
-        'project:',
-        'confirm',
-        'dry-run',
-        'all-participants',
-        'config:',
-        'verbose',
-        'help',
-    ]
-);
+$shortOpts = 'v';
+$longOpts  = [
+    'all',
+    'collection:',
+    'project:',
+    'confirm',
+    'dry-run',
+    'all-participants',
+    'exclude-file:',
+    'config:',
+    'verbose',
+    'help',
+];
+$options = getopt($shortOpts, $longOpts);
+// getopt() ignores options it does not know; a typo or a removed option
+// must not run with the default instead.
+Cli::exitOnUnknownOptions($shortOpts, $longOpts);
 
 if ($options === false || isset($options['help'])) {
     usage(isset($options['help']) ? EXIT_OK : EXIT_USAGE);
@@ -356,7 +347,7 @@ foreach ($targets as $target) {
     if ($tsvPath === null) {
         fwrite(
             STDERR,
-            "  SKIP no participants.tsv - studies will be archived unlinked\n\n"
+            "  SKIP no participants.tsv - its studies are UNLINKED: reported only, nothing created\n\n"
         );
         continue;
     }
@@ -372,7 +363,8 @@ foreach ($targets as $target) {
     $defaults = $projectConfig['candidate_defaults'] ?? [];
 
     try {
-        $roster = ParticipantsTsv::load($tsvPath, $defaults, $projectConfig);
+        $loaded = \LORIS\Pipelines\Shared\ParticipantSync::load($tsvPath, $projectConfig);
+        $roster = $loaded['roster'];
     } catch (RuntimeException $e) {
         fwrite(STDERR, '  ERROR ' . $e->getMessage() . "\n\n");
         $exitCode = EXIT_FAILURE;
@@ -385,14 +377,14 @@ foreach ($targets as $target) {
         basename($tsvPath)
     ));
 
-    if (!empty($roster->enrichedColumns())) {
+    if (!empty($loaded['enriched'])) {
         fwrite(STDERR, sprintf(
             "  enriched from candidate_defaults: %s\n",
-            implode(', ', $roster->enrichedColumns())
+            implode(', ', $loaded['enriched'])
         ));
     }
 
-    $missing = $roster->missingForLoris();
+    $missing = $loaded['missing'];
 
     if (!empty($missing)) {
         fwrite(STDERR, sprintf(
@@ -418,15 +410,27 @@ foreach ($targets as $target) {
         if (empty($wanted)) {
             fwrite(
                 STDERR,
-                "  SKIP no linked studies in the manifest - run run_dicom_organize.php "
+                "  SKIP no study matches a participant in the manifest - run run_dicom_organize.php "
                 . "first, or pass --all-participants\n\n"
             );
             continue;
         }
 
         fwrite(STDERR, sprintf(
-            "  %d subject(s) have linked studies\n",
+            "  %d participant(s) with matched studies\n",
             count($wanted)
+        ));
+    }
+
+    // Participants the operator chose to leave out (bundle: issues reported,
+    // "continue with the good studies"): never created in this run.
+    $exclusions = \LORIS\Pipelines\Dicom\DicomPreflight::readExclusions($options['exclude-file'] ?? null);
+    $excludedSubjects = array_flip($exclusions['subjects']);
+    if (!empty($excludedSubjects)) {
+        fwrite(STDERR, sprintf(
+            "  %d participant(s) excluded by the operator (issues reported): %s\n",
+            count($excludedSubjects),
+            implode(', ', array_map(static fn ($x) => 'sub-' . $x, array_keys($excludedSubjects)))
         ));
     }
 
@@ -434,19 +438,23 @@ foreach ($targets as $target) {
     // This step owns participants.tsv, so it is the only place that sees both
     // sides. Neither direction is fatal - a delivery can legitimately be
     // partial - but both are worth naming before candidates are created.
-    $onDisk = subjectDirectories($projectPath);
-    $inTsv  = [];
+    $orphans    = \LORIS\Pipelines\Shared\ParticipantSync::orphans(
+        $roster,
+        $projectPath . '/deidentified-raw/imaging/dicoms'
+    );
+    $orphanDirs = $orphans['dirs'];
+    $orphanRows = $orphans['rows'];
 
-    foreach (array_keys($roster->all()) as $participantId) {
-        $inTsv[
-            str_starts_with($participantId, 'sub-')
-                ? substr($participantId, 4)
-                : $participantId
-        ] = true;
+    $nestedDirs = \LORIS\Pipelines\Shared\ParticipantSync::nestedSubjectDirs(
+        $projectPath . '/deidentified-raw/imaging/dicoms'
+    );
+    if (!empty($nestedDirs)) {
+        fwrite(STDERR, sprintf(
+            "  WARN %d sub- folder(s) inside another participant's folder (copied one level too deep?): %s\n",
+            count($nestedDirs),
+            implode(', ', array_slice($nestedDirs, 0, 8)) . (count($nestedDirs) > 8 ? ' ...' : '')
+        ));
     }
-
-    $orphanDirs = array_keys(array_diff_key($onDisk, $inTsv));
-    $orphanRows = array_keys(array_diff_key($inTsv, $onDisk));
 
     if (!empty($orphanDirs)) {
         fwrite(STDERR, sprintf(
@@ -455,7 +463,7 @@ foreach ($targets as $target) {
             implode(', ', array_map(static fn ($d) => 'sub-' . $d, array_slice($orphanDirs, 0, 8)))
             . (count($orphanDirs) > 8 ? ' ...' : '')
         ));
-        fwrite(STDERR, "       their studies will be archived UNLINKED\n");
+        fwrite(STDERR, "       their studies are UNLINKED: reported only, nothing created or ingested\n");
     }
 
     if (!empty($orphanRows)) {
@@ -484,11 +492,6 @@ foreach ($targets as $target) {
         ));
     }
 
-    $matched = 0;
-    $created = 0;
-    $skipped = 0;
-    $failed  = 0;
-
     try {
         $api = new LorisApiClientAdapter($config, $logger);
         $api->setSite($defaults['site'] ?? null);
@@ -496,86 +499,83 @@ foreach ($targets as $target) {
         // Resolves ProjectID and the exact LORIS Project.Name from
         // project.json, same priority chain as BidsParticipantSync.
         $api->resolveProject($projectConfig, $config);
+        $api->setSexMappings($projectConfig['sex_mappings'] ?? []);
     } catch (Throwable $e) {
         fwrite(STDERR, '  ERROR ' . $e->getMessage() . "\n\n");
         $exitCode = EXIT_FAILURE;
         continue;
     }
 
-    foreach ($roster->all() as $participantId => $row) {
-        $subject = str_starts_with($participantId, 'sub-')
-            ? substr($participantId, 4)
-            : $participantId;
+    // --- Pre-flight: every mismatch, before any candidate is created --------
+    // participants.tsv values and identifiers, visit labels against LORIS,
+    // studies that would go in without a participant - all in one list. Any
+    // error: nothing is created for this project (dry run or not).
+    $pre = \LORIS\Pipelines\Dicom\DicomPreflight::check(
+        $projectPath,
+        $projectConfig,
+        static fn (): array => $api->getConfiguredVisitLabels(),
+        $exclusions
+    );
 
-        if ($wanted !== null && !isset($wanted[$subject])) {
-            $skipped++;
-            continue;
-        }
+    fwrite(STDERR, sprintf(
+        "  PRE-FLIGHT (before any candidate is created): %d error(s), %d warning(s)\n",
+        count($pre['errors']),
+        count($pre['warnings'])
+    ));
+    foreach ($pre['errors'] as $line) {
+        fwrite(STDERR, "    ERROR   {$line}\n");
+        $logger->error("Pre-flight: {$line}");
+    }
+    foreach ($pre['warnings'] as $line) {
+        fwrite(STDERR, "    warning {$line}\n");
+    }
 
-        $externalId = $row['external_id'] ?? $subject;
+    if (!empty($pre['errors'])) {
+        fwrite(STDERR, "  STOP nothing created - fix the error(s) above and re-run\n\n");
+        $exitCode = EXIT_FAILURE;
+        continue;
+    }
 
-        try {
-            $existing = $api->findCandidateByExternalId($externalId);
-        } catch (Throwable $e) {
-            fwrite(STDERR, "  ERROR lookup {$externalId}: " . $e->getMessage() . "\n");
-            $logger->error("Lookup failed for {$externalId}: " . $e->getMessage());
-            $failed++;
-            $exitCode = EXIT_FAILURE;
-            continue;
-        }
+    $n = \LORIS\Pipelines\Shared\ParticipantSync::sync(
+        $roster,
+        $api,
+        $wanted,
+        $excludedSubjects,
+        $confirm,
+        static function (string $line): void {
+            fwrite(STDERR, $line . "\n");
+        },
+        $logger,
+        $verbose
+    );
+    [$matched, $created, $skipped, $failed] = [$n['matched'], $n['created'], $n['skipped'], $n['failed']];
+    if ($failed > 0) {
+        $exitCode = EXIT_FAILURE;
+    }
 
-        if ($existing !== null) {
-            $matched++;
-
-            if ($verbose) {
-                fwrite(STDERR, sprintf(
-                    "    %-16s matched %s (%s)\n",
-                    $externalId,
-                    $existing['pscid'],
-                    $existing['cand_id']
-                ));
-            }
-
-            continue;
-        }
-
-        if (!$confirm) {
-            fwrite(STDERR, "    {$externalId}  would create\n");
-            $created++;
-            continue;
-        }
-
-        try {
-            $candidate = $api->createCandidate(
-                $subject,
-                $externalId,
-                $row['dob'] ?? null,
-                $row['sex'] ?? null
-            );
-
-            $created++;
-
-            fwrite(STDERR, sprintf(
-                "    %-16s created %s (%s)\n",
-                $externalId,
-                $candidate['pscid'],
-                $candidate['cand_id']
-            ));
-        } catch (Throwable $e) {
-            fwrite(STDERR, "  ERROR create {$externalId}: " . $e->getMessage() . "\n");
-            $logger->error("Creation failed for {$externalId}: " . $e->getMessage());
-            $failed++;
-            $exitCode = EXIT_FAILURE;
+    // Warnings for the import email (it is the run's one summary). Rewritten on
+    // every real run, so a fixed difference disappears; a dry run writes nothing.
+    if ($confirm) {
+        $warnFile = $projectPath . '/processed/imaging/dicom_participant_sync.json';
+        if (is_dir(dirname($warnFile)) || @mkdir(dirname($warnFile), 0775, true)) {
+            @file_put_contents($warnFile, json_encode([
+                'generated_at' => date('c'),
+                'problems'     => array_map(
+                    static fn (string $m): array => ['level' => 'warning', 'message' => $m],
+                    $n['differs']
+                ),
+            ], JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES));
         }
     }
 
     fwrite(STDERR, sprintf(
-        "  %d matched, %d %s, %d skipped, %d failed\n\n",
+        "  %d matched, %d %s, %d skipped, %d failed%s\n\n",
         $matched,
         $created,
         $confirm ? 'created' : 'would create',
         $skipped,
-        $failed
+        $failed,
+        $n['differs'] === [] ? '' : sprintf(', %d differ from LORIS (warning)', count($n['differs']))
     ));
 }
 

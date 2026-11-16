@@ -14,7 +14,7 @@
  * @package  Archimedes
  */
 
-namespace LORIS\Pipelines;
+namespace LORIS\Pipelines\Dicom;
 
 class DicomHeaderWriter
 {
