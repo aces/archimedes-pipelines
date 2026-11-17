@@ -539,6 +539,7 @@ PHPCODE;
         $startTime = microtime(true);
 
         // --- Priority 1: API client ---
+        $responded = false;
         if ($this->hasApiClient && $this->moduleConfig !== null) {
             try {
                 $this->logger->debug("    Trying API client (InstrumentManagerApi)...");
@@ -560,6 +561,7 @@ PHPCODE;
                 $elapsed = round(microtime(true) - $startTime, 2);
                 $this->logger->info("    Upload completed in {$elapsed}s");
 
+                $responded        = true;
                 $parsed           = $this->parseApiUploadResult($result);
                 $parsed['method'] = 'API';
 
@@ -569,14 +571,27 @@ PHPCODE;
                     return $parsed;
                 }
 
+                // LORIS answered: this is its real verdict (e.g. validation
+                // errors). Sending the same file again cannot change it and,
+                // in CREATE_SESSIONS mode, risks duplicate candidates.
                 $this->logger->warning("    API upload returned failure: " . ($parsed['message'] ?? 'unknown'));
+                return $parsed;
             } catch (\Error $e) {
                 $elapsed = round(microtime(true) - $startTime, 2);
                 $this->logger->warning("    API upload error ({$elapsed}s): " . $e->getMessage());
+                if ($responded) {
+                    // LORIS already received and answered the upload.
+                    return $this->outcomeUnknownResult($e->getMessage(), 1, 'API');
+                }
                 $this->logger->info("    Falling back to HTTP...");
             } catch (\Exception $e) {
+                if (!self::neverReachedServer($e)) {
+                    return $this->outcomeUnknownResult(
+                        $this->describeTransportError($e, 1), 1, 'API'
+                    );
+                }
                 $this->logger->warning("    API client upload failed: " . $e->getMessage());
-                $this->logger->info("    Falling back to HTTP...");
+                $this->logger->info("    Could not connect - falling back to HTTP...");
             }
         }
 
@@ -671,12 +686,42 @@ PHPCODE;
                 }
 
                 $this->logger->warning("    API multi-instrument returned HTTP {$statusCode}");
+
+                // The request reached LORIS. Unless the route itself is
+                // missing, LORIS may have processed (or still be processing)
+                // the file: sending it again creates duplicate candidates
+                // and sessions. Never re-send.
+                if ($statusCode >= 500) {
+                    return $this->outcomeUnknownResult(
+                        "HTTP {$statusCode}", $count, 'API', $data
+                    );
+                }
+                if (!self::isRouteMissingStatus($statusCode)) {
+                    // A definite refusal (400/401/403, or 409 when LORIS
+                    // is already processing another CREATE_SESSIONS upload).
+                    // Nothing was created; do not re-send now.
+                    $msg = $data['error'] ?? $data['message'] ?? "HTTP {$statusCode}";
+                    $this->logger->error("    ✗ Multi-instrument upload refused: HTTP {$statusCode}: {$msg}");
+                    return [
+                        'success'   => false,
+                        'message'   => "HTTP {$statusCode}: {$msg}",
+                        'idMapping' => [],
+                        'method'    => 'API',
+                    ];
+                }
+                $this->logger->info("    Route not found - falling back to HTTP...");
             } catch (\Error $e) {
+                // Raised while building the request (before anything is sent).
                 $this->logger->warning("    API multi-instrument error: " . $e->getMessage());
                 $this->logger->info("    Falling back to HTTP...");
             } catch (\Exception $e) {
+                if (!self::neverReachedServer($e)) {
+                    return $this->outcomeUnknownResult(
+                        $this->describeTransportError($e, $count), $count, 'API'
+                    );
+                }
                 $this->logger->warning("    API multi-instrument failed: " . $e->getMessage());
-                $this->logger->info("    Falling back to HTTP...");
+                $this->logger->info("    Could not connect - falling back to HTTP...");
             }
         }
 
@@ -739,11 +784,17 @@ PHPCODE;
                 return $result;
             }
 
+            if (!self::isRouteMissingStatus($statusCode) && $statusCode >= 500) {
+                return $this->outcomeUnknownResult("HTTP {$statusCode}", 1, 'HTTP');
+            }
             return [
                 'success' => false, 'message' => $data['error'] ?? "HTTP {$statusCode}",
                 'idMapping' => [], 'method' => 'HTTP',
             ];
         } catch (\Exception $e) {
+            if (!self::neverReachedServer($e)) {
+                return $this->outcomeUnknownResult($this->describeTransportError($e, 1), 1, 'HTTP');
+            }
             $msg = $this->describeTransportError($e, 1);
             $this->logger->error("    ✗ HTTP upload failed: {$msg}");
             return ['success' => false, 'message' => $msg, 'idMapping' => [], 'method' => 'HTTP'];
@@ -817,11 +868,22 @@ PHPCODE;
                 return $result;
             }
 
+            if ($statusCode >= 500) {
+                return $this->outcomeUnknownResult(
+                    "HTTP {$statusCode}", count($instrumentNames), 'HTTP'
+                );
+            }
             $errMsg = $data['error'] ?? $data['message'] ?? "HTTP {$statusCode}";
             $this->logger->error("    ✗ Multi-instrument upload failed: HTTP {$statusCode}");
             return ['success' => false, 'message' => $errMsg, 'idMapping' => [], 'method' => 'HTTP'];
 
         } catch (\Exception $e) {
+            if (!self::neverReachedServer($e)) {
+                return $this->outcomeUnknownResult(
+                    $this->describeTransportError($e, count($instrumentNames)),
+                    count($instrumentNames), 'HTTP'
+                );
+            }
             $msg = $this->describeTransportError($e, count($instrumentNames));
             $this->logger->error("    ✗ Multi-instrument HTTP upload failed: {$msg}");
             return ['success' => false, 'message' => $msg, 'idMapping' => [], 'method' => 'HTTP'];
@@ -1616,6 +1678,73 @@ PHPCODE;
      * invites a re-run that duplicates nothing (LORIS skips existing
      * rows) but hides the fact that data may already be in.
      */
+    // ──────────────────────────────────────────────────────────────────
+    //  Duplicate-safe resubmission
+    //
+    //  A data upload in CREATE_SESSIONS mode creates candidates and
+    //  sessions. It is NOT idempotent while it is still running: a second
+    //  copy sent before the first commits creates every candidate again
+    //  (BHFD, 2026-11-16: a 504 triggered the HTTP fallback and 249 rows
+    //  became 498 candidates). So an upload is only ever sent a second
+    //  time when the first one provably never reached LORIS.
+    // ──────────────────────────────────────────────────────────────────
+
+    /** The route does not exist, so nothing was processed. */
+    private static function isRouteMissingStatus(int $statusCode): bool
+    {
+        return $statusCode === 404 || $statusCode === 405;
+    }
+
+    /**
+     * True only when the request cannot have reached LORIS: DNS failure,
+     * connection refused, or a 404/405 for the route. A timeout, a 5xx
+     * (incl. 502/504 from the proxy) or a dropped connection are NOT
+     * safe: LORIS may be processing the file right now.
+     */
+    private static function neverReachedServer(\Throwable $e): bool
+    {
+        $msg = $e->getMessage();
+        foreach (['cURL error 28', 'timed out', 'Operation timed out'] as $timeout) {
+            if (str_contains($msg, $timeout)) {
+                return false;
+            }
+        }
+        // cURL 6 = could not resolve host, 7 = could not connect.
+        if (str_contains($msg, 'cURL error 6:') || str_contains($msg, 'cURL error 7:')) {
+            return true;
+        }
+        if ($e instanceof \GuzzleHttp\Exception\ConnectException) {
+            return true;
+        }
+        $code = (int) $e->getCode();
+        return self::isRouteMissingStatus($code);
+    }
+
+    /**
+     * Failure whose server-side outcome is unknown. The caller must not
+     * re-send the file until someone has checked what LORIS committed.
+     */
+    private function outcomeUnknownResult(
+        string $cause,
+        int $instrumentCount,
+        string $method,
+        array $body = []
+    ): array {
+        $message = "Upload outcome UNKNOWN ({$cause}). The file was sent once and "
+            . "NOT re-sent: LORIS may still be processing it or may have committed "
+            . "candidates/sessions. Wait for it to finish, check the candidate count "
+            . "for this project, then re-run with --force if data is missing.";
+        $this->logger->error("    ✗ {$message}");
+        return [
+            'success'         => false,
+            'message'         => $message,
+            'outcome_unknown' => true,
+            'idMapping'       => [],
+            'method'          => $method,
+            'instruments'     => $instrumentCount,
+        ];
+    }
+
     private function describeTransportError(\Exception $e, int $instrumentCount): string
     {
         $raw = $e->getMessage();

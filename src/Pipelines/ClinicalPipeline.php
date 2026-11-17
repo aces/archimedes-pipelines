@@ -561,6 +561,39 @@ class ClinicalPipeline
             return;
         }
 
+        // One ingestion per project at a time (same pattern as the DICOM
+        // import's .dicom_import.lock). Two concurrent runs would upload the
+        // same rows at once and LORIS would create every candidate/session
+        // twice (BHFD, 2026-11-16). The OS releases the lock when the
+        // project is done or the process ends, even on a crash.
+        $lock = null;
+        if (!$this->dryRun) {
+            $lock = @fopen(rtrim($mountPath, '/') . '/.clinical_import.lock', 'c');
+            if ($lock === false || !flock($lock, LOCK_EX | LOCK_NB)) {
+                $this->logger->error(
+                    "Project {$name}: another clinical/preclinical ingestion is "
+                    . "already running for this project - skipped, nothing ingested."
+                );
+                $this->stats['data_failed']++;
+                return;
+            }
+        }
+
+        try {
+            $this->processProjectLocked($project, $name, $mountPath);
+        } finally {
+            if ($lock !== null) {
+                flock($lock, LOCK_UN);
+                fclose($lock);
+            }
+        }
+    }
+
+    /**
+     * Body of processProject(), run while holding the project lock.
+     */
+    private function processProjectLocked(array $project, string $name, string $mountPath): void
+    {
         $ddDir    = "{$mountPath}/documentation/data_dictionary";
         $dataDirs = [];
         foreach (self::TABULAR_DATA_DIRS as $label => $rel) {
@@ -2963,6 +2996,31 @@ class ClinicalPipeline
             return;
         }
 
+        // Duplicate guard: a previous run sent this file and never learned
+        // what LORIS did with it (timeout / 5xx). Sending it again while
+        // LORIS may still be working - or after it committed - creates
+        // duplicate candidates and sessions in CREATE_SESSIONS mode.
+        $pending = $this->trackingData[$filename]['unconfirmed_upload'] ?? null;
+        if ($pending !== null && !$this->force && !$this->dryRun) {
+            $msg = "previous upload at {$pending['at']} ({$pending['reason']}) has an UNKNOWN outcome."
+                . " Not re-sending to avoid duplicate candidates. Check the candidate count"
+                . " for this project in LORIS, then re-run with --force.";
+            $this->log("    BLOCKED - {$msg}");
+            $this->writeError($filename, "Upload blocked: {$msg}");
+            $this->dataResults[$filename] = [
+                'status'        => 'failed',
+                'reason'        => 'blocked: previous upload outcome unknown',
+                'instruments'   => [],
+                'rows'          => $rows,
+                'change_status' => $changeStatus,
+            ];
+            $this->stats['data_failed']++;
+            if ($usingTemp && file_exists($uploadPath)) {
+                @unlink($uploadPath);
+            }
+            return;
+        }
+
         try {
             // Shortcut: a file named after a single instrument uploads
             // straight to it. A miss here is expected for any file holding
@@ -2981,6 +3039,8 @@ class ClinicalPipeline
                 if ($result['status'] === 'success') {
                     $this->updateTracking($filename, $filePath, $result, $rowPlan['current'] ?? null);
                     $this->archiveSnapshot($project, $filePath);
+                } elseif (!empty($result['outcome_unknown'])) {
+                    $this->markUploadUnconfirmed($filename, $result['reason'] ?? 'unknown');
                 } elseif (($result['reason'] ?? '') === 'ingestion not confirmed (rows may already exist)') {
                     // Nothing to archive - nothing was written. Record the hash
                     // anyway: LORIS returns this same empty response every time
@@ -3079,6 +3139,8 @@ class ClinicalPipeline
             if ($result['status'] === 'success') {
                 $this->updateTracking($filename, $filePath, $result, $rowPlan['current'] ?? null);
                 $this->archiveSnapshot($project, $filePath);
+            } elseif (!empty($result['outcome_unknown'])) {
+                $this->markUploadUnconfirmed($filename, $result['reason'] ?? 'unknown');
             } elseif (($result['reason'] ?? '') === 'ingestion not confirmed (rows may already exist)') {
                 // See above: record the hash so an unchanged file is not re-sent.
                 $this->updateTracking($filename, $filePath, [], $rowPlan['current'] ?? null);
@@ -3954,7 +4016,12 @@ class ClinicalPipeline
             $this->writeError($instrument, "Upload failed: {$msg}");
             $this->writeUploadErrorDetails($instrument, $filePath, $result);
             $this->stats['data_failed']++;
-            return ['status' => 'failed', 'reason' => $msg, 'elapsed' => $elapsed];
+            return [
+                'status'          => 'failed',
+                'reason'          => $msg,
+                'elapsed'         => $elapsed,
+                'outcome_unknown' => (bool) ($result['outcome_unknown'] ?? false),
+            ];
 
         } catch (\Exception $e) {
             $this->log("    EXCEPTION: " . $e->getMessage());
@@ -3995,7 +4062,12 @@ class ClinicalPipeline
             $this->writeError('multi-instrument', "Upload failed: {$msg}");
             $this->writeUploadErrorDetails('multi-instrument', $filePath, $result);
             $this->stats['data_failed']++;
-            return ['status' => 'failed', 'reason' => $msg, 'elapsed' => $elapsed];
+            return [
+                'status'          => 'failed',
+                'reason'          => $msg,
+                'elapsed'         => $elapsed,
+                'outcome_unknown' => (bool) ($result['outcome_unknown'] ?? false),
+            ];
 
         } catch (\Exception $e) {
             $this->log("    EXCEPTION: " . $e->getMessage());
@@ -4411,6 +4483,24 @@ class ClinicalPipeline
      * content changed); the previous row counts are preserved rather than
      * overwritten with nulls, so the "last run" detail stays truthful.
      */
+    /**
+     * Remember that this file was sent but LORIS's answer never arrived.
+     * Keeps the existing entry (hash etc.) so the file is not treated as
+     * changed; the marker blocks re-sending until --force. A later
+     * successful upload rewrites the entry and drops the marker.
+     */
+    private function markUploadUnconfirmed(string $filename, string $reason): void
+    {
+        $entry = $this->trackingData[$filename] ?? [];
+        $entry['unconfirmed_upload'] = [
+            'at'     => date('Y-m-d\TH:i:s'),
+            'run'    => $this->runTimestamp,
+            'reason' => mb_substr($reason, 0, 200),
+        ];
+        $this->trackingData[$filename] = $entry;
+        $this->saveTrackingFile();
+    }
+
     private function updateTracking(
         string $filename,
         string $filePath,
