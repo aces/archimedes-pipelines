@@ -44,6 +44,7 @@
 require_once __DIR__ . '/../../vendor/autoload.php';
 
 use LORIS\Pipelines\Shared\Cli;
+use LORIS\Pipelines\Shared\ProjectLock;
 use LORIS\Pipelines\Dicom\DicomImportPipeline;
 
 // ── Parse CLI ──────────────────────────────────────────────────────────
@@ -178,11 +179,20 @@ $totalStats = [
     'studies_no_session' => 0,
 ];
 $anyFailed = false;
+$lock      = null;
 
 foreach ($projectDirs as $info) {
     echo "────────────────────────────────────────\n";
     echo "Collection: {$info['collection']}  Project: {$info['project']}\n";
     echo "────────────────────────────────────────\n";
+
+    // One DICOM run per project at a time (shared with the bundle, which hands
+    // its lock over); dry runs do not lock.
+    if (!ProjectLock::enter($lock, $info['path'], 'dicom', basename(__FILE__), !$dryRun,
+        false, "{$info['collection']}/{$info['project']}")) {
+        $anyFailed = true;
+        continue;
+    }
 
     $subdir = $sourceSubdir;
     if ($subdir === null) {
@@ -253,65 +263,14 @@ exit($anyFailed ? 1 : 0);
 
 function resolveProjectDirs(array $config, array $options): array
 {
-    $collections   = $config['collections'] ?? [];
-    $wantAll       = isset($options['all']);
-    $wantColl      = $options['collection'] ?? null;
-    $wantProject   = $options['project'] ?? null;
-
+    // One selection rule for every imaging pipeline (Shared\ImagingProject).
     $dirs = [];
-
-    foreach ($collections as $coll) {
-        $collName  = $coll['name'] ?? '';
-        $basePath  = rtrim($coll['base_path'] ?? '', '/');
-        $enabled   = !empty($coll['enabled']);   // same rule as the other DICOM scripts
-        $projects  = $coll['projects'] ?? [];
-
-        if (!$wantAll && $wantColl !== null && $wantColl !== $collName) {
+    foreach (\LORIS\Pipelines\Shared\ImagingProject::targets($config, $options) as $target) {
+        if (!is_dir($target['path'])) {
+            fwrite(STDERR, "  Warning: project dir not found: {$target['path']} — skipping\n");
             continue;
         }
-
-        if (!$enabled && $wantColl !== $collName) {
-            continue;
-        }
-
-        if (empty($basePath) || empty($projects)) {
-            continue;
-        }
-
-        foreach ($projects as $proj) {
-            $projName    = $proj['name'] ?? '';
-            $projEnabled = !empty($proj['enabled']);
-
-            if ($wantProject !== null && $wantProject !== $projName) {
-                continue;
-            }
-
-            $projectPath = "{$basePath}/{$projName}";
-
-            if (!\LORIS\Pipelines\Dicom\DicomStudyOrganizer::acceptProject(
-                "{$collName}/{$projName}",
-                $projectPath,
-                $enabled && $projEnabled,
-                $wantProject === $projName || (!$enabled && $wantColl === $collName)
-            )) {
-                continue;
-            }
-
-            if (!is_dir($projectPath)) {
-                fwrite(STDERR, "  Warning: project dir not found: {$projectPath} — skipping\n");
-                continue;
-            }
-
-            $dirs[] = [
-                'collection' => $collName,
-                'project'    => $projName,
-                'path'       => $projectPath,
-            ];
-        }
-    }
-
-    if (empty($dirs) && !$wantAll && $wantColl === null) {
-        return [];
+        $dirs[] = $target;
     }
 
     return $dirs;

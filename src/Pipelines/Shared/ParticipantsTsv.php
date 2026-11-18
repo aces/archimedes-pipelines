@@ -131,6 +131,32 @@ class ParticipantsTsv
     }
 
     /**
+     * Why a delivered .tsv (participants.tsv, sessions.tsv ...) cannot be read
+     * as tab-separated text, or null when it can. The usual export mistakes:
+     * an Excel workbook renamed to .tsv, a comma/semicolon-separated file, an
+     * empty file. A UTF-8 BOM and Windows line ends are fine.
+     *
+     * The message starts with "is ...", to follow the file name.
+     */
+    public static function formatProblem(string $path): ?string
+    {
+        $head = (string) @file_get_contents($path, false, null, 0, 4096);
+        if ($head === '') {
+            return 'is empty';
+        }
+        if (str_starts_with($head, "PK\x03\x04") || str_starts_with($head, "\xD0\xCF\x11\xE0")) {
+            return 'is an Excel workbook, not a text file - save it as "Tab Delimited Text" (Excel) '
+                . 'or "Tab-separated values" (Google Sheets)';
+        }
+        $first = strtok(str_replace("\r", '', ltrim($head, "\xEF\xBB\xBF")), "\n") ?: '';
+        if (!str_contains($first, "\t") && (str_contains($first, ',') || str_contains($first, ';'))) {
+            return 'is comma- or semicolon-separated - save it as "Tab Delimited Text" (Excel) '
+                . 'or "Tab-separated values" (Google Sheets), not CSV';
+        }
+        return null;
+    }
+
+    /**
      * Parse a participants.tsv into rows, without judging them. Shared by every
      * modality (DICOM, BIDS, ...): tab-separated via fgetcsv (an empty first
      * cell stays empty - no column shift), values trimmed, short rows padded

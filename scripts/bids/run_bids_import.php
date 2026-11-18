@@ -18,6 +18,8 @@
 require_once __DIR__ . '/../../vendor/autoload.php';
 
 use LORIS\Pipelines\Shared\Cli;
+use LORIS\Pipelines\Shared\PipelineSetup;
+use LORIS\Pipelines\Shared\ProjectLock;
 use LORIS\Pipelines\Bids\BidsImportPipeline;
 
 // ── CLI options (same as the DICOM scripts) ──────────────────────────────────
@@ -166,6 +168,7 @@ try {
         'errors'             => [],
     ];
 
+    $lock = null;
     foreach ($projects as $projectInfo) {
         echo "\n";
         echo str_repeat("─", 60) . "\n";
@@ -173,6 +176,13 @@ try {
         echo "Project    : {$projectInfo['project']}\n";
         echo "BIDS dir   : {$projectInfo['bids_dir']}\n";
         echo str_repeat("─", 60) . "\n";
+
+        // One BIDS run per project at a time; dry runs do not lock.
+        $label = "{$projectInfo['collection']}/{$projectInfo['project']}";
+        if (!ProjectLock::enter($lock, $projectInfo['path'], 'bids', basename(__FILE__), !$dryRun)) {
+            $totalStats['errors'][] = "{$label}: another BIDS run holds the project lock - skipped";
+            continue;
+        }
 
         $stats = $pipeline->run($projectInfo['path'], $pipelineOptions);
 
@@ -221,9 +231,8 @@ try {
 
     $exitCode = ($totalStats['scans_failed'] > 0 || !empty($totalStats['errors'])) ? 1 : 0;
     if ($dryRun) {
-        $cmd = array_values(array_filter($argv, static fn ($a) => $a !== '--dry-run'));
-        echo "\nDry run complete. Nothing was changed. To execute, run:\n\n  php "
-            . implode(' ', array_map('escapeshellarg', $cmd)) . " --confirm\n\n";
+        echo "\nDry run complete. Nothing was changed. To execute, run:\n\n  "
+            . PipelineSetup::confirmCommand($argv) . "\n\n";
     }
 
     exit($exitCode);

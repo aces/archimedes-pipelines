@@ -1547,66 +1547,21 @@ final class RedcapValidator
     /** @return array{ERROR:int, WARNING:int, NOTE:int} */
     public static function counts(array $sections): array
     {
-        $c = [self::ERROR => 0, self::WARNING => 0, self::NOTE => 0];
-        foreach ($sections as $s) {
-            foreach ($s['issues'] as $i) {
-                $c[$i['severity']]++;
-            }
-        }
-        return $c;
+        return ValidationReport::counts($sections);
     }
 
     public static function renderText(array $sections, string $title, string $runAt): string
     {
-        $c   = self::counts($sections);
-        $out = [];
-        $out[] = str_repeat('=', 72);
-        $out[] = "REDCap validation report";
-        $out[] = $title;
-        $out[] = "Checked: {$runAt}";
-        $out[] = "Result : " . ($c[self::ERROR] > 0 ? 'NOT READY' : 'READY')
-            . " - {$c[self::ERROR]} error(s), {$c[self::WARNING]} warning(s)";
-        $out[] = str_repeat('=', 72);
-        $out[] = "ERROR   the instrument manager or the pipeline would reject it; fix before";
-        $out[] = "        ingestion. In a data file, one rejected row stops the whole file.";
-        $out[] = "WARNING ingestion can go ahead, but data may be lost or not as intended";
-        $out[] = "NOTE    information only";
-
-        foreach ($sections as $s) {
-            $out[] = '';
-            $out[] = "[{$s['scope']}] {$s['file']}" . ($s['summary'] !== '' ? "  ({$s['summary']})" : '');
-            $out[] = str_repeat('-', 72);
-            if ($s['issues'] === []) {
-                $out[] = "  OK - no problems found";
-                continue;
-            }
-            $order = [self::ERROR => 0, self::WARNING => 1, self::NOTE => 2];
-            $issues = $s['issues'];
-            usort($issues, fn($a, $b) => $order[$a['severity']] <=> $order[$b['severity']]);
-            foreach ($issues as $i) {
-                $out[] = sprintf("  %-8s%s", $i['severity'], wordwrap($i['message'], 62, "\n          ", true));
-                if ($i['fix'] !== '') {
-                    $out[] = "          Fix: " . wordwrap($i['fix'], 57, "\n               ", true);
-                }
-            }
-        }
-        $out[] = '';
-        return implode("\n", $out);
+        return ValidationReport::renderText($sections, "REDCap validation report", $title, $runAt, [
+            "ERROR   the instrument manager or the pipeline would reject it; fix before",
+            "        ingestion. In a data file, one rejected row stops the whole file.",
+            "WARNING ingestion can go ahead, but data may be lost or not as intended",
+            "NOTE    information only",
+        ]);
     }
 
     public static function writeCsv(array $sections, string $path): bool
     {
-        $fh = @fopen($path, 'w');
-        if ($fh === false) {
-            return false;
-        }
-        fputcsv($fh, ['severity', 'checked', 'file', 'problem', 'fix'], ',', '"', '');
-        foreach ($sections as $s) {
-            foreach ($s['issues'] as $i) {
-                fputcsv($fh, [$i['severity'], $s['scope'], $s['file'], $i['message'], $i['fix']], ',', '"', '');
-            }
-        }
-        fclose($fh);
-        return true;
+        return ValidationReport::writeCsv($sections, $path);
     }
 }

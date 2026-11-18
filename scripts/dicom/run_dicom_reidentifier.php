@@ -32,13 +32,11 @@ declare(strict_types=1);
 require_once __DIR__ . '/../../vendor/autoload.php';
 
 use LORIS\Pipelines\Shared\Cli;
+use LORIS\Pipelines\Shared\PipelineSetup;
+use LORIS\Pipelines\Shared\ProjectLock;
 use LORIS\Pipelines\Dicom\DicomHeaderWriter;
 use LORIS\Pipelines\Dicom\DicomReidentifier;
 use LORIS\Pipelines\Shared\ParticipantsTsv;
-use Monolog\Handler\RotatingFileHandler;
-use Monolog\Handler\StreamHandler;
-use Monolog\Level;
-use Monolog\Logger;
 
 const EXIT_OK      = 0;
 const EXIT_FAILURE = 1;
@@ -88,150 +86,19 @@ TXT
 }
 
 /**
- * Read and decode a JSON file.
- *
- * @throws RuntimeException on missing file or invalid JSON.
- */
-function readJson(string $path): array
-{
-    if (!file_exists($path)) {
-        throw new RuntimeException("File not found: {$path}");
-    }
-
-    $raw = file_get_contents($path);
-    if ($raw === false) {
-        throw new RuntimeException("Could not read {$path}");
-    }
-
-    $data = json_decode($raw, true);
-    if (json_last_error() !== JSON_ERROR_NONE) {
-        throw new RuntimeException(
-            "Invalid JSON in {$path}: " . json_last_error_msg()
-        );
-    }
-
-    return $data;
-}
-
-/**
  * Resolve which collection/project pairs to process.
  *
  * @return array<int, array{collection: string, project: string, path: string}>
  */
 function resolveTargets(array $config, array $options): array
 {
-    $targets = [];
-
-    $wantAll        = isset($options['all']);
-    $wantCollection = $options['collection'] ?? null;
-    $wantProject    = $options['project'] ?? null;
-
-    if ($wantProject !== null && $wantCollection === null) {
+    if (($options['project'] ?? null) !== null && ($options['collection'] ?? null) === null) {
         fwrite(STDERR, "--project requires --collection\n\n");
         usage();
     }
 
-    foreach ($config['collections'] ?? [] as $collection) {
-        $collectionName = $collection['name'] ?? null;
-
-        if ($collectionName === null) {
-            continue;
-        }
-
-        if (empty($collection['enabled']) && $wantCollection !== $collectionName) {
-            continue;
-        }
-
-        if (!$wantAll && $wantCollection !== null && $wantCollection !== $collectionName) {
-            continue;
-        }
-
-        $basePath = rtrim($collection['base_path'] ?? '', '/');
-
-        foreach ($collection['projects'] ?? [] as $project) {
-            $projectName = $project['name'] ?? null;
-
-            if ($projectName === null) {
-                continue;
-            }
-
-            if ($wantProject !== null && $wantProject !== $projectName) {
-                continue;
-            }
-
-            if (!\LORIS\Pipelines\Dicom\DicomStudyOrganizer::acceptProject(
-                "{$collectionName}/{$projectName}",
-                $basePath . '/' . $projectName,
-                !empty($collection['enabled']) && !empty($project['enabled']),
-                $wantProject === $projectName
-                || (empty($collection['enabled']) && $wantCollection === $collectionName)
-            )) {
-                continue;
-            }
-
-            $targets[] = [
-                'collection' => $collectionName,
-                'project'    => $projectName,
-                'path'       => $basePath . '/' . $projectName,
-            ];
-        }
-    }
-
-    return $targets;
-}
-
-/**
- * Build a per-project logger writing to logs/dicom/.
- */
-function buildLogger(string $projectPath, bool $verbose): Logger
-{
-    $logDir = $projectPath . '/logs/dicom';
-
-    if (!is_dir($logDir)) {
-        @mkdir($logDir, 0775, true);
-    }
-
-    $logger = new Logger('dicom_reidentifier');
-
-    if (is_dir($logDir)) {
-        $logger->pushHandler(
-            new RotatingFileHandler($logDir . '/dicom_reidentifier.log', 30, Level::Info)
-        );
-    }
-
-    $logger->pushHandler(
-        new StreamHandler('php://stderr', $verbose ? Level::Debug : Level::Warning)
-    );
-
-    return $logger;
-}
-
-/**
- * The command just run, with --confirm added and --dry-run removed.
- *
- * Printed at the end of a dry run so the operator can copy the exact line
- * rather than reconstructing it, which is where selection arguments get
- * mistyped and the wrong project gets written.
- */
-function confirmCommand(array $argv): string
-{
-    $args = array_slice($argv, 1);
-
-    $args = array_values(array_filter(
-        $args,
-        static fn (string $a): bool => $a !== '--dry-run' && $a !== '--confirm'
-    ));
-
-    $args[] = '--confirm';
-
-    return 'php ' . $argv[0] . ' ' . implode(' ', array_map(
-        // Quote anything outside the plain set, so a path with a space in it
-        // still produces a line that can be pasted and run.
-            static fn (string $a): string => preg_match('~^[A-Za-z0-9=_./-]+$~', $a) === 1
-                ? $a
-                : escapeshellarg($a),
-            $args
-        ));
+    // One selection rule for every imaging pipeline (Shared\ImagingProject).
+    return \LORIS\Pipelines\Shared\ImagingProject::targets($config, $options);
 }
 
 // -----------------------------------------------------------------------------
@@ -281,7 +148,7 @@ $verbose    = isset($options['v']) || isset($options['verbose']);
 $configPath = $options['config'] ?? DEFAULT_CONFIG;
 
 try {
-    $config = readJson($configPath);
+    $config = PipelineSetup::readJson($configPath);
 } catch (RuntimeException $e) {
     fwrite(STDERR, 'ERROR ' . $e->getMessage() . "\n");
     exit(EXIT_USAGE);
@@ -314,12 +181,21 @@ if (!$confirm) {
 // -----------------------------------------------------------------------------
 
 $exitCode = EXIT_OK;
+$lock     = null;
 
 foreach ($targets as $target) {
     $projectPath = $target['path'];
     $label       = "{$target['collection']}/{$target['project']}";
 
     fwrite(STDERR, "=== {$label} ===\n");
+
+    // One DICOM run per project at a time (shared with the bundle, which hands
+    // its lock over); dry runs do not lock.
+    if (!ProjectLock::enter($lock, $projectPath, 'dicom', basename(__FILE__), $confirm)) {
+        $exitCode = EXIT_FAILURE;
+        fwrite(STDERR, "\n");
+        continue;
+    }
 
     $manifestPath = $projectPath . '/processed/imaging/dicom_studies.json';
 
@@ -342,7 +218,7 @@ foreach ($targets as $target) {
         fwrite(STDERR, "  WARN no participants.tsv found; demographics unavailable\n");
     } else {
         try {
-            $projectConfig = readJson($projectPath . '/project.json');
+            $projectConfig = PipelineSetup::readJson($projectPath . '/project.json');
             $roster        = ParticipantsTsv::load(
                 $tsvPath,
                 $projectConfig['candidate_defaults'] ?? [],
@@ -372,12 +248,12 @@ foreach ($targets as $target) {
         }
     }
 
-    $logger = buildLogger($projectPath, $verbose);
+    $logger = PipelineSetup::logger($projectPath, 'dicom', 'reidentifier', $verbose);
 
     try {
         // Same setup as run_dicom_participant_sync.php: site and LORIS
         // project name are needed for visit labels and new sessions.
-        $projectConfig ??= readJson($projectPath . '/project.json');
+        $projectConfig ??= PipelineSetup::readJson($projectPath . '/project.json');
 
         $api = new \LORIS\Endpoints\LorisApiClientAdapter($config, $logger);
         $api->setSite($projectConfig['candidate_defaults']['site'] ?? null);
@@ -433,7 +309,7 @@ foreach ($targets as $target) {
 if (!$confirm) {
     fwrite(STDERR, "\nDry run complete. Nothing was copied and no headers rewritten.\n");
     fwrite(STDERR, "To write for real, run:\n\n");
-    fwrite(STDERR, '  ' . confirmCommand($argv) . "\n\n");
+    fwrite(STDERR, '  ' . PipelineSetup::confirmCommand($argv) . "\n\n");
 }
 
 exit($exitCode);

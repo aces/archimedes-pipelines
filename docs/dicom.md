@@ -506,7 +506,7 @@ To really delete a study from LORIS, use LORIS-MRI
 - **Only after organize, sync and reidentify all succeeded**, and only with `--confirm`.
 - **One StudyInstanceUID = one LORIS archive.** "Already inserted" becomes an update **only** for a study this pipeline imported for this project. A UID that came from another project or a manual import is refused, never overwritten.
 - **Never downgraded or moved silently.** A reidentified study keeps its PSCID and visit.
-- **One run per project at a time** (lock). A second run is skipped.
+- **One run per project at a time** (lock). Every DICOM script that writes - the bundle and each step on its own (`--confirm`) - takes `<project>/.dicom_pipeline.lock`; the bundle hands it to its steps, so a step started by hand while a bundle runs is skipped too, and says who holds the lock. Before a real bundle run the lock is checked on the project's mount (works, enforced, local to this host?): a FAIL stops the project. Dry runs do not lock. The OS releases the lock when a run ends, even on a crash.
 - **Uploads in progress are left alone:** if anything in the delivery changed in the last `imaging.delivery_quiet_minutes` (default 5), the project waits for the next run. `--force` overrides this.
 - **Long imports are never duplicated.** Ingestion runs under the LORIS server process manager and can take hours. If the pipeline stops watching a job (4-hour limit, or LORIS stops answering), the study is recorded as *still running*. The next run checks that job before doing anything with the study.
 - **Data issues are reported together, before anything is created** (section 4). The project then aborts, or continues with the good studies only, if you answer yes or pass `--continue-good`. Data issues are:
@@ -644,16 +644,22 @@ than copying it:
 |---|---|---|
 | `ParticipantsTsv::locate()` | finds the file: `bids`, `dicom`, or any folder under `deidentified-raw/` (`png`, `imaging/pngs`, …) | all |
 | `ParticipantsTsv::readRows()` | parses the file (tabs, CRLF, Excel BOM, short/long rows; an empty first cell never shifts the columns) | DICOM, BIDS |
-| `ParticipantSync::load()` | rows filled from `candidate_defaults`, plus the LORIS columns still missing | DICOM |
-| `ParticipantsCheck::check()` | pre-flight: columns, identifiers, sex, dob, visit labels, visits configured in LORIS | DICOM |
+| `ParticipantSync::load()` | rows filled from `candidate_defaults`, plus the LORIS columns still missing | DICOM, PNG |
+| `ParticipantsCheck::check()` | pre-flight: columns, identifiers, sex, dob, visit labels, visits configured in LORIS | DICOM, PNG |
 | `LorisApiClientAdapter::normaliseSexValue()` | sex → Male/Female/Other, plus `project.json` `sex_mappings` | DICOM, BIDS |
-| `ParticipantSync::EXTERNAL_ID_COLUMNS` / `externalId()` | `external_id`, `ExtStudyID`, `study_id`, … | DICOM, BIDS |
-| `ParticipantSync::orphans()` / `orphanFolders()` | `sub-` folders with no row, rows with no folder | DICOM, BIDS |
-| `ParticipantSync::nestedSubjectDirs()` | a `sub-` folder inside another one | DICOM (BIDS has its own, with the file-name check) |
-| `ParticipantSync::sync()` | find by external ID, create if missing (dry run: report only); warns when an existing candidate's dob/sex differ | DICOM |
-| `ParticipantSync::lorisDifferences()` | `participants.tsv` dob/sex vs the candidate in LORIS, same normalisation as creation (read-only) | DICOM sync, validator |
-| `SessionsTsv::listed()` / `check()` | `sub-<ID>/sessions.tsv` (preferred) or `sub-<ID>_sessions.tsv`: which visits are listed (only those are ingested), and every mismatch with the `ses-` folders (missing file, no `session_id`, visit not listed, row with no folder, bad `acq_date`) | DICOM organizer, validator (BIDS: ready to use, same file) |
-| `LorisApiClientAdapter` (`src/Endpoints/`) | the LORIS calls (mapper, candidatesPlus, candidates, visits, sessions) | DICOM, BIDS |
+| `ParticipantSync::EXTERNAL_ID_COLUMNS` / `externalId()` | `external_id`, `ExtStudyID`, `study_id`, … | DICOM, BIDS, PNG |
+| `ParticipantSync::orphans()` / `orphanFolders()` | `sub-` folders with no row, rows with no folder | DICOM, BIDS, PNG |
+| `ParticipantSync::nestedSubjectDirs()` | a `sub-` folder inside another one | DICOM, PNG (BIDS has its own, with the file-name check) |
+| `ParticipantSync::sync()` | find by external ID, create if missing (dry run: report only); warns when an existing candidate's dob/sex differ | DICOM, PNG |
+| `ParticipantSync::lorisDifferences()` | `participants.tsv` dob/sex vs the candidate in LORIS, same normalisation as creation (read-only) | DICOM sync, validator, PNG validator |
+| `SessionsTsv::listed()` / `check()` | `sub-<ID>/sessions.tsv` (preferred) or `sub-<ID>_sessions.tsv`: which visits are listed (only those are ingested), and every mismatch with the `ses-` folders (missing file, no `session_id`, visit not listed, row with no folder, bad `acq_date`) | DICOM organizer, validator, PNG scan (BIDS: ready to use, same file) |
+| `LorisApiClientAdapter` (`src/Endpoints/`) | the LORIS calls (mapper, candidatesPlus, candidates, visits, sessions) | DICOM, BIDS, PNG |
+| `ImagingProject::targets()` / `acceptProject()` / `projectSkipReason()` / `uploadInProgress()` | project selection (`--all` / `--collection` / `--project`, names matched case-insensitively, enabled + `Imaging` in `modalities`) and the upload quiet period | every DICOM script, PNG |
+| `ProjectLock::enter()` / `acquire()` / `probe()` | one run per project folder (`.<modality>_pipeline.lock`, `flock`), hand-over to a bundle's step scripts, mount pre-flight (lock enforced? local-only?) | DICOM, BIDS, PNG, clinical |
+| `PipelineSetup` | strict options, config, `readJson()`, `logDir()` / `logger()` (`logs/<modality>/`), `project.json`, LORIS adapter for the project, declared visits, the `--confirm` line | DICOM, BIDS, PNG (`PngCli` extends it) |
+| `BundleSupport` | a bundle's step runner (output to console + bundle log, abort detection, lock hand-over), the stop-before-ingestion rule and FAILED email, the continue prompt | DICOM and PNG bundles |
+| `ParticipantsTsv::formatProblem()` | a `.tsv` that is an Excel workbook, comma-separated or empty | DICOM validator, PNG |
+| `Validation\ValidationReport` | the ERROR / WARNING / NOTE report and `.csv` of the pre-checks | `validate_redcap.php`, `validate_png.php` |
 
 DOB everywhere: `LORIS\Utils\Dob` (unchanged).
 
@@ -667,7 +673,27 @@ while carrying on. Compared with before, a BIDS run differs only in two ways:
   instead of being read with its columns shifted
 - `sex_mappings` is honoured (`1`/`2` and so on), as in clinical and DICOM
 
-**A new modality:**
+**A new modality** (PNG is the worked example: `src/Pipelines/Png/`, `scripts/png/`,
+[docs/png.md](png.md)). Write only what is the modality's own - reading its delivery,
+reidentifying, importing - and take the rest from `Shared/`:
+
+| Need | Use | PNG example |
+|---|---|---|
+| script options, project selection, config, LORIS adapter, `--confirm` line | `PipelineSetup` (extend it for the modality's paths) | `PngCli extends PipelineSetup` |
+| skip projects without `Imaging`, wait for uploads in progress | `ImagingProject` | bundle + every script via `PipelineSetup::targets()` |
+| participants.tsv, sex/dob, visits, candidates by ExternalID | `ParticipantsTsv`, `ParticipantsCheck`, `ParticipantSync`, `SessionsTsv`, `LorisApiClientAdapter` | `run_png_participant_sync.php` |
+| one run per project, lock passed to the bundle's steps, mount pre-flight | `ProjectLock::enter($lock, $path, '<modality>', ...)` in each script's project loop | `.png_pipeline.lock` |
+| bundle: run steps, stop rule + FAILED email, continue prompt, bundle log | `BundleSupport` | `run_png_bundle.php` |
+| site pre-check report (ERROR/WARNING/NOTE, `.txt` + `.csv`) | `Validation\ValidationReport` (a `<Modality>Validator` beside `RedcapValidator`) | `PngValidator`, `scripts/test/validate_png.php` |
+| change detection, tracking files | `StudyFingerprint`, `FingerprintTracker`, `TrackingFile` | (PNG hashes per image instead, see docs/png.md) |
+
+**BIDS** uses the participant pieces and the project lock (`.bids_pipeline.lock`, every BIDS
+script with `--confirm`). It keeps its own project selection on purpose (as clinical: `enabled`
+defaults to true, and a disabled project is skipped even when named). It has no upload quiet
+period yet: `ImagingProject::uploadInProgress()` adds it, and `BundleSupport` a BIDS bundle,
+without changing its import logic.
+
+The participant step on its own:
 
 ```php
 $tsv    = ParticipantsTsv::locate($projectPath, 'imaging/pngs');
@@ -695,10 +721,12 @@ src/Pipelines/
                                     DicomHeaderWriter, DicomImportPipeline, DicomEviDataExtract
   Bids/     LORIS\Pipelines\Bids    BidsParticipantSync, BidsReidentifier, BidsImportPipeline
   Shared/   LORIS\Pipelines\Shared  ParticipantsTsv, ParticipantSync, ParticipantsCheck,
-                                    SessionsTsv (sessions.tsv rules),
+                                    SessionsTsv (sessions.tsv rules), ImagingProject (project
+                                    selection, upload quiet period), ProjectLock (per-project lock),
+                                    PipelineSetup (script plumbing), BundleSupport (bundle runner),
                                     StudyFingerprint, FingerprintTracker, TrackingFile,
-                                    Cli (strict option check for every BIDS/DICOM script)
-  ClinicalPipeline.php, ParticipantMetadataPipeline.php      (clinical - unchanged)
+                                    Cli (strict option check for every script)
+  ClinicalPipeline.php, ParticipantMetadataPipeline.php      (clinical; its lock is Shared\ProjectLock)
 src/Endpoints/  LORIS\Endpoints     the API clients: LorisApiClientAdapter + LorisApiClientInterface
                                     (BIDS/DICOM), ClinicalClient, EviDataClient (unchanged)
 src/Utils/, src/Database/                                    (shared with clinical - unchanged)
@@ -713,6 +741,6 @@ scripts/
 docs/dicom.md   this guide
 ```
 
-A new modality (PNG …) gets `src/Pipelines/<Modality>/` and `scripts/<modality>/`
+A new modality gets `src/Pipelines/<Modality>/` and `scripts/<modality>/` (PNG did: [docs/png.md](png.md))
 and builds on `Shared/` (section 13). A class moves to `Shared/` when a second
 modality uses it.

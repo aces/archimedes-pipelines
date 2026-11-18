@@ -32,13 +32,11 @@ declare(strict_types=1);
 require_once __DIR__ . '/../../vendor/autoload.php';
 
 use LORIS\Pipelines\Shared\Cli;
+use LORIS\Pipelines\Shared\PipelineSetup;
+use LORIS\Pipelines\Shared\ProjectLock;
 use LORIS\Pipelines\Dicom\DicomEviDataExtract;
 use LORIS\Pipelines\Dicom\DicomStudyOrganizer;
 use LORIS\Pipelines\Shared\StudyFingerprint;
-use Monolog\Handler\RotatingFileHandler;
-use Monolog\Handler\StreamHandler;
-use Monolog\Level;
-use Monolog\Logger;
 
 const EXIT_OK      = 0;
 const EXIT_FAILURE = 1;
@@ -88,166 +86,19 @@ TXT
 }
 
 /**
- * Read and decode a JSON file.
- *
- * @throws RuntimeException on missing file or invalid JSON.
- */
-function readJson(string $path): array
-{
-    if (!file_exists($path)) {
-        throw new RuntimeException("File not found: {$path}");
-    }
-
-    $raw = file_get_contents($path);
-    if ($raw === false) {
-        throw new RuntimeException("Could not read {$path}");
-    }
-
-    $data = json_decode($raw, true);
-    if (json_last_error() !== JSON_ERROR_NONE) {
-        throw new RuntimeException(
-            "Invalid JSON in {$path}: " . json_last_error_msg()
-        );
-    }
-
-    return $data;
-}
-
-/**
  * Resolve which collection/project pairs to process.
  *
  * @return array<int, array{collection: string, project: string, path: string}>
  */
 function resolveTargets(array $config, array $options): array
 {
-    $targets = [];
-
-    $wantAll        = isset($options['all']);
-    $wantCollection = $options['collection'] ?? null;
-    $wantProject    = $options['project'] ?? null;
-
-    if ($wantProject !== null && $wantCollection === null) {
+    if (($options['project'] ?? null) !== null && ($options['collection'] ?? null) === null) {
         fwrite(STDERR, "--project requires --collection\n\n");
         usage();
     }
 
-    // Collection and project names are identifiers, not data, so match them
-    // case-insensitively. --collection=ARCHIMEDES finding nothing because the
-    // config says "archimedes" is a frustrating way to spend ten minutes.
-    $matches = static function (?string $wanted, string $actual): bool {
-        return $wanted === null || strcasecmp($wanted, $actual) === 0;
-    };
-
-    foreach ($config['collections'] ?? [] as $collection) {
-        $collectionName = $collection['name'] ?? null;
-
-        if ($collectionName === null) {
-            continue;
-        }
-
-        $collectionWanted = $matches($wantCollection, $collectionName);
-
-        // Named explicitly only when --collection was given; matches() is also
-        // true when no name was given, which made --all include disabled ones.
-        $collectionNamed = $wantCollection !== null && $collectionWanted;
-
-        if (empty($collection['enabled']) && !$collectionNamed) {
-            continue;
-        }
-
-        if (!$wantAll && $wantCollection !== null && !$collectionWanted) {
-            continue;
-        }
-
-        $basePath = rtrim($collection['base_path'] ?? '', '/');
-
-        foreach ($collection['projects'] ?? [] as $project) {
-            $projectName = $project['name'] ?? null;
-
-            if ($projectName === null) {
-                continue;
-            }
-
-            $projectWanted = $matches($wantProject, $projectName);
-
-            if ($wantProject !== null && !$projectWanted) {
-                continue;
-            }
-
-            $projectNamed = $wantProject !== null && $projectWanted;
-
-            if (!\LORIS\Pipelines\Dicom\DicomStudyOrganizer::acceptProject(
-                "{$collectionName}/{$projectName}",
-                $basePath . '/' . $projectName,
-                !empty($collection['enabled']) && !empty($project['enabled']),
-                $projectNamed || ($collectionNamed && empty($collection['enabled']))
-            )) {
-                continue;
-            }
-
-            $targets[] = [
-                'collection' => $collectionName,
-                'project'    => $projectName,
-                'path'       => $basePath . '/' . $projectName,
-            ];
-        }
-    }
-
-    return $targets;
-}
-
-/**
- * Build a per-project logger writing to logs/dicom/.
- */
-function buildLogger(string $projectPath, bool $verbose): Logger
-{
-    $logDir = $projectPath . '/logs/dicom';
-
-    if (!is_dir($logDir)) {
-        @mkdir($logDir, 0775, true);
-    }
-
-    $logger = new Logger('dicom_organize');
-
-    if (is_dir($logDir)) {
-        $logger->pushHandler(
-            new RotatingFileHandler($logDir . '/dicom_organize.log', 30, Level::Info)
-        );
-    }
-
-    $logger->pushHandler(
-        new StreamHandler('php://stderr', $verbose ? Level::Debug : Level::Warning)
-    );
-
-    return $logger;
-}
-
-/**
- * The command just run, with --confirm added and --dry-run removed.
- *
- * Printed at the end of a dry run so the operator can copy the exact line
- * rather than reconstructing it, which is where selection arguments get
- * mistyped and the wrong project gets written.
- */
-function confirmCommand(array $argv): string
-{
-    $args = array_slice($argv, 1);
-
-    $args = array_values(array_filter(
-        $args,
-        static fn (string $a): bool => $a !== '--dry-run' && $a !== '--confirm'
-    ));
-
-    $args[] = '--confirm';
-
-    return 'php ' . $argv[0] . ' ' . implode(' ', array_map(
-        // Quote anything outside the plain set, so a path with a space in it
-        // still produces a line that can be pasted and run.
-            static fn (string $a): string => preg_match('~^[A-Za-z0-9=_./-]+$~', $a) === 1
-                ? $a
-                : escapeshellarg($a),
-            $args
-        ));
+    // One selection rule for every imaging pipeline (Shared\ImagingProject).
+    return \LORIS\Pipelines\Shared\ImagingProject::targets($config, $options);
 }
 
 // -----------------------------------------------------------------------------
@@ -302,7 +153,7 @@ $verbose    = isset($options['v']) || isset($options['verbose']);
 $configPath = $options['config'] ?? DEFAULT_CONFIG;
 
 try {
-    $config = readJson($configPath);
+    $config = PipelineSetup::readJson($configPath);
 } catch (RuntimeException $e) {
     fwrite(STDERR, 'ERROR ' . $e->getMessage() . "\n");
     exit(EXIT_USAGE);
@@ -370,7 +221,7 @@ $evidataPath   = __DIR__ . '/../../config/evidata_config.json';
 
 if (file_exists($evidataPath)) {
     try {
-        $evidataGlobal = readJson($evidataPath);
+        $evidataGlobal = PipelineSetup::readJson($evidataPath);
     } catch (RuntimeException $e) {
         fwrite(STDERR, 'ERROR ' . $e->getMessage() . "\n");
         exit(EXIT_USAGE);
@@ -386,6 +237,7 @@ if (!$confirm) {
 // -----------------------------------------------------------------------------
 
 $exitCode = EXIT_OK;
+$lock     = null;
 $summary  = [];
 
 foreach ($targets as $target) {
@@ -393,6 +245,14 @@ foreach ($targets as $target) {
     $label       = "{$target['collection']}/{$target['project']}";
 
     fwrite(STDERR, "=== {$label} ===\n");
+
+    // One DICOM run per project at a time (shared with the bundle, which hands
+    // its lock over); dry runs do not lock.
+    if (!ProjectLock::enter($lock, $projectPath, 'dicom', basename(__FILE__), $confirm)) {
+        $exitCode = EXIT_FAILURE;
+        fwrite(STDERR, "\n");
+        continue;
+    }
 
     // Gate on project.json, same as the other imaging pipelines.
     $projectJson = $projectPath . '/project.json';
@@ -403,7 +263,7 @@ foreach ($targets as $target) {
     }
 
     try {
-        $projectConfig = readJson($projectJson);
+        $projectConfig = PipelineSetup::readJson($projectJson);
     } catch (RuntimeException $e) {
         fwrite(STDERR, '  ERROR ' . $e->getMessage() . "\n\n");
         $exitCode = EXIT_FAILURE;
@@ -414,7 +274,7 @@ foreach ($targets as $target) {
     $sourceDir = $projectPath . '/deidentified-raw/imaging/dicoms';
     $targetDir = $projectPath . '/processed/imaging';
 
-    $waitReason = \LORIS\Pipelines\Dicom\DicomStudyOrganizer::uploadInProgress(
+    $waitReason = \LORIS\Pipelines\Shared\ImagingProject::uploadInProgress(
         $sourceDir,
         (int) ($config['imaging']['delivery_quiet_minutes'] ?? 5)
     );
@@ -442,7 +302,7 @@ foreach ($targets as $target) {
 
     if (file_exists($stateFile)) {
         try {
-            $previousState = readJson($stateFile);
+            $previousState = PipelineSetup::readJson($stateFile);
         } catch (RuntimeException $e) {
             // A corrupt state file must not stop a run; treat it as absent.
             fwrite(STDERR, '  WARN unreadable delivery state, re-processing: '
@@ -475,7 +335,7 @@ foreach ($targets as $target) {
         ));
     }
 
-    $logger = buildLogger($projectPath, $verbose);
+    $logger = PipelineSetup::logger($projectPath, 'dicom', 'organize', $verbose);
 
     // De-identification audit runs BEFORE organizing, on the original
     // delivery - that is what the site actually sent, and it is the version
@@ -698,7 +558,7 @@ if (count($summary) > 1) {
 if (!$confirm) {
     fwrite(STDERR, "\nDry run complete. No studies were written.\n");
     fwrite(STDERR, "To organize for real, run:\n\n");
-    fwrite(STDERR, '  ' . confirmCommand($argv) . "\n\n");
+    fwrite(STDERR, '  ' . PipelineSetup::confirmCommand($argv) . "\n\n");
 }
 
 exit($exitCode);

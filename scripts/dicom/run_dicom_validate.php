@@ -50,6 +50,7 @@ declare(strict_types=1);
 require_once __DIR__ . '/../../vendor/autoload.php';
 
 use LORIS\Pipelines\Shared\Cli;
+use LORIS\Pipelines\Shared\PipelineSetup;
 use LORIS\Pipelines\Dicom\DicomPreflight;
 use LORIS\Pipelines\Dicom\DicomStudyOrganizer;
 use LORIS\Endpoints\LorisApiClientAdapter;
@@ -126,18 +127,6 @@ TXT
     exit($code);
 }
 
-function readJson(string $path): array
-{
-    if (!is_file($path)) {
-        throw new RuntimeException("File not found: {$path}");
-    }
-    $data = json_decode((string) file_get_contents($path), true);
-    if (!is_array($data)) {
-        throw new RuntimeException("Invalid JSON in {$path}: " . json_last_error_msg());
-    }
-    return $data;
-}
-
 /**
  * Same selection rule as the other DICOM scripts.
  *
@@ -145,52 +134,13 @@ function readJson(string $path): array
  */
 function resolveTargets(array $config, array $options): array
 {
-    $targets        = [];
-    $wantAll        = isset($options['all']);
-    $wantCollection = $options['collection'] ?? null;
-    $wantProject    = $options['project'] ?? null;
-
-    if ($wantProject !== null && $wantCollection === null) {
+    if (($options['project'] ?? null) !== null && ($options['collection'] ?? null) === null) {
         fwrite(STDERR, "--project requires --collection\n\n");
         usage();
     }
 
-    foreach ($config['collections'] ?? [] as $collection) {
-        $collectionName = $collection['name'] ?? null;
-        if ($collectionName === null) {
-            continue;
-        }
-        if (empty($collection['enabled']) && $wantCollection !== $collectionName) {
-            continue;
-        }
-        if (!$wantAll && $wantCollection !== null && $wantCollection !== $collectionName) {
-            continue;
-        }
-        $basePath = rtrim($collection['base_path'] ?? '', '/');
-
-        foreach ($collection['projects'] ?? [] as $project) {
-            $projectName = $project['name'] ?? null;
-            if ($projectName === null || ($wantProject !== null && $wantProject !== $projectName)) {
-                continue;
-            }
-            if (!DicomStudyOrganizer::acceptProject(
-                "{$collectionName}/{$projectName}",
-                $basePath . '/' . $projectName,
-                !empty($collection['enabled']) && !empty($project['enabled']),
-                $wantProject === $projectName
-                || (empty($collection['enabled']) && $wantCollection === $collectionName)
-            )) {
-                continue;
-            }
-            $targets[] = [
-                'collection' => $collectionName,
-                'project'    => $projectName,
-                'path'       => $basePath . '/' . $projectName,
-            ];
-        }
-    }
-
-    return $targets;
+    // One selection rule for every imaging pipeline (Shared\ImagingProject).
+    return \LORIS\Pipelines\Shared\ImagingProject::targets($config, $options);
 }
 
 function rmTree(string $dir): void
@@ -316,24 +266,6 @@ final class Findings
 // =============================================================================
 
 /**
- * A tab-separated file saved the wrong way (guide section 3): CSV, or not text.
- */
-function spreadsheetFormatProblem(string $path): ?string
-{
-    $head = (string) @file_get_contents($path, false, null, 0, 4096);
-    if (str_starts_with($head, "PK\x03\x04") || str_starts_with($head, "\xD0\xCF\x11\xE0")) {
-        return 'is an Excel workbook, not a text file - save it as "Tab Delimited Text" (Excel) '
-            . 'or "Tab-separated values" (Google Sheets)';
-    }
-    $first = strtok(str_replace("\r", '', $head), "\n") ?: '';
-    if (!str_contains($first, "\t") && (str_contains($first, ',') || str_contains($first, ';'))) {
-        return 'is comma- or semicolon-separated - save it as "Tab Delimited Text" (Excel) '
-            . 'or "Tab-separated values" (Google Sheets), not CSV';
-    }
-    return null;
-}
-
-/**
  * Walk a folder: regular files, files the pipeline cannot read (the organizer
  * skips those silently, so their slices would be lost), and an error when a
  * folder itself cannot be listed. Hidden files are ignored.
@@ -442,7 +374,7 @@ function checkStructure(
         $f->fix('participants.tsv', 'participants.tsv',
             'missing - without it no study can be matched to a participant',
             'add participants.tsv at the top level, next to the sub- folders (guide section 3)');
-    } elseif (($why = spreadsheetFormatProblem($tsv)) !== null) {
+    } elseif (($why = ParticipantsTsv::formatProblem($tsv)) !== null) {
         $f->fix('participants.tsv', 'participants.tsv', $why);
     } elseif (($parsed = readTsv($tsv, 'participants.tsv', $f, true)) !== null) {
         $columns = $parsed['columns'];
@@ -585,7 +517,7 @@ function checkStructure(
             $f->check('sessions.tsv', $label, "both sessions.tsv and sub-{$subject}_sessions.tsv are present - only sessions.tsv is read",
                 'keep one of them');
         }
-        if (is_file($sessTsv) && ($why = spreadsheetFormatProblem($sessTsv)) !== null) {
+        if (is_file($sessTsv) && ($why = ParticipantsTsv::formatProblem($sessTsv)) !== null) {
             $f->check('sessions.tsv', $sessRel, $why);
         } elseif (is_file($sessTsv) && ($err = SessionsTsv::read($dicomDir, $subject)['error']) !== null) {
             $f->check('permissions', $sessRel, 'cannot be read: ' . $err, 'make it readable by the pipeline user');
@@ -1092,7 +1024,7 @@ $verbose    = isset($options['v']) || isset($options['verbose']);
 $configPath = $options['config'] ?? DEFAULT_CONFIG;
 
 try {
-    $config = readJson($configPath);
+    $config = PipelineSetup::readJson($configPath);
 } catch (RuntimeException $e) {
     fwrite(STDERR, 'ERROR ' . $e->getMessage() . "\n");
     exit(EXIT_USAGE);
@@ -1132,7 +1064,7 @@ foreach ($targets as $target) {
     fwrite(STDERR, "=== {$label} ===\n");
 
     try {
-        $projectConfig = readJson($projectPath . '/project.json');
+        $projectConfig = PipelineSetup::readJson($projectPath . '/project.json');
 
         if (!is_dir($dicomDir)) {
             $f->fix('structure', 'deidentified-raw/imaging/dicoms/', 'upload folder does not exist',
@@ -1208,7 +1140,7 @@ function validateUpload(
     $tsvIds         = [];   // normalised participant ID (no sub-) => participant_id
     $tsv            = "{$dicomDir}/participants.tsv";
     $tsvUsable      = false;
-    if (is_file($tsv) && spreadsheetFormatProblem($tsv) === null) {
+    if (is_file($tsv) && ParticipantsTsv::formatProblem($tsv) === null) {
         try {
             $parsed = ParticipantsTsv::readRows($tsv);
         } catch (Throwable) {
@@ -1242,7 +1174,7 @@ function validateUpload(
         }
     }
 
-    $wait = DicomStudyOrganizer::uploadInProgress($dicomDir, (int) ($config['imaging']['delivery_quiet_minutes'] ?? 5));
+    $wait = \LORIS\Pipelines\Shared\ImagingProject::uploadInProgress($dicomDir, (int) ($config['imaging']['delivery_quiet_minutes'] ?? 5));
     if ($wait !== null) {
         $f->check('upload', 'dicoms/', $wait . ' - this check may be incomplete', 'run it again once the upload has finished');
     }
@@ -1277,7 +1209,7 @@ function validateUpload(
         $organizer->setForce(true);
         $organizer->setIgnoreParticipants($ignoreParticipants);
         $organizer->organize($dicomDir);
-        return is_file($manifestPath) ? (readJson($manifestPath)['studies'] ?? []) : [];
+        return is_file($manifestPath) ? (PipelineSetup::readJson($manifestPath)['studies'] ?? []) : [];
     };
 
     try {

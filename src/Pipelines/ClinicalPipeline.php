@@ -8,6 +8,8 @@ use LORIS\Utils\{Notification, CleanLogFormatter, MountHealthCheck, DateNormaliz
 use Monolog\Logger;
 use Monolog\Handler\StreamHandler;
 use Psr\Log\LoggerInterface;
+use LORIS\Pipelines\Shared\ProjectLock;
+
 
 /**
  * Clinical Data Ingestion Pipeline
@@ -561,19 +563,16 @@ class ClinicalPipeline
             return;
         }
 
-        // One ingestion per project at a time (same pattern as the DICOM
-        // import's .dicom_import.lock). Two concurrent runs would upload the
-        // same rows at once and LORIS would create every candidate/session
-        // twice (BHFD, 2026-11-16). The OS releases the lock when the
-        // project is done or the process ends, even on a crash.
+        // One ingestion per project at a time (Shared\ProjectLock, as every
+        // pipeline). Two concurrent runs would upload the same rows at once and
+        // LORIS would create every candidate/session twice (BHFD, 2026-11-16).
+        // The OS releases the lock when the project is done or the process
+        // ends, even on a crash.
         $lock = null;
         if (!$this->dryRun) {
-            $lock = @fopen(rtrim($mountPath, '/') . '/.clinical_import.lock', 'c');
-            if ($lock === false || !flock($lock, LOCK_EX | LOCK_NB)) {
-                $this->logger->error(
-                    "Project {$name}: another clinical/preclinical ingestion is "
-                    . "already running for this project - skipped, nothing ingested."
-                );
+            [$lock, $busy] = ProjectLock::acquire($mountPath, 'clinical', 'run_clinical_pipeline.php');
+            if ($lock === null) {
+                $this->logger->error("Project {$name}: {$busy}");
                 $this->stats['data_failed']++;
                 return;
             }
@@ -582,10 +581,7 @@ class ClinicalPipeline
         try {
             $this->processProjectLocked($project, $name, $mountPath);
         } finally {
-            if ($lock !== null) {
-                flock($lock, LOCK_UN);
-                fclose($lock);
-            }
+            $lock?->release();
         }
     }
 

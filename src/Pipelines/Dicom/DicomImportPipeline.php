@@ -235,18 +235,9 @@ class DicomImportPipeline
         }
         $this->_log("========================================");
 
-        // One import per project at a time: two concurrent runs would both see
-        // a study as new and race to insert it.
-        $lock = null;
-        if (!$this->dryRun) {
-            $lock = @fopen(rtrim($projectDir, '/') . '/.dicom_import.lock', 'c');
-            if ($lock === false || !flock($lock, LOCK_EX | LOCK_NB)) {
-                $this->abortReason = 'another DICOM import is already running for this project';
-                $this->_writeError('LOCK', ucfirst($this->abortReason) . ' - skipped, nothing ingested.');
-                $this->_closeAllLogs();
-                return $this->_finalStats();
-            }
-        }
+        // One import per project at a time: the caller (run_dicom_import.php)
+        // holds the project's DICOM lock (Shared\ProjectLock) while this runs,
+        // so two runs cannot both see a study as new and race to insert it.
 
         try {
             if (!$this->dryRun) {

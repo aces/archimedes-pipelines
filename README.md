@@ -607,6 +607,52 @@ php scripts/dicom/run_dicom_bundle.php  --collection=archimedes --project=FDG-PE
 
 ---
 
+## PNG Ingestion Workflow
+
+> **Full guide — every script, option, rule and message: [docs/png.md](docs/png.md).**
+> This section is a summary.
+
+Takes a site's PNG images (echocardiogram stills, ECG traces, ...), checks them against the
+PNG user guide, matches each visit to a LORIS participant and session, and inserts the images
+through the CBIGR script API (`/cbigr_api/script/importpngdataset`, C-BIG `import_png_dataset.py`).
+Same project selection as DICOM (`Imaging` in `project.json`); projects without
+`deidentified-raw/imaging/png/` are skipped.
+
+```
+deidentified-raw/imaging/png/  ──validate──►  report for the site (read-only)
+        │
+        ├─(bundle)──►  processed/imaging/png_visits.json   scan: visits, images, md5, problems
+        ├─sync──────►  LORIS candidates                     participants.tsv → candidatesPlus (ExtStudyID)
+        ├─reidentify►  deidentified-lorisid/imaging/png/    sessions + sub-<PSCID>/ses-<Visit>/ byte-identical copies
+        └─import────►  LORIS files (assembly_png/)          one async job per visit, polled
+```
+
+| Step | Script (`scripts/png/`) | Writes to LORIS |
+|---|---|---|
+| 0 | `scripts/test/validate_png.php` — validates the share against the user guide, project.json and LORIS (read-only), `.txt` + `.csv` | no (reads only) |
+| 1 | `run_png_participant_sync.php` — pre-flight, then creates missing candidates | candidates |
+| 2 | `run_png_reidentifier.php` — creates sessions, copies to `deidentified-lorisid/` | sessions |
+| 3 | `run_png_import.php` — inserts each visit (async job, polled; `--validate` = LORIS check only) | the images |
+| — | `run_png_bundle.php` — scans + checks the delivery, then runs 1→3; ingests only if 1–2 succeeded | — |
+
+```bash
+php scripts/test/validate_png.php --collection=archimedes --project=ARCHI-TEST --save
+php scripts/png/run_png_bundle.php   --collection=archimedes --project=ARCHI-TEST             # dry run
+php scripts/png/run_png_bundle.php   --collection=archimedes --project=ARCHI-TEST --confirm
+```
+
+**Key rules** (as DICOM, with the visit as the unit): dry run unless `--confirm`; incremental
+(visit fingerprint = image names + md5 + acq_date); images whose type is not in `png.scan_types`,
+or that are not real PNGs, are **set aside** and reported, the rest of the visit goes in; every
+data issue is reported before anything is created (`--continue-good` when unattended); nothing
+is ever deleted from LORIS — replaced or removed images are reported with their FileID.
+
+**On the LORIS server**: the CBIGR `importpngdataset` endpoint + SQL patch, `mri_scan_type`
+rows for the agreed types, and `api_script_execution` for the API user
+([docs/png.md §8](docs/png.md#8-on-the-loris-server-cbigr--loris-mri)).
+
+---
+
 ## Participant Metadata Workflow
 
 The participant metadata pipeline updates candidate demographic fields in ARCHIMEDES (Date of Death today; extensible to Sex, DoB, and other fields) from BIDS, clinical, and custom-configured source files. Each source's MD5 is tracked so unchanged files are skipped on subsequent runs.
