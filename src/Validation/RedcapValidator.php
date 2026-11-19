@@ -1030,12 +1030,16 @@ final class RedcapValidator
                     "The column '{$headers[$idx['study_id']]}' must be named exactly study_id (lowercase)."
                     . " The instrument manager looks only for study_id and rejects the whole file.",
                     "Rename the header to study_id.");
+            } elseif (isset($idx['record_id']) && !isset($idx['studyid']) && !isset($idx['pscid'])) {
+                // The pipeline renames REDCap's record_id column to study_id.
+                $idCol = $idx['record_id'];
+                $this->add(self::NOTE,
+                    "No study_id column: the pipeline renames the record_id column to study_id.",
+                    "");
             } else {
                 $this->add(self::ERROR,
-                    "No study_id column. The instrument manager rejects the whole file."
-                    . (isset($idx['record_id']) ? " The file has record_id instead." : ""),
-                    "Name the participant ID column study_id"
-                    . (isset($idx['record_id']) ? " (rename record_id to study_id)." : "."));
+                    "No study_id column. The instrument manager rejects the whole file.",
+                    "Name the participant ID column study_id.");
             }
         }
 
@@ -1118,6 +1122,13 @@ final class RedcapValidator
         $seenVisits    = [];
         $keys          = [];
 
+        // DoB and sex once per participant, as the pipeline does: a blank
+        // cell is filled from the same participant's other row before
+        // candidate_defaults (ClinicalPipeline::scanParticipantDemographics).
+        [$partValues, $partConflicts] = $this->participantDemographics(
+            $rows, $idCol, ['dob' => $candIdx['dob'][0], 'sex' => $candIdx['sex'][0]]
+        );
+
         foreach ($rows as [$line, $row]) {
             $cell = fn(?int $i): string => $i === null ? '' : trim((string)($row[$i] ?? ''));
 
@@ -1154,6 +1165,10 @@ final class RedcapValidator
             foreach ($candIdx as $key => [$col, $default]) {
                 $v = $cell($col);
                 $fromDefault = false;
+                if ($v === '' && $col !== null && $id !== '' && isset($partValues[$id][$key])) {
+                    $p["participant_{$key}"][] = "line {$line}";
+                    continue;   // the participant's own value is checked on its own row
+                }
                 if ($v === '') {
                     if ($default === '') {
                         if ($col !== null) {
@@ -1169,6 +1184,12 @@ final class RedcapValidator
                 }
                 if ($fromDefault) {
                     continue;   // defaults are checked once, in project settings
+                }
+                // project / site / cohort: a value in candidate_defaults is
+                // authoritative; the pipeline replaces a different value.
+                if (in_array($key, ['project', 'site', 'cohort'], true) && $default !== '' && $v !== $default) {
+                    $p["override_{$key}"][$v][] = $line;
+                    continue;
                 }
                 switch ($key) {
                     case 'dob':
@@ -1210,19 +1231,36 @@ final class RedcapValidator
             . " (repeating instruments included)",
             "Keep one row per participant per event.");
         foreach ($candIdx as $key => [$col, $default]) {
+            $this->addLines($p, "participant_{$key}", self::NOTE,
+                "row(s) have an empty {$key}; the pipeline takes it from the same participant's"
+                . " other row", "");
             $this->addLines($p, "blank_{$key}", self::ERROR,
-                "row(s) have an empty {$key}, and there is no candidate_defaults.{$key} in project.json"
-                . " (one such row rejects the whole file)",
-                "Fill in {$key} on every row, or ask the ARCHIMEDES team to set candidate_defaults.{$key}.");
+                "row(s) have an empty {$key}, it is not on any other row of that participant, and"
+                . " there is no candidate_defaults.{$key} in project.json (one such row rejects the whole file)",
+                "Fill in {$key} on at least one row of each participant, or ask the ARCHIMEDES team"
+                . " to set candidate_defaults.{$key}.");
             $this->addLines($p, "filled_{$key}", self::NOTE,
                 "row(s) have an empty {$key}; '{$default}' will be taken from project.json"
                 . " (candidate_defaults.{$key})", "");
         }
+        foreach ($partConflicts as $pid => $byKey) {
+            foreach ($byKey as $k => $values) {
+                $p['conflict'][] = "'{$pid}' {$k}: " . implode(' / ', array_map(fn($v) => "'{$v}'", $values));
+            }
+        }
+        $this->addLines($p, 'conflict', self::WARNING, "participant(s) have different DoB or sex values"
+            . " on different rows; blank cells and LORIS use the first",
+            "Correct the source so each participant has one DoB and one sex.");
         $this->addLines($p, 'bad_dob', self::ERROR, "row(s) have a date of birth that is not a real date",
             "Use YYYY-MM-DD, YYYY-MM or YYYY.");
         $this->addValues($p, 'bad_sex', self::ERROR, "sex value(s) cannot be read as Male, Female or Other"
             . " (one such row rejects the whole file)",
             "Use Male, Female or Other, or tell the ARCHIMEDES team what each code means (sex_mappings).");
+        foreach (['project', 'site', 'cohort'] as $k) {
+            $this->addValues($p, "override_{$k}", self::NOTE,
+                "{$k} value(s) differ from candidate_defaults.{$k} '" . $this->cdValue($k) . "'; the"
+                . " pipeline replaces them with it", "");
+        }
         $this->addValues($p, 'other_project', self::NOTE,
             "project value(s) differ from the LORIS project name '{$full}'; they will be replaced with it",
             "Check this file belongs to this project.");
@@ -1442,12 +1480,56 @@ final class RedcapValidator
      */
     private function mapSex(string $v): ?string
     {
-        $map = array_change_key_case(array_merge(
-            self::pipelineConst('SEX_VALUE_MAP'),
-            is_array($this->project['sex_mappings'] ?? null) ? $this->project['sex_mappings'] : []
-        ), CASE_LOWER);
+        // '+' keeps numeric codes ("1", "2") as keys; array_merge would renumber them.
+        $map = array_change_key_case(
+            (is_array($this->project['sex_mappings'] ?? null) ? $this->project['sex_mappings'] : [])
+            + self::pipelineConst('SEX_VALUE_MAP'),
+            CASE_LOWER
+        );
         $out = $map[strtolower(trim($v))] ?? trim($v);
         return in_array($out, self::SEX_VALUES, true) ? $out : null;
+    }
+
+    /**
+     * Each participant's first non-blank DoB / sex in the file, and any
+     * different later values. Mirrors
+     * ClinicalPipeline::scanParticipantDemographics().
+     *
+     * @param array<string,?int> $cols key => column index
+     * @return array{0: array<string,array<string,string>>, 1: array<string,array<string,array<string>>>}
+     */
+    private function participantDemographics(array $rows, ?int $idCol, array $cols): array
+    {
+        $values    = [];
+        $conflicts = [];
+        if ($idCol === null) {
+            return [$values, $conflicts];
+        }
+        foreach ($rows as [, $row]) {
+            $pid = trim((string)($row[$idCol] ?? ''));
+            if ($pid === '') {
+                continue;
+            }
+            foreach ($cols as $k => $ci) {
+                if ($ci === null) {
+                    continue;
+                }
+                $v = trim((string)($row[$ci] ?? ''));
+                if ($v === '') {
+                    continue;
+                }
+                if (!isset($values[$pid][$k])) {
+                    $values[$pid][$k] = $v;
+                } elseif ($values[$pid][$k] !== $v) {
+                    $seen = $conflicts[$pid][$k] ?? [$values[$pid][$k]];
+                    if (!in_array($v, $seen, true)) {
+                        $seen[] = $v;
+                    }
+                    $conflicts[$pid][$k] = $seen;
+                }
+            }
+        }
+        return [$values, $conflicts];
     }
 
     /**

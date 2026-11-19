@@ -360,6 +360,12 @@ class ClinicalPipeline
     ];
 
     /**
+     * candidate_defaults keys that REPLACE a different value in the file,
+     * not only fill a blank one. Lowercase, as matched against the column.
+     */
+    private const DEFAULT_OVERRIDES_COLUMNS = ['project', 'site', 'cohort'];
+
+    /**
      * Source sex encodings mapped to the three values LORIS accepts:
      * Male / Female / Other. Keys are lowercased; matching against the
      * file's cell value is case-insensitive.
@@ -3155,11 +3161,13 @@ class ClinicalPipeline
      * DoB matches any Dob::COLUMN_NAMES header; with $appendDob=false a
      * missing DoB column is not added (blank cells are still filled).
      *
-     * Config is a FALLBACK, not an override. For each key in
-     * CLINICAL_DEFAULT_COLUMNS present in candidate_defaults:
+     * For each key in CLINICAL_DEFAULT_COLUMNS present in candidate_defaults:
      *   - column absent from the header -> appended, stamped on every row
      *   - column present, cell blank    -> filled from config
-     *   - column present, cell populated-> left alone (the file wins)
+     *   - column present, cell populated:
+     *       project / site / cohort -> REPLACED by config when different
+     *                                  (config is authoritative; noted)
+     *       dob / sex               -> left alone (the file wins)
      * A key absent from candidate_defaults never stamps.
      *
      * ALSO normalises the sex column, when the file has one, into the
@@ -3185,6 +3193,13 @@ class ClinicalPipeline
      * reject every row. Blank cells are still filled from
      * candidate_defaults.project as before. No project_full_name in
      * project.json, or no project column in the file -> no check.
+     *
+     * ALSO renames a REDCap file's record_id column to study_id (header
+     * only) when the file has no study_id / StudyID / PSCID column.
+     *
+     * ALSO fills a blank DoB / sex cell from the same participant's other
+     * row in the file (REDCap exports put demographics on one event only),
+     * before candidate_defaults - see scanParticipantDemographics().
      *
      * A file that needs nothing gets no processed copy: the original path
      * is returned and ingestion reads it directly. In practice only the
@@ -3222,9 +3237,11 @@ class ClinicalPipeline
         // whether a processed copy is needed at all. The decision is
         // made below, once both $apply and $sexIdx are known.
 
-        // Per-project overrides merged over the baseline vocabulary.
+        // Per-project overrides merged over the baseline vocabulary. '+'
+        // (not array_merge) so numeric codes keep their keys: array_merge
+        // renumbers {"1":"Male","2":"Female"} to 0,1, mapping 1 to Female.
         $sexMap = array_change_key_case(
-            array_merge(self::SEX_VALUE_MAP, $project['sex_mappings'] ?? []),
+            ($project['sex_mappings'] ?? []) + self::SEX_VALUE_MAP,
             CASE_LOWER
         );
 
@@ -3255,6 +3272,22 @@ class ClinicalPipeline
             fclose($in);
             $this->log("    candidate_defaults: no header row in {$basename}");
             return null;
+        }
+
+        // REDCap's default record ID column is record_id; the instrument
+        // endpoint requires study_id for a REDCap upload. Rename the header
+        // only (values untouched), only in a REDCap file, and only when the
+        // file has no participant ID column of its own.
+        $recordIdRenamed = false;
+        if ($isRedcap) {
+            $lower = array_map(fn($h) => strtolower(trim((string)$h)), $headers);
+            if (array_intersect(['study_id', 'studyid', 'pscid'], $lower) === []) {
+                $ri = array_search('record_id', $lower, true);
+                if ($ri !== false) {
+                    $headers[$ri]    = 'study_id';
+                    $recordIdRenamed = true;
+                }
+            }
         }
 
         // Match case-insensitively: an existing column keeps the file's
@@ -3291,6 +3324,17 @@ class ClinicalPipeline
             }
         }
 
+        // DoB and sex once per participant. A REDCap longitudinal export
+        // fills demographics on one event only (e.g. hospital admission),
+        // leaving them blank on that participant's other events. LORIS
+        // only needs them to create the participant, but the pre-upload
+        // check requires a DoB on every row, so a blank cell is filled from
+        // the same participant's other row. Runs before candidate_defaults:
+        // the participant's own value wins over the project default.
+        $participant = $this->scanParticipantDemographics(
+            $srcPath, $delimiter, array_slice($headers, 0, $origCount), $sexIdx
+        );
+
         // Locate the visit column, only when there is a mapping to apply.
         $visitIdx = null;
         if ($visitMap !== []) {
@@ -3316,7 +3360,9 @@ class ClinicalPipeline
         // Nothing to stamp, no sex column to normalise, no visit to map
         // and no project name to check - the copy would be
         // byte-identical, so skip it entirely.
-        if ($apply === [] && $sexIdx === null && $visitIdx === null && $projectIdx === null) {
+        if ($apply === [] && $sexIdx === null && $visitIdx === null && $projectIdx === null
+            && $participant['fillable'] === 0 && !$recordIdRenamed
+        ) {
             fclose($in);
             return $srcPath;
         }
@@ -3344,9 +3390,26 @@ class ClinicalPipeline
         $visitMapped    = [];   // "from => to" => occurrences
         $visitUnmapped  = [];   // raw value => occurrences
         $projectFixed   = [];   // wrong project value => occurrences
+        $fromParticipant = ['dob' => 0, 'sex' => 0];
+        $overridden      = [];   // column => [file value => occurrences]
         while (($row = fgetcsv($in, 0, $delimiter)) !== false) {
             $rows++;
             $row = array_pad($row, $origCount, '');
+
+            // Blank DoB / sex -> the same participant's value from another
+            // row of this file (see scanParticipantDemographics).
+            if ($participant['idIdx'] !== null) {
+                $pid = trim((string)$row[$participant['idIdx']]);
+                foreach (['dob', 'sex'] as $k) {
+                    $ci = $participant['cols'][$k];
+                    if ($pid !== '' && $ci !== null && trim((string)$row[$ci]) === ''
+                        && isset($participant['values'][$pid][$k])
+                    ) {
+                        $row[$ci] = $participant['values'][$pid][$k];
+                        $fromParticipant[$k]++;
+                    }
+                }
+            }
 
             // Wrong project name -> project_full_name. Runs BEFORE the
             // blank-fill below, so a blank cell is still filled from
@@ -3360,9 +3423,17 @@ class ClinicalPipeline
             }
 
             foreach ($fillIndex as $column => $idx) {
-                if (trim((string)$row[$idx]) === '') {
+                $raw = trim((string)$row[$idx]);
+                if ($raw === '') {
                     $row[$idx] = $apply[$column];
                     $filled[$column]++;
+                } elseif (in_array(strtolower($column), self::DEFAULT_OVERRIDES_COLUMNS, true)
+                    && $raw !== $apply[$column]
+                ) {
+                    // project / site / cohort: a value in candidate_defaults
+                    // is authoritative, so a different value is replaced.
+                    $row[$idx] = $apply[$column];
+                    $overridden[$column][$raw] = ($overridden[$column][$raw] ?? 0) + 1;
                 }
             }
 
@@ -3411,6 +3482,26 @@ class ClinicalPipeline
         fclose($in);
         fclose($out);
 
+        // record_id -> study_id: noted so the source export can be corrected.
+        if ($recordIdRenamed) {
+            $note = "Column 'record_id' renamed to 'study_id' in the processed copy (the upload "
+                . "requires study_id). The source file is unchanged; export with study_id to avoid this note.";
+            $this->log("    NOTE: {$note}");
+            $this->dataNotes[$basename][] = $note;
+        }
+
+        // project / site / cohort values that differed from candidate_defaults:
+        // replaced in the processed copy, and noted so the source can be corrected.
+        foreach ($overridden as $column => $values) {
+            foreach ($values as $value => $n) {
+                $note = ucfirst(strtolower($column)) . " '{$value}' differs from project.json "
+                    . "candidate_defaults." . strtolower($column) . " '{$apply[$column]}' - replaced "
+                    . "in {$n}/{$rows} row(s). The source file is unchanged.";
+                $this->log("    NOTE: {$note}");
+                $this->dataNotes[$basename][] = $note;
+            }
+        }
+
         // Project names that did not match project_full_name: replaced in
         // the processed copy, and noted so the source can be corrected.
         foreach ($projectFixed as $value => $n) {
@@ -3419,6 +3510,19 @@ class ClinicalPipeline
                 . "row(s). The source file is unchanged; correct it to avoid this note.";
             $this->log("    NOTE: {$note}");
             $this->dataNotes[$basename][] = $note;
+        }
+
+        // A participant with two different DoBs (or sexes) in the file:
+        // blank cells were filled with the first one, which is also the one
+        // LORIS uses when it creates the participant. Noted for the source.
+        foreach ($participant['conflicts'] as $pid => $byKey) {
+            foreach ($byKey as $k => $values) {
+                $note = "Participant '{$pid}' has different {$k} values in {$basename} ("
+                    . implode(', ', array_map(fn($v) => "'{$v}'", $values)) . "). Blank {$k} "
+                    . "cells were filled with the first; correct the source.";
+                $this->log("    WARNING: {$note}");
+                $this->dataNotes[$basename][] = $note;
+            }
         }
 
         // Unrecognised sex values are reported whether or not a copy is
@@ -3443,7 +3547,8 @@ class ClinicalPipeline
         // ingest the original. Only files that actually needed a change
         // reach processed/clinical/.
         if ($appended === [] && array_sum($filled) === 0 && $sexNormalized === 0
-            && $visitMapped === [] && $projectFixed === []
+            && $visitMapped === [] && $projectFixed === [] && array_sum($fromParticipant) === 0
+            && $overridden === [] && !$recordIdRenamed
         ) {
             @unlink($outPath);
             $this->log("    candidate_defaults: {$basename} already carries every target column - using file as-is");
@@ -3451,6 +3556,14 @@ class ClinicalPipeline
         }
 
         $parts = [];
+        if ($recordIdRenamed) {
+            $parts[] = "record_id column renamed to study_id";
+        }
+        foreach ($fromParticipant as $k => $n) {
+            if ($n > 0) {
+                $parts[] = "{$k} taken from the same participant's other row ({$n}/{$rows} blank cell(s) filled)";
+            }
+        }
         foreach ($appended as $column) {
             $parts[] = "{$column}={$apply[$column]} (column added)";
         }
@@ -3458,6 +3571,9 @@ class ClinicalPipeline
             if ($n > 0) {
                 $parts[] = "{$column}={$apply[$column]} ({$n}/{$rows} blank cell(s) filled)";
             }
+        }
+        foreach ($overridden as $column => $values) {
+            $parts[] = "{$column}={$apply[$column]} (" . array_sum($values) . "/{$rows} different value(s) replaced)";
         }
         if ($sexNormalized > 0) {
             $parts[] = "sex normalised to Male/Female/Other ({$sexNormalized}/{$rows} value(s) rewritten)";
@@ -3475,6 +3591,94 @@ class ClinicalPipeline
         }
 
         return $outPath;
+    }
+
+    /**
+     * Each participant's DoB and sex, as found on any row of the file.
+     *
+     * A REDCap longitudinal export puts demographics on one event only, so
+     * the other rows of the same participant have them blank. LORIS only
+     * reads DoB/sex when it creates the participant (from its first row)
+     * and matches the other rows by ID, so the value can be repeated on
+     * every row of that participant without changing what LORIS stores.
+     *
+     * The participant is identified like the instrument endpoint does:
+     * PSCID, else StudyID, else study_id (header matched case-insensitively).
+     * The first non-blank value per participant is kept; a different later
+     * value is reported as a conflict, not used.
+     *
+     * @param array<int,string> $headers the file's own header row
+     * @return array{idIdx:?int, cols:array{dob:?int,sex:?int},
+     *               values:array<string,array<string,string>>,
+     *               conflicts:array<string,array<string,array<string>>>,
+     *               fillable:int}
+     */
+    private function scanParticipantDemographics(
+        string $srcPath,
+        string $delimiter,
+        array $headers,
+        ?int $sexIdx
+    ): array {
+        $lower  = array_map(fn($h) => strtolower(trim((string)$h)), $headers);
+        $result = [
+            'idIdx'     => null,
+            'cols'      => ['dob' => Dob::columnIndex($headers), 'sex' => $sexIdx],
+            'values'    => [],
+            'conflicts' => [],
+            'fillable'  => 0,
+        ];
+        foreach (['pscid', 'studyid', 'study_id'] as $c) {
+            $i = array_search($c, $lower, true);
+            if ($i !== false) {
+                $result['idIdx'] = $i;
+                break;
+            }
+        }
+        if ($result['idIdx'] === null
+            || ($result['cols']['dob'] === null && $result['cols']['sex'] === null)
+        ) {
+            return $result;
+        }
+
+        $fh = @fopen($srcPath, 'r');
+        if ($fh === false) {
+            return $result;
+        }
+        fgetcsv($fh, 0, $delimiter);
+        $blanks = [];   // participant => number of blank dob/sex cells
+        while (($row = fgetcsv($fh, 0, $delimiter)) !== false) {
+            $pid = trim((string)($row[$result['idIdx']] ?? ''));
+            if ($pid === '') {
+                continue;
+            }
+            foreach ($result['cols'] as $k => $ci) {
+                if ($ci === null) {
+                    continue;
+                }
+                $v = trim((string)($row[$ci] ?? ''));
+                if ($v === '') {
+                    $blanks[$pid][$k] = ($blanks[$pid][$k] ?? 0) + 1;
+                } elseif (!isset($result['values'][$pid][$k])) {
+                    $result['values'][$pid][$k] = $v;
+                } elseif ($result['values'][$pid][$k] !== $v) {
+                    $seen = $result['conflicts'][$pid][$k] ?? [$result['values'][$pid][$k]];
+                    if (!in_array($v, $seen, true)) {
+                        $seen[] = $v;
+                    }
+                    $result['conflicts'][$pid][$k] = $seen;
+                }
+            }
+        }
+        fclose($fh);
+
+        foreach ($blanks as $pid => $byKey) {
+            foreach ($byKey as $k => $n) {
+                if (isset($result['values'][$pid][$k])) {
+                    $result['fillable'] += $n;
+                }
+            }
+        }
+        return $result;
     }
 
 
@@ -4279,9 +4483,9 @@ class ClinicalPipeline
 
         if ($blankDob !== []) {
             $problems[] = sprintf(
-                "%d row(s) have an empty date of birth (none in the file or "
-                . "candidate_defaults.dob): %s%s. DoB is required to create a "
-                . "candidate - populate it at source.",
+                "%d row(s) have an empty date of birth (not on any row of that "
+                . "participant, nor in candidate_defaults.dob): %s%s. DoB is required "
+                . "to create a candidate - populate it at source.",
                 count($blankDob),
                 implode(', ', array_slice($blankDob, 0, 10)),
                 count($blankDob) > 10 ? ' ... and ' . (count($blankDob) - 10) . ' more' : ''
