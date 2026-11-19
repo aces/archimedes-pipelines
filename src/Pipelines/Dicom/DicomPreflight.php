@@ -42,6 +42,7 @@ namespace LORIS\Pipelines\Dicom;
 
 use LORIS\Pipelines\Shared\ParticipantsCheck;
 use LORIS\Pipelines\Shared\ParticipantsTsv;
+use LORIS\Pipelines\Shared\SessionsTsv;
 
 final class DicomPreflight
 {
@@ -93,8 +94,26 @@ final class DicomPreflight
         $linked = array_values(array_filter($studies, static fn ($s) => ($s['link_status'] ?? '') === 'linked'));
         $counts = ['linked' => count($linked), 'unlinked' => 0];
 
+        // --- visits: folder = sessions file session_id = project.json "visits"
+        // exactly. A mismatch is flagged; its studies are held back (organize
+        // leaves them unlinked, the reidentifier holds the rest) and the rest
+        // of the delivery goes in.
+        $deliveryTsv = ParticipantsTsv::locate($projectPath, 'dicom');
+        if ($deliveryTsv !== null) {
+            foreach (SessionsTsv::visitMismatches(dirname($deliveryTsv), $projectConfig) as $m) {
+                $warnings[] = $m;
+            }
+        }
+
         foreach ($studies as $s) {
             $status = $s['link_status'] ?? '';
+            if ($status === 'unlinked'
+                && in_array($s['link_reason'] ?? null, ['no_sessions_tsv', 'not_in_sessions_tsv'], true)
+                && $deliveryTsv !== null
+            ) {
+                $counts['unlinked']++;
+                continue;   // a VISIT MISMATCH above
+            }
             if ($status === 'unlinked') {
                 $counts['unlinked']++;
                 $warnings[] = sprintf(
@@ -126,7 +145,10 @@ final class DicomPreflight
                     array_column($studies, 'subject'),
                     'imaging'
                 );
-                $warnings = array_merge($warnings, $result['warnings']);
+                $warnings = array_merge($warnings, array_filter(
+                    $result['warnings'],
+                    static fn (string $w): bool => !str_contains($w, 'VISIT MISMATCH')   // flagged above
+                ));
 
                 foreach ($result['issues'] as $issue) {
                     if ($issue['scope'] !== 'session') {

@@ -57,6 +57,12 @@ class LorisApiClientAdapter implements LorisApiClientInterface
     /** @var string[] project.json "visits": the visits the project declares as configured. */
     private array $declaredVisits = [];
 
+    /** @var array<string, ?string> CandID => its LORIS project (null: could not be read). */
+    private array $candidateProjects = [];
+
+    /** @var array project.json visits (+ visit_mappings, for rename hints only). */
+    private array $visitConfig = [];
+
     /** Exact LORIS Project.Name, e.g. "FDG PET". */
     private ?string $projectName = null;
 
@@ -146,10 +152,11 @@ class LorisApiClientAdapter implements LorisApiClientInterface
         if (!empty($defaults['cohort'])) {
             $this->defaultCohort = (string) $defaults['cohort'];
         }
-        $this->declaredVisits = array_values(array_filter(array_map(
-            static fn ($v): string => trim((string) $v),
-            (array) ($projectConfig['visits'] ?? [])
-        )));
+        $this->declaredVisits = \LORIS\Utils\VisitLabel::declared($projectConfig);
+        $this->visitConfig    = array_intersect_key(
+            $projectConfig,
+            array_flip([\LORIS\Utils\VisitLabel::VISITS_KEY, \LORIS\Utils\VisitLabel::MAPPINGS_KEY])
+        );
 
         // ProjectExternalName defaults to the LORIS project name, since in
         // practice they usually match, but is separately overridable.
@@ -313,9 +320,54 @@ class LorisApiClientAdapter implements LorisApiClientInterface
             $candId = '';
         }
 
+        // The mapper matches an ExtStudyID in EVERY project. A second study
+        // using the same participant IDs must not be filed under the first
+        // study's candidate: stop here (PROJECT_CONFLICT), link nothing.
+        $this->_assertSameProject($candId, $pscid, $externalId);
+
         $this->resolved[$externalId] = ['pscid' => $pscid, 'cand_id' => $candId];
 
         return $this->resolved[$externalId];
+    }
+
+    /**
+     * Throw PROJECT_CONFLICT when the candidate belongs to another LORIS
+     * project than this project's (candidate_defaults.project). Nothing to
+     * compare (no CandID, no project configured, candidate unreadable): no
+     * conflict is assumed - the other checks still apply.
+     */
+    public function assertSameProject(string $candId, string $pscid, string $externalId): void
+    {
+        $this->_assertSameProject($candId, $pscid, $externalId);
+    }
+
+    private function _assertSameProject(string $candId, string $pscid, string $externalId): void
+    {
+        if ($candId === '' || $this->projectName === null || $this->projectName === '') {
+            return;
+        }
+        if (!array_key_exists($candId, $this->candidateProjects)) {
+            $response = $this->_raw(
+                'GET',
+                $this->baseUrl . '/api/' . $this->version . '/candidates/' . rawurlencode($candId)
+            );
+            $project = $response['body']['Meta']['Project'] ?? null;
+            $this->candidateProjects[$candId] = ($response['status'] === 200 && is_string($project) && $project !== '')
+                ? $project : null;
+        }
+        $project = $this->candidateProjects[$candId];
+        if ($project !== null && strcasecmp(trim($project), trim($this->projectName)) !== 0) {
+            throw new RuntimeException(sprintf(
+                "'%s' is already a participant of another LORIS project: candidate %s (CandID %s) of project '%s', "
+                . "not '%s' - nothing linked or created. Two studies use the same participant IDs: give this "
+                . 'project its own IDs (e.g. a prefix), or an external_id column with unique values',
+                $externalId,
+                $pscid,
+                $candId,
+                $project,
+                $this->projectName
+            ), self::PROJECT_CONFLICT);
+        }
     }
 
     // =========================================================================
@@ -338,10 +390,13 @@ class LorisApiClientAdapter implements LorisApiClientInterface
         string $pscid,
         string $externalId,
         ?string $dob,
-        ?string $sex
+        ?string $sex,
+        ?string $site = null
     ): array {
-        $dobValue = $this->_normaliseDate($dob ?? '');
-        $sexValue = $this->_normaliseSex($sex) ?? '';
+        $dobValue  = $this->_normaliseDate($dob ?? '');
+        $sexValue  = $this->_normaliseSex($sex) ?? '';
+        // participants.tsv site when given (as clinical and BIDS), else candidate_defaults.site.
+        $siteValue = ($site !== null && trim($site) !== '') ? trim($site) : ($this->site ?? '');
 
         // DoB is required to create a candidate (LORIS\Utils\Dob). Fail
         // before any request; callers already turn this into a rejected
@@ -373,7 +428,7 @@ class LorisApiClientAdapter implements LorisApiClientInterface
             $body = ['Candidate' => [
                 'PSCID'               => $pscid,
                 'Project'             => $this->projectName ?? '',
-                'Site'                => $this->site ?? '',
+                'Site'                => $siteValue,
                 'DoB'                 => $dobValue,
                 'Sex'                 => $sexValue,
                 'ExtStudyID'          => $externalId,
@@ -466,7 +521,7 @@ class LorisApiClientAdapter implements LorisApiClientInterface
             ));
         }
 
-        $candId = $this->_createCandidateLegacy($pscid, $sexValue, $dobValue);
+        $candId = $this->_createCandidateLegacy($pscid, $sexValue, $dobValue, $siteValue, $externalId);
 
         $this->_appendExternalId($candId, $externalId, $this->projectExternalId);
 
@@ -482,7 +537,9 @@ class LorisApiClientAdapter implements LorisApiClientInterface
     private function _createCandidateLegacy(
         string $pscid,
         string $sex,
-        string $dob
+        string $dob,
+        string $site,
+        string $externalId
     ): string {
         if ($this->projectName === null) {
             throw new RuntimeException(
@@ -493,7 +550,7 @@ class LorisApiClientAdapter implements LorisApiClientInterface
         $body = ['Candidate' => [
             'PSCID'   => $pscid,
             'Project' => $this->projectName,
-            'Site'    => $this->site ?? '',
+            'Site'    => $site,
             'DoB'     => $dob,
             'Sex'     => $sex,
         ]];
@@ -509,6 +566,8 @@ class LorisApiClientAdapter implements LorisApiClientInterface
             $existing = $this->_lookupCandidateByPscid($pscid);
 
             if ($existing !== null) {
+                // Linked below: only when it is a candidate of this project.
+                $this->_assertSameProject($existing, $pscid, $externalId);
                 return $existing;
             }
         }
@@ -657,6 +716,22 @@ class LorisApiClientAdapter implements LorisApiClientInterface
     public function getConfiguredVisitLabels(): array
     {
         return $this->declaredVisits;
+    }
+
+    /** Why a ses- folder name is held back (LORIS\Utils\VisitLabel::problem), or null. */
+    public function visitProblem(string $visit): ?string
+    {
+        return \LORIS\Utils\VisitLabel::problem($visit, $this->visitConfig);
+    }
+
+    /**
+     * LORIS visit for a ses- folder name: the name itself, when it is exactly
+     * a project.json "visits" entry or none are declared (LORIS\Utils\VisitLabel).
+     */
+
+    public function resolveVisitLabel(string $visit): ?string
+    {
+        return \LORIS\Utils\VisitLabel::resolve($visit, $this->visitConfig);
     }
 
     // -------------------------------------------------------------------------
@@ -937,33 +1012,14 @@ class LorisApiClientAdapter implements LorisApiClientInterface
 
     /**
      * Source sex value -> Male | Female | Other, or null when it cannot be
-     * mapped. Same baseline as before, plus project.json sex_mappings
-     * (e.g. {"1": "Male", "2": "Female"}) merged over it, case-insensitive.
-     * Shared with the pre-flight check so both judge a value the same way.
+     * mapped: LORIS\Utils\Sex, the rule clinical uses (m/male, f/female,
+     * o/other, any case) plus project.json sex_mappings merged over it.
+     * A value it cannot map is reported, never guessed.
      */
     public static function normaliseSexValue(?string $sex, array $mappings = []): ?string
     {
-        if ($sex === null || trim($sex) === '') {
-            return null;
-        }
-
-        $key = strtolower(trim($sex));
-
-        foreach ($mappings as $from => $to) {
-            if (strtolower(trim((string) $from)) === $key
-                && in_array((string) $to, ['Male', 'Female', 'Other'], true)
-            ) {
-                return (string) $to;
-            }
-        }
-
-        return match ($key) {
-            'm', 'male'                                                 => 'Male',
-            'f', 'female'                                               => 'Female',
-            'o', 'other', 'nb', 'non-binary', 'nonbinary',
-            'unknown', 'u', 'n/a'                                       => 'Other',
-            default                                                     => null,
-        };
+        // LORIS\Utils\Sex: the imaging rule, the same as clinical's.
+        return \LORIS\Utils\Sex::normalize($sex, $mappings);
     }
 
     private function _info(string $message): void

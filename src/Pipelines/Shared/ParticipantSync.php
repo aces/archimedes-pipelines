@@ -268,7 +268,9 @@ final class ParticipantSync
             }
 
             try {
-                $candidate = $api->createCandidate($subject, $externalId, $row['dob'] ?? null, $row['sex'] ?? null);
+                $candidate = $api->createCandidate(
+                    $subject, $externalId, $row['dob'] ?? null, $row['sex'] ?? null, $row['site'] ?? null
+                );
                 $n['created']++;
                 $out(sprintf("    %-16s created %s (%s)", $externalId, $candidate['pscid'], $candidate['cand_id']));
             } catch (\Throwable $e) {

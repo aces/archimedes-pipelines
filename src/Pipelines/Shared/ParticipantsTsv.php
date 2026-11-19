@@ -27,6 +27,7 @@ declare(strict_types=1);
 namespace LORIS\Pipelines\Shared;
 
 use LORIS\Utils\Dob;
+use LORIS\Utils\Sex;
 use RuntimeException;
 
 class ParticipantsTsv
@@ -53,6 +54,25 @@ class ParticipantsTsv
         'sex'     => 'sex',
     ];
 
+    /**
+     * Column => the header names it may arrive as, lowercased, in priority
+     * order (Dob / Sex hold the clinical lists). Matched case-insensitively,
+     * so DoB, DOB, Date_Of_Birth, Sex, Gender, Site, Cohort, Project,
+     * ExtStudyID ... all work, for every modality.
+     */
+    public const COLUMN_ALIASES = [
+        'participant_id' => ['participant_id'],
+        'external_id'    => ['external_id', 'externalid', 'extstudyid', 'ext_study_id', 'study_id', 'studyid'],
+        'dob'            => Dob::COLUMN_NAMES,
+        'sex'            => Sex::COLUMN_NAMES,
+        'site'           => ['site'],
+        'cohort'         => ['cohort', 'group'],
+        'project'        => ['project'],
+    ];
+
+    /** @var string[] Notes on values changed while normalising (as clinical). */
+    private array $notes = [];
+
     /** @var array<string, array<string, string>> participant_id => row */
     private array $rows = [];
 
@@ -71,6 +91,9 @@ class ParticipantsTsv
 
     /** @var string Path the data was read from. */
     private string $path;
+
+    /** @var array<string, array> Rows as in the file, before normalising. */
+    private array $delivered = [];
 
     private function __construct(string $path)
     {
@@ -96,6 +119,7 @@ class ParticipantsTsv
         $instance = new self($path);
         $instance->_read($path);
         $instance->_recordFileState($candidateDefaults);
+        $instance->delivered = $instance->rows;
         $instance->_enrich($candidateDefaults, $projectConfig);
 
         return $instance;
@@ -157,6 +181,35 @@ class ParticipantsTsv
     }
 
     /**
+     * Header names with the known columns renamed to their canonical name
+     * (COLUMN_ALIASES): the first alias present, case-insensitively, becomes
+     * e.g. 'dob' or 'sex'. A canonical name already in the file is kept as is;
+     * any other column keeps its own name.
+     *
+     * @param string[] $headers
+     *
+     * @return string[]
+     */
+    public static function canonicalColumns(array $headers): array
+    {
+        $lower = array_map(static fn ($h) => strtolower(trim((string) $h)), $headers);
+        foreach (self::COLUMN_ALIASES as $canonical => $aliases) {
+            if (in_array($canonical, $headers, true)) {
+                continue;
+            }
+            foreach ($aliases as $alias) {
+                $i = array_search($alias, $lower, true);
+                if ($i !== false) {
+                    $headers[$i] = $canonical;
+                    $lower[$i]   = $canonical;
+                    break;
+                }
+            }
+        }
+        return $headers;
+    }
+
+    /**
      * Parse a participants.tsv into rows, without judging them. Shared by every
      * modality (DICOM, BIDS, ...): tab-separated via fgetcsv (an empty first
      * cell stays empty - no column shift), values trimmed, short rows padded
@@ -182,10 +235,10 @@ class ParticipantsTsv
             return ['columns' => [], 'rows' => []];
         }
 
-        $columns = array_map(
+        $columns = self::canonicalColumns(array_map(
             static fn ($c) => trim((string) $c, " \t\n\r\0\x0B\xEF\xBB\xBF"),
             $header
-        );
+        ));
         $rows   = [];
         $lineNo = 1;
 
@@ -281,6 +334,51 @@ class ParticipantsTsv
                 if (!in_array($column, $this->columns, true)) {
                     $this->columns[] = $column;
                 }
+            }
+        }
+
+        // site / cohort / project: when project.json candidate_defaults sets
+        // one, it is the value used. A blank cell or a missing column takes
+        // it (above); the same value in another case or spacing takes its
+        // spelling; a different value is replaced by it and noted, so the
+        // source can be corrected. Header names are matched in any case
+        // (canonicalColumns: Site, COHORT, group, Project ...).
+        foreach (['site', 'cohort', 'project'] as $column) {
+            $configured = trim((string) ($candidateDefaults[$column] ?? ''));
+            if ($configured === '') {
+                continue;
+            }
+            $differs = [];
+            foreach ($this->rows as $id => $row) {
+                $v = trim((string) ($row[$column] ?? ''));
+                if ($v === $configured) {
+                    continue;
+                }
+                $this->rows[$id][$column] = $configured;
+                if ($v !== '' && strcasecmp(preg_replace('/\s+/', ' ', $v), $configured) !== 0) {
+                    $differs[$v][] = (string) $id;
+                }
+            }
+            foreach ($differs as $v => $ids) {
+                $this->notes[] = sprintf(
+                    "participants.tsv %s '%s' (%s) is not project.json candidate_defaults.%s '%s' - "
+                    . "'%s' is used; correct participants.tsv to avoid this note",
+                    $column,
+                    $v,
+                    implode(', ', array_slice($ids, 0, 5)) . (count($ids) > 5 ? ', ...' : ''),
+                    $column,
+                    $configured,
+                    $configured
+                );
+            }
+        }
+
+        // sex: shared policy (LORIS\Utils\Sex, as clinical) - mapped to
+        // Male/Female/Other; a value it cannot map is left for the check to report.
+        foreach ($this->rows as $id => $row) {
+            $mapped = Sex::normalize((string) ($row['sex'] ?? ''), $projectConfig['sex_mappings'] ?? []);
+            if ($mapped !== null) {
+                $this->rows[$id]['sex'] = $mapped;
             }
         }
 
@@ -445,5 +543,26 @@ class ParticipantsTsv
     public function path(): string
     {
         return $this->path;
+    }
+
+    /**
+     * Values changed while normalising that the site should correct (e.g. a
+     * project name that is not the configured one).
+     *
+     * @return string[]
+     */
+    public function notes(): array
+    {
+        return $this->notes;
+    }
+
+    /**
+     * A value as written in the file, before normalising (e.g. sex 'F'
+     * before 'Female'), for reports that show both. Null when not in the file.
+     */
+    public function delivered(string $participantId, string $column): ?string
+    {
+        $v = $this->delivered[$participantId][$column] ?? null;
+        return $v === null || $v === '' ? null : (string) $v;
     }
 }

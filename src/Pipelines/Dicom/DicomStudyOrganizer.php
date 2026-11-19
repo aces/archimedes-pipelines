@@ -32,6 +32,9 @@ class DicomStudyOrganizer
     /** Studies are written under <target>/dicoms/ */
     const STUDY_SUBDIR = 'dicoms';
 
+    /** Hidden work folder of a study being written (".<study>.organize-tmp"). */
+    const WORK_SUFFIX = '.organize-tmp';
+
     /** Idempotency state, keyed on StudyInstanceUID. */
     const TRACK_FILE = '.dicom_organize_tracking.json';
 
@@ -401,6 +404,7 @@ class DicomStudyOrganizer
         }
 
         $this->_ensureTargetDir();
+        $this->_clearWorkDirs();
 
         $this->participants = $this->ignoreParticipants ? [] : $this->_loadParticipants($sourceDir);
         $this->sourceRoot     = rtrim($sourceDir, '/');
@@ -1704,6 +1708,18 @@ class DicomStudyOrganizer
      *
      * @return void
      */
+    /** Work folders of a run that stopped: never finished, so removed (copy mode only). */
+    private function _clearWorkDirs(): void
+    {
+        if ($this->dryRun || $this->move) {
+            return;
+        }
+        foreach (glob($this->_studyRoot() . '/.*' . self::WORK_SUFFIX, GLOB_ONLYDIR) ?: [] as $dir) {
+            exec('rm -rf ' . escapeshellarg($dir));
+            $this->_info('  Removed unfinished copy of an earlier run: ' . basename($dir));
+        }
+    }
+
     private function _writeStudy(array $entry, array $seriesMap): void
     {
         $this->_info("  {$entry['study_instance_uid']}");
@@ -1726,9 +1742,30 @@ class DicomStudyOrganizer
             return;
         }
 
+        // Copy mode: the study is written in a hidden folder beside it and
+        // moved into place once complete, so a run that stops part-way leaves
+        // no half-copied study (removed at the next start, _clearWorkDirs).
+        // Move mode writes in place: the moved files exist nowhere else.
+        $finalDir = rtrim((string) $entry['directory'], '/');
+        $writeDir = $this->move
+            ? $finalDir
+            : dirname($finalDir) . '/.' . basename($finalDir) . self::WORK_SUFFIX;
+
         foreach ($seriesMap as $rows) {
-            $seriesDir = $entry['directory'] . '/' . $this->_seriesDirName($rows[0]);
+            $seriesDir = $writeDir . '/' . $this->_seriesDirName($rows[0]);
             $this->_transferSeries($rows, $seriesDir);
+        }
+
+        if ($writeDir !== $finalDir) {
+            if (is_dir($finalDir)) {
+                exec('rm -rf ' . escapeshellarg($finalDir), $o, $rc);
+                if ($rc !== 0 || is_dir($finalDir)) {
+                    throw new \RuntimeException("Could not replace {$finalDir}");
+                }
+            }
+            if (!@rename($writeDir, $finalDir)) {
+                throw new \RuntimeException("Could not move {$writeDir} to {$finalDir}");
+            }
         }
 
         $this->stats['studies_written']++;

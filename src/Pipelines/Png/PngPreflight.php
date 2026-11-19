@@ -32,6 +32,7 @@ declare(strict_types=1);
 namespace LORIS\Pipelines\Png;
 
 use LORIS\Pipelines\Shared\ParticipantsCheck;
+use LORIS\Pipelines\Shared\SessionsTsv;
 
 final class PngPreflight
 {
@@ -51,7 +52,9 @@ final class PngPreflight
         foreach ($manifest['problems'] ?? [] as $p) {
             $line = self::line($p);
             if (($p['level'] ?? '') !== 'error') {
-                $warnings[] = $line;
+                if (!str_contains($line, ', but there is no ses-')) {   // a VISIT MISMATCH error below
+                    $warnings[] = $line;
+                }
                 continue;
             }
             $issues[] = array_filter([
@@ -66,7 +69,24 @@ final class PngPreflight
         $linked = array_values(array_filter($visits, static fn ($v) => ($v['link_status'] ?? '') === 'linked'));
         $counts = ['linked' => count($linked), 'unlinked' => 0];
 
+        // Visits: folder = sessions.tsv session_id = project.json "visits"
+        // exactly. A mismatch is flagged; that visit is held back (the scan
+        // leaves it unlinked, the reidentifier holds the rest) and the rest
+        // of the delivery goes in.
+        $deliveryTsv = $manifest['participants_tsv'] ?? null;
+        if (is_string($deliveryTsv) && is_file($deliveryTsv)) {
+            foreach (SessionsTsv::visitMismatches(dirname($deliveryTsv), $projectConfig) as $m) {
+                $warnings[] = $m;
+            }
+        }
+        $isMismatch = static fn (array $v): bool => is_string($deliveryTsv)
+            && in_array($v['link_reason'] ?? null, [PngDelivery::NO_SESSIONS_TSV, PngDelivery::NOT_IN_SESSIONS_TSV], true);
+
         foreach ($visits as $v) {
+            if (($v['link_status'] ?? '') === 'unlinked' && $isMismatch($v)) {
+                $counts['unlinked']++;
+                continue;   // a VISIT MISMATCH above
+            }
             if (($v['link_status'] ?? '') === 'unlinked') {
                 $counts['unlinked']++;
                 $warnings[] = sprintf('UNLINKED sub-%s/ses-%s: %s', $v['subject'], $v['session'],
@@ -99,16 +119,8 @@ final class PngPreflight
                 // Visits not in project.json "visits" are held back, not
                 // ingested: an issue for that visit (the DICOM reidentifier
                 // holds them back the same way; here the operator sees it first).
-                if (preg_match("/^visit '([^']+)' \\(([^)]*)\\) is not in project\\.json \"visits\"/", $w, $m)) {
-                    foreach ($linked as $v) {
-                        if ($v['session'] === $m[1]) {
-                            $issues[] = ['scope' => 'visit', 'subject' => $v['subject'], 'session' => $v['session'],
-                                'message' => "sub-{$v['subject']}/ses-{$v['session']}: visit '{$m[1]}' is not in "
-                                    . 'project.json "visits" - fix the ses- folder name, or add the visit to '
-                                    . '"visits" (and set it up in LORIS)'];
-                        }
-                    }
-                    continue;
+                if (str_contains($w, 'VISIT MISMATCH')) {
+                    continue;   // flagged above
                 }
                 $warnings[] = $w;
             }

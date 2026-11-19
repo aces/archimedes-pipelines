@@ -348,7 +348,7 @@ stand-alone check.
 | Checked | Error when |
 |---|---|
 | `participants.tsv` | unreadable, no `participant_id`, duplicate rows, a needed column missing and not in `candidate_defaults` |
-| `sex` | cannot be mapped to Male / Female / Other — `M`, `male`, `f`, `u`, `n/a` … are accepted, plus `project.json` `sex_mappings` (e.g. `{"1": "Male", "2": "Female"}`), as in clinical |
+| `sex` | cannot be mapped to Male / Female / Other — `M`, `male`, `F`, `female`, `O`, `other` in any case are accepted, plus `project.json` `sex_mappings` (e.g. `{"1": "Male", "2": "Female"}`), the clinical rule (`u`, `n/a`, `unknown` are no longer read as Other: map them in `sex_mappings` if a site uses them) |
 | `dob` | not a date LORIS accepts after normalisation (`YYYY-MM-DD`, `YYYY-MM`, `YYYY`, `M/D/YYYY`, `D/M/YYYY`; `date_input_format` decides M/D vs D/M) |
 | identifiers | `sub-` or `ses-` label not letters and digits only |
 | visits | a participant study in a `ses-` folder that is not a visit configured in LORIS |
@@ -410,6 +410,67 @@ php scripts/dicom/run_dicom_organize.php         $C --confirm \
 | Stop the project if any study is unlinked | `$B $C --confirm --no-unlinked` |
 
 `B="php scripts/dicom/run_dicom_bundle.php"` and `C="--collection=archimedes --project=FDG-PET"`.
+
+---
+
+## 6a. Running it — every case
+
+**Which projects.** Spell `--collection` / `--project` as in `loris_client_config.json`
+(DICOM also accepts another case).
+
+| Scope | Command |
+|---|---|
+| one project | `$B --collection=archimedes --project=FDG-PET --confirm` |
+| every enabled project of a collection | `$B --collection=archimedes --confirm` — projects with no `deidentified-raw/imaging/dicoms/` are skipped (`SKIP no DICOM directory`) |
+| every enabled project | `$B --all --confirm` |
+| two (or more) specific projects | one run each (below) |
+| a disabled project, once | `$B --collection=archimedes --project=OLD-STUDY --confirm` (named projects run with a warning) |
+
+```bash
+for p in FDG-PET CNMDP; do
+  php scripts/dicom/run_dicom_bundle.php --collection=archimedes --project=$p --confirm || echo "STOPPED: $p"
+done
+```
+
+`--project` takes one name. For a set you run often, list the projects in a collection of
+their own in `loris_client_config.json` and run `--collection=NAME`.
+
+**Bundle or single steps.**
+
+| Use | When |
+|---|---|
+| `$B $C --confirm` | normal runs: the four steps, the data-issue report, the stop rule (nothing imported if a step before the import failed) |
+| `$B $C --confirm --steps=organize` / `--skip=import` / `--steps=import` | part of the chain, with the bundle's checks |
+| `php scripts/dicom/run_dicom_<step>.php $C --confirm` | one step on its own: no data-issue prompt, no stop rule — run them in order (section 5) |
+
+**Dry run and confirm.** Every script previews unless `--confirm` is given; `--dry-run`
+wins over `--confirm`. A dry run creates nothing, archives nothing and writes no tracking.
+
+**Unattended (cron).**
+
+```bash
+# every enabled imaging project; a project with data issues is aborted (exit 3) and emailed
+15 2 * * * cd /opt/archimedes-pipelines && php scripts/dicom/run_dicom_bundle.php --all --confirm
+# same, but go ahead with the good studies when some have issues
+15 2 * * * cd /opt/archimedes-pipelines && php scripts/dicom/run_dicom_bundle.php --all --confirm --continue-good
+```
+
+**At the same time.** One DICOM run per project (`.dicom_pipeline.lock`); a second one is
+skipped with a message naming the run that holds it (exit `1`). Different projects, and PNG,
+BIDS or clinical runs of the same project, are not blocked.
+
+**When to use `--force`** (`$B $C --confirm --force`, or on one step):
+
+| Situation | Command |
+|---|---|
+| a study moved to another visit or participant folder, and LORIS should follow | `$B $C --confirm --force` |
+| a session was deleted in LORIS | `php scripts/dicom/run_dicom_reidentifier.php $C --confirm --force`, then `$B $C --confirm` |
+| `REFUSED … already in LORIS but was not imported by this pipeline`, and this project should own the study | `php scripts/dicom/run_dicom_import.php $C --confirm --force` |
+| `WAIT … probably still uploading` and the upload is complete | `$B $C --confirm --force` |
+| redo everything (after a LORIS-side clean-up) | `$B $C --confirm --force` |
+
+Not needed for new or changed studies, new participants, new visits, fixed visit folders,
+failed studies (retried automatically) or after a crash (section 8a).
 
 ---
 
@@ -497,6 +558,39 @@ the sidecar only.
 
 To really delete a study from LORIS, use LORIS-MRI
 `tools/delete_imaging_upload.pl` (it backs up what it deletes).
+
+**Visit mismatches.** The `ses-` folder, its `sessions.tsv` `session_id` and project.json
+`"visits"` (optional) must be the same label exactly (`ses-V01` / `ses-V01` / `V01`). A
+difference — no sessions file, a folder not listed, a row with no folder, `ses-v01` when the
+visit is `V01` — is reported as `VISIT MISMATCH` with the rename to make (also in dry runs
+and by `run_dicom_validate.php`), and **that visit is held back while the rest goes in**. It
+goes in on the run after it is fixed.
+
+---
+
+## 8a. After a crash or an interruption
+
+**Run the same command again** (`$B $C --confirm`). Nothing needs cleaning by hand and
+nothing is duplicated.
+
+| Interrupted during | State left | On the next run |
+|---|---|---|
+| organize (copy mode) | a half-copied study only in a hidden `dicoms/.<study>.organize-tmp` | removed, the study organized again |
+| participant sync | some candidates created | matched (not created twice); the rest created |
+| reidentify | a half-written study only in a hidden `dicoms/.<study>.reidentify-tmp`; the previous copy (if any) unchanged | removed, the study done again |
+| reidentify, right after a study was swapped in but before it was recorded | the finished study, with its provenance file | found by its StudyInstanceUID; **its folder is reused**, no `_2` copy |
+| import (the pipeline killed; LORIS keeps archiving) | the job recorded as running the moment it started | LORIS is asked: still running → left alone; finished → recorded as imported (`finished successfully after this pipeline stopped watching`); failed → retried. **Never started twice** |
+| the bundle, anywhere | the steps it finished are recorded | the same bundle command continues: finished work is skipped |
+| anything, with the project lock held | — | the OS released the lock when the process ended; the next run is not blocked |
+
+Tested on a LORIS with Loris-MRI: kill during reidentify, during an import job and between
+the swap and the record; every rerun ended with the same 4 archives and exit `0`.
+
+Not covered: **organize with `--move`** writes in place (a half-moved folder holds the
+only copy of those files, so it is never deleted automatically): re-run organize, then check
+`processed/imaging/dicoms/` by hand. If organize is killed between moving a study into
+place and recording it, the rerun writes a second organized copy (`…_2`); it is never
+imported (the reidentifier and import work from the manifest) and can be deleted.
 
 ---
 
@@ -646,7 +740,12 @@ than copying it:
 | `ParticipantsTsv::readRows()` | parses the file (tabs, CRLF, Excel BOM, short/long rows; an empty first cell never shifts the columns) | DICOM, BIDS |
 | `ParticipantSync::load()` | rows filled from `candidate_defaults`, plus the LORIS columns still missing | DICOM, PNG |
 | `ParticipantsCheck::check()` | pre-flight: columns, identifiers, sex, dob, visit labels, visits configured in LORIS | DICOM, PNG |
-| `LorisApiClientAdapter::normaliseSexValue()` | sex → Male/Female/Other, plus `project.json` `sex_mappings` | DICOM, BIDS |
+| `Utils\Sex` (`LorisApiClientAdapter::normaliseSexValue()` delegates) | sex → Male/Female/Other, column `sex` or `gender`, plus `project.json` `sex_mappings` — the clinical rule | DICOM, BIDS, PNG |
+| `Utils\VisitLabel` | the `ses-` folder **is** the LORIS visit, exactly (case too); with project.json `"visits"` (optional) it must be one of them; nothing is renamed on the way in; `problem()` / `hint()` give the rename (`ses-v01` → `ses-V01`) | DICOM, BIDS, PNG |
+| `SessionsTsv::visitMismatches()` | every `ses-` folder = its `sessions.tsv` `session_id` = a `"visits"` entry (when declared); a missing sessions file, an unlisted folder, a row with no folder or a folder not exactly a visit is a **VISIT MISMATCH: flagged, that visit held back, the rest goes in** (listed by every dry run and validator) | DICOM, PNG |
+| `Bids\BidsVisitCheck::held()` | the BIDS visits held back: folder not exactly a LORIS visit, or files labelled with another `ses-`; flagged by the sync and the validator, left out by the reidentifier, the rest goes in (BIDS needs no `sessions.tsv`) | BIDS |
+| `ParticipantsTsv::load()` / `canonicalColumns()` | column names in any case and their aliases (`DoB`, `Gender`, `ExtStudyID`, `group` …); **site, cohort, project: when `candidate_defaults` sets one, it is the value used** — a missing column or blank cell takes it, the same value in another case takes its spelling, a different value is replaced by it with a note to correct `participants.tsv` | DICOM, BIDS, PNG |
+| `LorisApiClientAdapter::findCandidateByExternalId()` | refuses a participant that is a candidate of **another** LORIS project (same IDs in two studies): nothing linked or created | DICOM, BIDS, PNG |
 | `ParticipantSync::EXTERNAL_ID_COLUMNS` / `externalId()` | `external_id`, `ExtStudyID`, `study_id`, … | DICOM, BIDS, PNG |
 | `ParticipantSync::orphans()` / `orphanFolders()` | `sub-` folders with no row, rows with no folder | DICOM, BIDS, PNG |
 | `ParticipantSync::nestedSubjectDirs()` | a `sub-` folder inside another one | DICOM, PNG (BIDS has its own, with the file-name check) |
@@ -663,15 +762,51 @@ than copying it:
 
 DOB everywhere: `LORIS\Utils\Dob` (unchanged).
 
-**BIDS** (`BidsParticipantSync`) uses the shared parser, sex mapping, external-ID
-columns and orphan check. It keeps its own rules: PSCID = external ID,
-CandidatesPlus with the legacy fallback, the LORIS project check, a warning for
-each default used, the subject-containment check, and skipping a bad participant
-while carrying on. Compared with before, a BIDS run differs only in two ways:
+**BIDS** (`BidsParticipantSync`) reads `participants.tsv` through the shared roster
+and runs one blocking pre-flight **before anything is created** (a BIDS dataset is
+imported as a whole): the shared `ParticipantsCheck` (IDs, sex, dob, visits), folders
+with no row, files filed under the wrong participant **or visit** (`ses-1` file in
+`ses-V01`), `dataset_description.json`, and participants already in another LORIS
+project. A visit folder must already be the LORIS label (BIDS file names carry it,
+so it is not mapped on the way in; the message names the rename). It keeps its own
+rules: PSCID = external ID, CandidatesPlus with the legacy fallback.
 
-- a row with an empty `participant_id` is reported (`Line N: missing participant_id`)
-  instead of being read with its columns shifted
-- `sex_mappings` is honoured (`1`/`2` and so on), as in clinical and DICOM
+**Visits, all three modalities.** The `ses-` folder name is the LORIS visit, used exactly:
+`ses-V01` folder, `session_id ses-V01` in `sessions.tsv` (DICOM, PNG), `"V01"` in project.json
+`"visits"` (optional). A difference is flagged (VISIT MISMATCH, with the rename to make) and that
+visit is held back; the rest of the delivery goes in, and the visit goes in on the run after it is
+fixed. Dry runs and the validators list every one. Why here: LORIS compares visit labels case-insensitively (`utf8mb3_general_ci`),
+so Loris-MRI would accept `v01` and, for BIDS, create a session spelt `v01`.
+
+| Loris-MRI script | Checks on the visit |
+|---|---|
+| `dicomTar` / `import_dicom_study` (session from PatientName `PSCID_CandID_Visit`) | candidate exists, PSCID matches CandID, visit in the `visit` table; a new session needs a visit window and the project–cohort link |
+| `import_png_dataset.py` | visit in the `visit` table; the session must already exist (created by the reidentifier) |
+| `bids_import` | visit = the `ses-` label (or `default_bids_vl`); session found, or created with the row's `cohort` (must be a LORIS cohort); columns read by exact lowercase name (`participant_id`, `cohort`, `site`, `project`, `sex`, `dob`); files the `bids_validator` rejects are not indexed, so not imported |
+
+The BIDS import hands Loris-MRI a corrected copy of `participants.tsv` (`processed/bids/`):
+lowercase column names, `cohort` / `site` / `project` from `candidate_defaults`, sex normalised.
+
+**Validation before ingestion (read-only, LORIS over the API only).**
+
+| Modality | Script | Report |
+|---|---|---|
+| DICOM | `scripts/dicom/run_dicom_validate.php` | fix-it list, visits, values, headers |
+| PNG | `scripts/test/validate_png.php` | `.txt` + `.csv` per project |
+| BIDS | `scripts/test/validate_bids.php` | `.txt` + `.csv`: folder, `dataset_description.json`, `participants.tsv` (missing values, site / cohort / project vs `candidate_defaults`), visit mismatches, files named for another participant, the `bids_validator` package Loris-MRI uses (via `scripts/test/bids_validator_check.py` and the Loris-MRI Python), LORIS (project, sites, participants in another project, dob/sex differences) |
+
+**Crash and rerun.** No stage leaves half-written output where the next stage reads:
+
+| Stage | Writes into | On success | Interrupted / failed |
+|---|---|---|---|
+| DICOM organize (copy mode) | `dicoms/.<study>.organize-tmp` | moved to `dicoms/<study>` | removed at the next start |
+| DICOM reidentify | `dicoms/.<study>.reidentify-tmp` | provenance written, then swapped in; a rerun finds an unrecorded study by its StudyInstanceUID and reuses its folder (no `_2` copy) | removed at the next start; the previous copy stays |
+| BIDS reidentify | `.<target>.reidentify-tmp-<run>` next to `deidentified-lorisid/bids` | subjects moved in (with `--force`, the whole tree swapped); held-back visits left out and recorded, the subject redone once they change | removed at the next start; nothing in the target changes, run not recorded |
+| BIDS import | — | — | refused while the last reidentify failed or the tree holds folders it did not finish |
+| PNG | per image, temp file + rename, checksum | — | the image is redone |
+
+Finished, recorded work is never redone on a rerun; the import side matches what
+is already in LORIS, so a rerun creates no second candidate, session or file.
 
 **A new modality** (PNG is the worked example: `src/Pipelines/Png/`, `scripts/png/`,
 [docs/png.md](png.md)). Write only what is the modality's own - reading its delivery,

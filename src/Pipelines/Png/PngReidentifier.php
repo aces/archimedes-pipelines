@@ -263,9 +263,9 @@ class PngReidentifier
         if ($visitLabel === null) {
             $this->stats['visits_held_back']++;
             $this->_problem('warning', $key, sprintf(
-                'VISIT NOT IN project.json %s: not reidentified, not ingested - visit \'%s\' is not in '
-                . 'project.json "visits" (%s). Fix the ses- folder name, or add the visit, then re-run',
-                $label, $session, implode(', ', $this->configuredVisits ?? [])
+                'VISIT MISMATCH %s: not reidentified, not ingested - %s. The ses- folder, its sessions.tsv '
+                . 'session_id and project.json "visits" must match exactly; fix it, then re-run',
+                $label, (string) $this->api->visitProblem($session)
             ));
             return null;
         }
@@ -293,7 +293,7 @@ class PngReidentifier
             } else {
                 try {
                     $candidate = $this->api->createCandidate(
-                        $subject, $externalId, $row['dob'] ?? null, $row['sex'] ?? null
+                        $subject, $externalId, $row['dob'] ?? null, $row['sex'] ?? null, $row['site'] ?? null
                     );
                     $this->stats['candidates_created']++;
                 } catch (\Throwable $e) {
@@ -463,18 +463,13 @@ class PngReidentifier
     }
 
     /**
-     * project.json "visits" spelling (case-insensitive), the folder label as is
-     * when none are declared, null when declared and not matched.
+     * The ses- folder name when it is exactly a project.json "visits" entry
+     * (or none are declared), else null - held back (LORIS\Utils\VisitLabel).
      */
     private function _resolveVisitLabel(string $session): ?string
     {
         $this->configuredVisits ??= $this->api->getConfiguredVisitLabels();
-        foreach ($this->configuredVisits as $label) {
-            if (strcasecmp($label, $session) === 0) {
-                return $label;
-            }
-        }
-        return $this->configuredVisits === [] ? $session : null;
+        return $this->api->resolveVisitLabel($session);
     }
 
     /**

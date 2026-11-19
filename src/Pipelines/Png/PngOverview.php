@@ -88,7 +88,16 @@ final class PngOverview
                 if (array_key_exists($v['subject'], $out['existing'])) {
                     continue;
                 }
-                $found = $api->findCandidateByExternalId((string) $v['external_id']);
+                try {
+                    $found = $api->findCandidateByExternalId((string) $v['external_id']);
+                } catch (\RuntimeException $e) {
+                    if ($e->getCode() !== \LORIS\Endpoints\LorisApiClientInterface::PROJECT_CONFLICT) {
+                        throw $e;
+                    }
+                    // A participant of another project: reported for this participant only.
+                    $out['existing'][$v['subject']] = ['conflict' => $e->getMessage()];
+                    continue;
+                }
                 $out['existing'][$v['subject']] = $found === null ? null : $found + [
                     'diff' => ParticipantSync::lorisDifferences($api, $found, $rowFor($v['subject']) ?? []),
                 ];
@@ -330,7 +339,8 @@ final class PngOverview
             } elseif ($match === null) {
                 $this->_add($S, 'HELD', "{$text} - NOT in project.json \"visits\": held back{$tail}");
             } elseif ($match !== $label) {
-                $this->_add($S, 'OK', "{$text} - ingested as LORIS visit '{$match}' (case differs){$tail}");
+                $this->_add($S, 'HELD', "{$text} - not exactly the LORIS visit '{$match}': held back - rename"
+                    . " the folder and its session_id to ses-{$match}{$tail}");
             } else {
                 $this->_add($S, $unl || $blk ? 'CHECK' : 'OK', "{$text}{$tail}");
             }
@@ -414,13 +424,16 @@ final class PngOverview
             count($dobs), $dobs ? " ({$dobs[0]} ... " . end($dobs) . ", date order {$order})" : ''));
 
         if ($this->loris !== null && $this->loris['error'] === null && $this->loris['existing'] !== []) {
-            $ex = array_filter($this->loris['existing']);
+            $ex = array_filter($this->loris['existing'], static fn ($e) => $e !== null && !isset($e['conflict']));
             $df = array_filter($ex, static fn ($e) => $e['diff'] !== []);
+            if (($cf = count(array_filter($this->loris['existing'], static fn ($e) => isset($e['conflict'])))) > 0) {
+                $this->_add($S, 'FIX', "in LORIS: {$cf} participant ID(s) belong to ANOTHER project - see the ERRORs above");
+            }
             $this->_add($S, $df ? 'FIX' : 'OK', sprintf('in LORIS: %d already (dob/sex %s), %d new - created by participant sync',
                 count($ex), $df ? count($df) . ' differ - see the ERRORs above' : 'match', count($this->loris['existing']) - count($ex)));
         }
 
-        $declaredVisits = array_map('strtolower', array_filter(array_map('strval', (array) ($pc['visits'] ?? []))));
+        $declaredVisits = \LORIS\Utils\VisitLabel::declared($pc);
         $declaredCohorts = array_values(array_filter(array_map('strval', (array) ($pc['cohorts'] ?? [])),
             static fn ($x) => !str_starts_with($x, '<')));
         $lorisSites = ($this->loris !== null && $this->loris['error'] === null && $this->loris['sites'] !== null)
@@ -430,7 +443,7 @@ final class PngOverview
 
         foreach ($rows as $pid => $row) {
             $subj = ParticipantSync::subjectId((string) $pid);
-            $sexRaw = (string) ($row['sex'] ?? '');
+            $sexRaw = $this->roster?->delivered((string) $pid, 'sex') ?? (string) ($row['sex'] ?? '');
             $sex    = LorisApiClientAdapter::normaliseSexValue($sexRaw, $maps);
             $dobRaw = (string) ($row['dob'] ?? '');
             $dob    = Dob::normalize($dobRaw, $order);
@@ -441,7 +454,7 @@ final class PngOverview
             $state  = 'OK';
             foreach ($byVisit[$subj] ?? [] as $v) {
                 $held = $v['link_status'] === 'linked' && $declaredVisits !== []
-                    && !in_array(strtolower((string) $v['session']), $declaredVisits, true);
+                    && \LORIS\Utils\VisitLabel::resolve((string) $v['session'], $pc) === null;
                 $visits[] = sprintf('%s(%s)', $v['session'], match (true) {
                     $held                          => 'held: not in "visits"',
                     $v['link_status'] === 'linked' => count($v['images']) . (count($v['set_aside']) ? '+' . count($v['set_aside']) . ' aside' : ''),
@@ -478,6 +491,10 @@ final class PngOverview
                 $e = $this->loris['existing'][$subj];
                 if ($e === null) {
                     $lorisNote = 'new';
+                } elseif (isset($e['conflict'])) {
+                    $lorisNote = 'ANOTHER PROJECT in LORIS';
+                    $state     = 'FIX';
+                    $this->lorisFix[] = "[LORIS] participants.tsv ({$pid}): {$e['conflict']}";
                 } else {
                     $lorisNote = "in LORIS as {$e['pscid']} ({$e['cand_id']})";
                     if ($e['diff'] !== []) {

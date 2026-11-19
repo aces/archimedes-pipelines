@@ -12,6 +12,9 @@ use Monolog\Logger;
 use Monolog\Handler\StreamHandler;
 use LORIS\Utils\CleanLogFormatter;
 use LORIS\Utils\Dob;
+use LORIS\Utils\VisitLabel;
+use LORIS\Pipelines\Shared\ParticipantsCheck;
+use LORIS\Endpoints\LorisApiClientInterface;
 
 /**
  * BIDS Participant Sync Pipeline
@@ -59,6 +62,9 @@ class BidsParticipantSync
     private array   $config;
     private ?string $token           = null;
     private ?array  $projectDefaults = null;
+
+    /** Shared LORIS adapter (mapper lookup + cross-project check), set after login. */
+    private ?LorisApiClientAdapter $api = null;
 
     private string  $runTimestamp;
     private ?string $logDir       = null;
@@ -189,7 +195,7 @@ class BidsParticipantSync
      * @param string        $bidsDir     BIDS root being validated.
      * @param array<string> $subjectDirs sub-* directory names found in it.
      */
-    private function _checkSubjectContainment(string $bidsDir, array $subjectDirs): void
+    private function _checkSubjectContainment(string $bidsDir, array $subjectDirs): int
     {
         $mismatched = 0;
         $nested     = 0;
@@ -249,7 +255,7 @@ class BidsParticipantSync
 
         if ($mismatched === 0 && $nested === 0) {
             $this->_log('  ✓ All sub-* directories contain only their own files');
-            return;
+            return 0;
         }
 
         $this->_log(sprintf(
@@ -258,6 +264,7 @@ class BidsParticipantSync
             $mismatched,
             $nested
         ));
+        return $mismatched + $nested;
     }
 
     /**
@@ -495,31 +502,120 @@ class BidsParticipantSync
             $this->_error("PARTICIPANTS_TSV", "File not found: {$tsvFile}");
             return [];
         }
-        // Shared parser (ParticipantsTsv::readRows, same as DICOM and other
-        // modalities): fgetcsv on tabs, so an empty first cell no longer shifts
-        // the row's columns. Messages and per-row skipping are unchanged.
+        // Same reader and normalisation as DICOM and PNG (ParticipantsTsv):
+        // column names in any case (DoB, Sex, Gender, Site, Cohort ...), sex
+        // mapped, dob normalised, site/cohort/project in the configured
+        // spelling, blanks filled from candidate_defaults.
+        if (($why = ParticipantsTsv::formatProblem($tsvFile)) !== null) {
+            $this->_error("PARTICIPANTS_TSV", "participants.tsv {$why}");
+            return [];
+        }
         try {
-            $parsed = ParticipantsTsv::readRows($tsvFile);
+            $roster = ParticipantsTsv::load(
+                $tsvFile,
+                $this->projectDefaults['candidate_defaults'] ?? [],
+                $this->projectDefaults ?? []
+            );
         } catch (\RuntimeException $e) {
-            $this->_error("PARTICIPANTS_TSV", "Cannot open: {$tsvFile}");
+            $this->_error("PARTICIPANTS_TSV", $e->getMessage());
             return [];
         }
-        if ($parsed['columns'] === []) {
-            $this->_error("PARTICIPANTS_TSV", "Empty file: {$tsvFile}");
-            return [];
-        }
-        $participants = [];
-        foreach ($parsed['rows'] as ['line' => $lineNum, 'row' => $row]) {
-            if (empty($row['participant_id'])) {
-                $this->_error("PARTICIPANTS_TSV",
-                    "Line {$lineNum}: missing participant_id — skipping row"
-                );
-                continue;
-            }
-            $participants[] = $row;
-        }
+        // $roster->notes() are reported by the pre-flight (ParticipantsCheck).
+        $participants = array_values($roster->all());
         $this->_log("  Parsed " . count($participants) . " participants from participants.tsv");
         return $participants;
+    }
+
+    /**
+     * Checks run BEFORE any candidate is created; returns the number of
+     * blocking problems (each already reported as an error).
+     *
+     *   - participants.tsv values, identifiers and visits: the shared
+     *     ParticipantsCheck (same rules and messages as DICOM and PNG)
+     *   - visit mismatches are NOT counted: flagged here, held back by the
+     *     reidentifier (BidsVisitCheck); the rest goes in
+     *   - dataset_description.json present (bidsimport needs it)
+     *   - each participant not already a candidate of ANOTHER project
+     *   - participant IDs following one pattern (warning only)
+     */
+    private function _preflight(string $bidsDir, array $bidsSubjects, array $participantMap, bool $dryRun): int
+    {
+        $problems = 0;
+        $root     = rtrim($bidsDir, '/');
+        $config   = $this->projectDefaults ?? [];
+
+        if (!is_file("{$root}/dataset_description.json")) {
+            $problems++;
+            $this->_error('DATASET_DESCRIPTION', "no dataset_description.json at the top of {$bidsDir}"
+                . ' - add it (BIDS guide section 3); bidsimport cannot load the dataset without it');
+        }
+
+        // participant => visits found in the delivery
+        $sessions = [];
+        foreach ($bidsSubjects as $sub) {
+            $subject = substr($sub, 4);
+            $sessions[$subject] = array_map(
+                static fn ($d) => substr(basename($d), 4),
+                glob("{$root}/{$sub}/ses-*", GLOB_ONLYDIR) ?: []
+            );
+        }
+
+        $tsv   = "{$root}/participants.tsv";
+        $check = ParticipantsCheck::check($tsv, $config, $sessions,
+            static fn (): array => VisitLabel::declared($config), array_keys($sessions), 'BIDS data');
+        foreach ($check['issues'] as $issue) {
+            $problems++;
+            $this->_error('PARTICIPANTS', $issue['message']);
+        }
+
+        // Visits that cannot go in as they are (folder not exactly a LORIS
+        // visit, files labelled with another ses-): flagged and held back by
+        // the reidentifier; everything else goes in. BIDS needs no
+        // sessions.tsv - the visits are the ses- folder names.
+        foreach (BidsVisitCheck::held($bidsDir, $config) as $sub => $sessions) {
+            foreach ($sessions as $ses => $why) {
+                $this->_warn('VISIT MISMATCH', "{$sub}/{$ses}: {$why} - HELD BACK (not reidentified, not"
+                    . ' imported; the rest goes in). Fix it and re-run to add it');
+            }
+        }
+        foreach ($check['warnings'] as $warning) {
+            if (str_contains($warning, 'VISIT MISMATCH')) {
+                continue;   // a BIDS error above
+            }
+            $this->_warn('PARTICIPANTS', $warning);
+        }
+
+        // Participant IDs following different patterns (sub-ARCHI0001, sub-P14)
+        $patterns = [];
+        foreach (array_keys($participantMap) as $pid) {
+            $id = str_starts_with((string) $pid, 'sub-') ? substr((string) $pid, 4) : (string) $pid;
+            $patterns[preg_replace('/\d/', '9', preg_replace('/[A-Za-z]/', 'A', $id))][] = $pid;
+        }
+        if (count($patterns) > 1) {
+            $this->_warn('ID_PATTERN', 'participant IDs follow ' . count($patterns) . ' different patterns ('
+                . implode('; ', array_map(static fn ($ids) => implode(', ', array_slice($ids, 0, 3)), $patterns))
+                . ') - check they are not typos (BIDS guide section 4)');
+        }
+
+        // Already a candidate of another LORIS project (same IDs in two studies)
+        if (!$dryRun && $this->api !== null) {
+            foreach ($participantMap as $pid => $row) {
+                $ext = $this->_extractExternalID($row);
+                if ($ext === null) {
+                    continue;
+                }
+                try {
+                    $this->api->findCandidateByExternalId($ext);
+                } catch (\RuntimeException $e) {
+                    if ($e->getCode() === LorisApiClientInterface::PROJECT_CONFLICT) {
+                        $problems++;
+                        $this->_error('PROJECT_CONFLICT', "{$pid}: " . $e->getMessage());
+                    }
+                }
+            }
+        }
+
+        return $problems;
     }
 
     private function _discoverBidsSubjects(string $bidsDir): array
@@ -542,8 +638,8 @@ class BidsParticipantSync
 
     private function _extractSex(array $row): ?string
     {
-        // Shared with DICOM and other modalities: same baseline as before
-        // (m/male, f/female, o/other/nb/unknown/u/n/a) plus project.json
+        // Shared with DICOM and PNG (LORIS\Utils\Sex, the clinical rule):
+        // m/male, f/female, o/other in any case, plus project.json
         // sex_mappings, e.g. {"1": "Male", "2": "Female"}.
         return LorisApiClientAdapter::normaliseSexValue(
             (string) ($row['sex'] ?? $row['Sex'] ?? $row['gender'] ?? ''),
@@ -557,41 +653,19 @@ class BidsParticipantSync
 
     private function _lookupExternalIDViaCBIGR(string $externalID): ?array
     {
-        $baseUrl = rtrim($this->config['loris']['base_url'], '/');
+        // The shared adapter's mapper lookup (as DICOM and PNG): it resolves
+        // the CandID and refuses a participant of ANOTHER LORIS project
+        // (PROJECT_CONFLICT, thrown to the caller - nothing linked).
         try {
-            $response = $this->_http()->request('POST',
-                "{$baseUrl}/cbigr_api/externalToInternalIdMapper",
-                [
-                    'headers' => [
-                        'Authorization' => "Bearer {$this->token}",
-                        'Content-Type'  => 'application/json',
-                    ],
-                    'json' => [$externalID],
-                ]
-            );
-            if ($response->getStatusCode() !== 200) return null;
-
-            $lines = explode("\n", trim((string)$response->getBody()));
-            if (count($lines) >= 2) {
-                $parts = str_getcsv($lines[1]);
-                if (count($parts) >= 2) {
-                    $pscid = trim($parts[1]);
-                    if ($pscid && $pscid !== 'unauthorized_access') {
-                        return ['PSCID' => $pscid, 'CandID' => 'exists'];
-                    }
-                }
+            $found = $this->api?->findCandidateByExternalId($externalID);
+        } catch (\RuntimeException $e) {
+            if ($e->getCode() === LorisApiClientInterface::PROJECT_CONFLICT) {
+                throw $e;
             }
-            return null;
-        } catch (\Exception $e) {
-            $msg = $e->getMessage();
-            if (str_contains($msg, 'no PSCIDS returned')
-                || str_contains($msg, 'Number of returned IDs')
-            ) {
-                return null;
-            }
-            $this->_warn("CBIGR_LOOKUP", "Lookup error for {$externalID}: {$msg}");
+            $this->_warn("CBIGR_LOOKUP", "Lookup error for {$externalID}: " . $e->getMessage());
             return null;
         }
+        return $found === null ? null : ['PSCID' => $found['pscid'], 'CandID' => $found['cand_id'] ?: 'exists'];
     }
 
     // =========================================================================
@@ -752,7 +826,17 @@ class BidsParticipantSync
                 $this->_warn("CREATE_CANDIDATE",
                     "PSCID={$pscid} already exists (409) — looking up CandID"
                 );
-                return $this->_lookupCandidateByPSCID($pscid);
+                $existing = $this->_lookupCandidateByPSCID($pscid);
+                // Linked next: only when it is a candidate of this project.
+                try {
+                    if ($existing !== null && $this->api !== null) {
+                        $this->api->assertSameProject($existing, $pscid, $pscid);
+                    }
+                } catch (\RuntimeException $conflict) {
+                    $this->_error('PROJECT_CONFLICT', $conflict->getMessage());
+                    return null;
+                }
+                return $existing;
             }
             $this->_error("CREATE_CANDIDATE",
                 "Exception for PSCID={$pscid}: " . $e->getMessage()
@@ -864,6 +948,11 @@ class BidsParticipantSync
             $this->_closeLogs();
             return $this->stats;
         }
+        if (!$dryRun) {
+            $this->api = new LorisApiClientAdapter($this->config, $this->logger);
+            $this->api->setToken((string) $this->token);
+            $this->api->resolveProject($this->projectDefaults ?? [], $this->config);
+        }
 
         // ── Validate project exists in LORIS ──────────────────────────────────
         $projectNameForLoris = null;
@@ -915,6 +1004,12 @@ class BidsParticipantSync
         $this->_log("  sub-* directories : " . count($bidsSubjects));
         $this->_log("  participants.tsv  : " . count($participants));
 
+        if (empty($participants) && $this->stats['errors'] !== []) {
+            // the reason is already reported (missing, CSV, Excel, unreadable)
+            $this->_printSummary();
+            $this->_closeLogs();
+            return $this->stats;
+        }
         if (empty($participants)) {
             $this->_error("PARTICIPANTS_TSV",
                 "No participants found — cannot proceed."
@@ -970,7 +1065,20 @@ class BidsParticipantSync
         // files sit in another subject's directory passes it unchanged and is
         // carried through reidentification and import into candidate records
         // that attribute one participant's imaging to another.
-        $this->_checkSubjectContainment($bidsDir, $bidsSubjects);
+        $blocking = $this->_checkSubjectContainment($bidsDir, $bidsSubjects);
+        $blocking += count($orphans['dirs']);   // a folder with no row would be imported with no candidate
+        $blocking += $this->_preflight($bidsDir, $bidsSubjects, $participantMap, $dryRun);
+
+        // A BIDS dataset is imported as a whole: with any problem above,
+        // nothing is created (no candidate left behind for a dataset that
+        // cannot be imported). Fix the delivery and run again.
+        if ($blocking > 0) {
+            $this->_error('PREFLIGHT', "{$blocking} problem(s) above - NOTHING was created."
+                . ' Fix the delivery (or project.json) and run again.');
+            $this->_printSummary();
+            $this->_closeLogs();
+            return $this->stats;
+        }
 
         // ── Process participants ───────────────────────────────────────────────
         $this->_log("───────────────────────────────────────────────────────────");
@@ -1098,7 +1206,13 @@ class BidsParticipantSync
 
             // Step 1: Already mapped in CBIGR?
             if (!$dryRun) {
-                $cbigrResult = $this->_lookupExternalIDViaCBIGR($externalID);
+                try {
+                    $cbigrResult = $this->_lookupExternalIDViaCBIGR($externalID);
+                } catch (\RuntimeException $e) {
+                    $this->_error('PROJECT_CONFLICT', "{$subjectId}: " . $e->getMessage());
+                    $this->stats['external_id_skipped']++;
+                    continue;
+                }
                 if ($cbigrResult) {
                     $this->_log("  ✓ Already mapped: {$externalID} → PSCID={$cbigrResult['PSCID']}");
                     $this->stats['already_exists']++;

@@ -59,6 +59,21 @@ class BidsReidentifier
     /** Temp staging dir (symlink tree of new subjects). Cleaned in _closeLogs(). */
     private ?string $stagingDir = null;
 
+    /**
+     * Where the reidentifier writes this run (a hidden folder next to the
+     * target, same disk). Moved into the target only after a successful run,
+     * so an interrupted run never leaves half-written subjects in
+     * deidentified-lorisid/; removed on any failure and at the next start.
+     */
+    private ?string $workDir = null;
+
+    /**
+     * Visits held back this run (BidsVisitCheck): sub-<ID> => [ses-<visit> => why].
+     * Left out of the staged source; recorded on the subject, which is redone
+     * on the next run so the visit goes in once fixed.
+     */
+    private array $held = [];
+
     /** Seconds between job status poll requests */
     private const POLL_INTERVAL_SECONDS = 30;
 
@@ -198,6 +213,8 @@ class BidsReidentifier
         // cleanup line shows up in the run log and so an interrupted run
         // doesn't leave orphan symlink trees in /tmp.
         $this->_cleanupStaging();
+        // A run that did not reach _promote() leaves nothing in the target.
+        $this->_cleanupWork();
 
         $sep = str_repeat('=', 72);
         $ts  = date('Y-m-d H:i:s T');
@@ -437,7 +454,7 @@ class BidsReidentifier
             $tracking['subjects'][$subj] = [
                 'reidentified_at' => $now,
                 'run_timestamp'   => $this->runTimestamp,
-            ];
+            ] + (empty($this->held[$subj]) ? [] : ['held' => array_keys($this->held[$subj])]);
         }
 
         $tracking['last_run'] = [
@@ -540,13 +557,30 @@ class BidsReidentifier
             }
         }
 
-        // Symlink each new sub-* directory.
+        // Symlink each new sub-* directory; a subject with visits held back
+        // gets a real folder holding links to everything but those visits.
         foreach ($newSubjects as $subj) {
             $src = "{$sourceDir}/{$subj}";
             $dst = "{$stagePath}/{$subj}";
             if (!is_dir($src)) {
                 $this->_error("STAGING", "New subject directory missing: {$src}");
                 return null;
+            }
+            if (!empty($this->held[$subj])) {
+                if (!@mkdir($dst)) {
+                    $this->_error("STAGING", "Cannot create {$dst}");
+                    return null;
+                }
+                foreach (scandir($src) ?: [] as $entry) {
+                    if ($entry === '.' || $entry === '..' || isset($this->held[$subj][$entry])) {
+                        continue;
+                    }
+                    if (!@symlink("{$src}/{$entry}", "{$dst}/{$entry}")) {
+                        $this->_error("STAGING", "Failed to symlink {$subj}/{$entry}");
+                        return null;
+                    }
+                }
+                continue;
             }
             if (!@symlink($src, $dst)) {
                 $this->_error("STAGING", "Failed to symlink subject: {$subj}");
@@ -555,7 +589,8 @@ class BidsReidentifier
         }
 
         $this->_log("  Staging directory: {$stagePath}");
-        $this->_log("    Staged " . count($newSubjects) . " new sub-* folder(s) via symlink");
+        $this->_log("    Staged " . count($newSubjects) . " sub-* folder(s) via symlink"
+            . ($this->held !== [] ? ', held-back visits left out' : ''));
         return $stagePath;
     }
 
@@ -563,6 +598,92 @@ class BidsReidentifier
      * Tear down the staging directory if one was created. Idempotent.
      * Called from _closeLogs() so every exit path triggers cleanup.
      */
+    /**
+     * Move this run's output into the target, then record the subjects.
+     * A subject already in the target is replaced as a whole (no stale files
+     * from an earlier copy); with --force the whole target is replaced.
+     * If the move fails, the run is recorded as failed (subjects not marked
+     * done), so the next run redoes them.
+     */
+    private function _finishSuccess(
+        string $projectPath,
+        array $tracking,
+        array $subjects,
+        string $targetDir,
+        bool $force,
+        string $detail
+    ): void {
+        $problem = $this->_promote($targetDir, $force);
+        if ($problem !== null) {
+            $this->_error('PROMOTE', $problem . ' - the subjects of this run are not recorded; run again');
+            $this->_markFailed($projectPath, $tracking, 'moving the output into place failed: ' . $problem);
+            return;
+        }
+        $this->_markSuccess($projectPath, $tracking, $subjects, $detail);
+    }
+
+    /**
+     * @return string|null Why the output could not be moved into place, or null.
+     */
+    private function _promote(string $targetDir, bool $force): ?string
+    {
+        $work   = (string) $this->workDir;
+        $target = rtrim($targetDir, '/');
+        if (!is_dir($work)) {
+            return "the work folder {$work} is missing";
+        }
+        if ($force) {
+            // Full rebuild: swap the whole tree.
+            if (is_dir($target)) {
+                exec('rm -rf ' . escapeshellarg($target), $o, $rc);
+                if ($rc !== 0 || is_dir($target)) {
+                    return "cannot remove the previous output {$target}";
+                }
+            }
+            if (!@rename($work, $target)) {
+                return "cannot move {$work} to {$target}";
+            }
+            $this->workDir = null;
+            $this->_log("  Output in place (full rebuild): {$target}");
+            return null;
+        }
+        if (!is_dir($target) && !@mkdir($target, 0777, true)) {
+            return "cannot create {$target}";
+        }
+        $moved = 0;
+        foreach (scandir($work) ?: [] as $entry) {
+            if ($entry === '.' || $entry === '..') {
+                continue;
+            }
+            $from = "{$work}/{$entry}";
+            $to   = "{$target}/{$entry}";
+            if (file_exists($to) || is_link($to)) {
+                exec('rm -rf ' . escapeshellarg($to), $o, $rc);
+                if ($rc !== 0 || file_exists($to)) {
+                    return "cannot replace {$to}";
+                }
+            }
+            if (!@rename($from, $to)) {
+                return "cannot move {$from} to {$to}";
+            }
+            $moved++;
+        }
+        exec('rm -rf ' . escapeshellarg($work));
+        $this->workDir = null;
+        $this->_log("  Output in place: {$moved} entr" . ($moved === 1 ? 'y' : 'ies') . " moved into {$target}");
+        return null;
+    }
+
+    /** Remove this run's work folder when the run did not finish. Idempotent. */
+    private function _cleanupWork(): void
+    {
+        if ($this->workDir !== null && is_dir($this->workDir)) {
+            exec('rm -rf ' . escapeshellarg($this->workDir));
+            $this->_log("  Unfinished output removed (nothing changed in the target): {$this->workDir}");
+        }
+        $this->workDir = null;
+    }
+
     private function _cleanupStaging(): void
     {
         if ($this->stagingDir === null) {
@@ -620,37 +741,25 @@ class BidsReidentifier
         $tsvFile = "{$bidsDir}/participants.tsv";
         if (!file_exists($tsvFile)) return [];
 
-        $handle = fopen($tsvFile, 'r');
-        if ($handle === false) return [];
+        // Shared reader: header names in any case and their aliases
+        // (Participant_ID, ExtStudyID ...), as the participant sync reads them.
+        try {
+            $parsed = \LORIS\Pipelines\Shared\ParticipantsTsv::readRows($tsvFile);
+        } catch (\RuntimeException $e) {
+            return [];
+        }
 
-        $headerLine = fgets($handle);
-        if ($headerLine === false) { fclose($handle); return []; }
-
-        $headers      = array_map('trim', explode("\t", $headerLine));
         $participants = [];
-
-        while (($line = fgets($handle)) !== false) {
-            $line = trim($line);
-            if ($line === '') continue;
-
-            $fields = array_map('trim', explode("\t", $line));
-            $row    = [];
-            foreach ($headers as $i => $header) {
-                $row[$header] = $fields[$i] ?? '';
-            }
-
-            $pid        = $row['participant_id'] ?? '';
-            $externalId = $this->_extractExternalID($row);
-
-            if ($pid) {
+        foreach ($parsed['rows'] as $entry) {
+            $row = (array) ($entry['row'] ?? []);
+            $pid = trim((string) ($row['participant_id'] ?? ''));
+            if ($pid !== '') {
                 $participants[] = [
                     'participant_id' => $pid,
-                    'external_id'    => $externalId ?? substr($pid, 4),
+                    'external_id'    => $this->_extractExternalID($row) ?? substr($pid, 4),
                 ];
             }
         }
-
-        fclose($handle);
         return $participants;
     }
 
@@ -791,13 +900,42 @@ class BidsReidentifier
         // otherwise either stage just the new subjects (default) or run
         // the full source (--force).
         $tracking         = $this->_loadTracking($projectPath);
-        $trackedSubjects  = array_keys($tracking['subjects'] ?? []);
         $sourceSubjects   = array_map('basename',
             glob(rtrim($sourceDir, '/') . '/sub-*', GLOB_ONLYDIR) ?: []
         );
         sort($sourceSubjects);
 
-        $newSubjects      = array_values(array_diff($sourceSubjects, $trackedSubjects));
+        // ── Visits held back (flagged; the rest goes in) ──────────────────
+        $this->held = BidsVisitCheck::held($sourceDir, $this->projectConfig ?? []);
+
+        // A subject recorded with visits held back is redone once those
+        // change (a folder fixed or added), so the fixed visit goes in.
+        $trackedSubjects  = [];
+        foreach ((array) ($tracking['subjects'] ?? []) as $sub => $entry) {
+            $was = (array) ($entry['held'] ?? []);
+            $now = array_keys($this->held[$sub] ?? []);
+            sort($was);
+            sort($now);
+            if ($was === $now) {
+                $trackedSubjects[] = $sub;
+            }
+        }
+        $allHeld    = [];
+        foreach ($this->held as $sub => $sessions) {
+            foreach ($sessions as $ses => $why) {
+                $this->_warn('VISIT MISMATCH', "{$sub}/{$ses}: {$why} - HELD BACK"
+                    . ($dryRun ? ' (would be left out)' : ' (not reidentified, not imported; the rest goes in)'));
+            }
+            $sesDirs = glob(rtrim($sourceDir, '/') . "/{$sub}/ses-*", GLOB_ONLYDIR) ?: [];
+            if (count($sesDirs) === count($sessions)) {
+                $allHeld[] = $sub;   // nothing of this subject can go in yet
+            }
+        }
+
+        $newSubjects      = array_values(array_diff($sourceSubjects, $trackedSubjects, $allHeld));
+        if ($allHeld !== []) {
+            $this->_log('  Every visit held back, not processed: ' . implode(', ', $allHeld));
+        }
         $alreadyDone      = count($sourceSubjects) - count($newSubjects);
         $orphanInTracking = array_values(array_diff($trackedSubjects, $sourceSubjects));
 
@@ -818,6 +956,9 @@ class BidsReidentifier
 
         // No new subjects → skip entirely.
         if (!$force && !$dryRun && empty($newSubjects)) {
+            if ($this->held !== []) {
+                $this->_log("  Nothing else to do: only held-back visits remain - fix them and re-run");
+            }
             $this->_log("");
             $this->_log("  ✓ All source subjects already reidentified — skipping");
             $this->_log("    Use --force to re-run anyway.");
@@ -861,28 +1002,16 @@ class BidsReidentifier
             $this->_log("  project_list : {$projectList}");
             $this->_log("  Would process: " . ($force
                     ? "full source (" . count($sourceSubjects) . " subjects, --force)"
-                    : count($newSubjects) . " new subject(s), staged via symlinks"));
+                    : count($newSubjects) . " new subject(s), staged via symlinks")
+                . ($this->held !== [] ? '; held-back visits left out (see VISIT MISMATCH above)' : ''));
             $this->_printSummary();
             $this->_closeLogs();
             return $this->stats;
         }
 
-        // Handle --force: delete target directory for clean reidentification
-        if ($force && is_dir($targetDir)) {
-            $this->_log("  --force: removing existing target directory: {$targetDir}");
-            // Use shell rm -rf since PHP's recursive delete is verbose
-            exec('rm -rf ' . escapeshellarg($targetDir), $out, $rc);
-            if ($rc !== 0 || is_dir($targetDir)) {
-                $this->_error("TARGET_DIR",
-                    "Failed to remove existing target: {$targetDir}"
-                    . " — check for open file handles (NFS locks)"
-                );
-                $this->_printSummary();
-                $this->_closeLogs();
-                return $this->stats;
-            }
-            $this->_log("  ✓ Target directory removed");
-        }
+        // --force: the existing output is kept until the rebuild succeeded,
+        // then replaced as a whole (_promote) - an interrupted rebuild leaves
+        // the previous, complete output in place.
 
         // Ensure target directory exists
         if (!is_dir($targetDir)) {
@@ -900,16 +1029,37 @@ class BidsReidentifier
             $this->_log("  ✓ Target directory created (777)");
         }
 
+        // ── Work folder: a fresh one each run ─────────────────────────────
+        // Output of an earlier run that did not finish (crash, kill, error)
+        // is removed here, so it is never taken for finished work.
+        // One folder per run: the LORIS-side job of a killed run may still be
+        // writing into its own folder, never into this run's.
+        $workBase = dirname(rtrim($targetDir, '/')) . '/.' . basename(rtrim($targetDir, '/')) . '.reidentify-tmp';
+        foreach (glob($workBase . '*', GLOB_ONLYDIR) ?: [] as $stale) {
+            exec('rm -rf ' . escapeshellarg($stale));
+            $this->_log("  Removed the unfinished output of an earlier run: {$stale}");
+        }
+        $this->workDir = $workBase . '-' . $this->runTimestamp;
+        if (!@mkdir($this->workDir, 0777, true)) {
+            $this->_error("TARGET_DIR", "Cannot create the work folder {$this->workDir} - check the parent is writable");
+            $this->_printSummary();
+            $this->_closeLogs();
+            return $this->stats;
+        }
+        chmod($this->workDir, 0777);   // written by the LORIS host (bids_reidentifier.php)
+
         // ── Decide effective source ───────────────────────────────────────
         // --force: run on the original source (full rebuild).
         // First run with no tracking and all subjects new: also run on
         //   original source — staging would be a 1:1 mirror, no benefit.
         // Otherwise: stage only the new subjects.
         $effectiveSourceDir   = $sourceDir;
+        $toDo                 = $force ? array_values(array_diff($sourceSubjects, $allHeld)) : $newSubjects;
         $subjectsToReidentify = $sourceSubjects; // recorded on success
+        $holding              = array_intersect($toDo, array_keys($this->held)) !== [];
 
-        if (!$force && count($newSubjects) < count($sourceSubjects)) {
-            $staged = $this->_stageNewSubjects($sourceDir, $newSubjects);
+        if (count($toDo) < count($sourceSubjects) || $holding) {
+            $staged = $this->_stageNewSubjects($sourceDir, $toDo);
             if ($staged === null) {
                 // _stageNewSubjects already logged the error and recorded it
                 // in stats; the staging dir (if partially created) is on
@@ -921,7 +1071,7 @@ class BidsReidentifier
                 return $this->stats;
             }
             $effectiveSourceDir   = $staged;
-            $subjectsToReidentify = $newSubjects;
+            $subjectsToReidentify = $toDo;
         }
 
         if (!$this->_authenticate()) {
@@ -932,7 +1082,7 @@ class BidsReidentifier
         }
 
         // Launch async job
-        $launch = $this->_launchAsync($effectiveSourceDir, $targetDir, $idPattern, $projectList);
+        $launch = $this->_launchAsync($effectiveSourceDir, $this->workDir, $idPattern, $projectList);
 
         $httpStatus = $launch['http_status'] ?? 0;
 
@@ -1051,7 +1201,7 @@ class BidsReidentifier
                         . " after successful run) ({$elapsed}s)"
                     );
                     $this->stats['subjects_mapped'] = $this->stats['subjects_found'];
-                    $this->_markSuccess($projectPath, $tracking, $subjectsToReidentify,
+                    $this->_finishSuccess($projectPath, $tracking, $subjectsToReidentify, $targetDir, $force,
                         "job_id={$jobId} (UNKNOWN confirmed via wasRunning)");
                     $this->_printSummary();
                     $this->_closeLogs();
@@ -1072,7 +1222,7 @@ class BidsReidentifier
                 $this->_log("  ✓ SUCCESS ({$elapsed}s)");
                 $output = $status['progress'] ?? '';
                 $this->_parseScriptOutput($output);
-                $this->_markSuccess($projectPath, $tracking, $subjectsToReidentify,
+                $this->_finishSuccess($projectPath, $tracking, $subjectsToReidentify, $targetDir, $force,
                     "job_id={$jobId}");
                 $this->_printSummary();
                 $this->_closeLogs();
@@ -1097,9 +1247,9 @@ class BidsReidentifier
             // reidentified subjects from earlier runs, so the count check stays
             // against the source-total expectation.
             $isExitCodeUnknown = str_contains(strtolower($errorDetail), 'exit code unknown');
-            $targetSubjects    = glob("{$targetDir}/sub-*", GLOB_ONLYDIR) ?: [];
+            $targetSubjects    = glob("{$this->workDir}/sub-*", GLOB_ONLYDIR) ?: [];
             $targetCount       = count($targetSubjects);
-            $sourceCount       = $this->stats['subjects_found'];
+            $sourceCount       = count($subjectsToReidentify);
 
             if ($isExitCodeUnknown
                 && $targetCount > 0
@@ -1111,7 +1261,7 @@ class BidsReidentifier
                     . " sub-* dirs) ({$elapsed}s)"
                 );
                 $this->stats['subjects_mapped'] = $sourceCount;
-                $this->_markSuccess($projectPath, $tracking, $subjectsToReidentify,
+                $this->_finishSuccess($projectPath, $tracking, $subjectsToReidentify, $targetDir, $force,
                     "job_id={$jobId} (race condition recovery)");
                 $this->_printSummary();
                 $this->_closeLogs();

@@ -729,6 +729,13 @@ function checkLorisValues(LorisApiClientAdapter $api, array $projectConfig, ?Par
                     'correct participants.tsv, or ask the ARCHIMEDES team to correct the candidate in LORIS');
             }
         } catch (Throwable $e) {
+            if ($e->getCode() === \LORIS\Endpoints\LorisApiClientInterface::PROJECT_CONFLICT) {
+                // A participant of another LORIS project: this participant only.
+                $result['existing'][$pid] = 'conflict';
+                $f->fix('LORIS', "participants.tsv ({$pid})", $e->getMessage(),
+                    'use participant IDs unique to this project (e.g. a prefix), or an external_id column');
+                continue;
+            }
             $result['existing'][$pid] = 'error';
             $f->nocheck('LORIS', "participants.tsv ({$pid})", 'cannot compare with LORIS: ' . $e->getMessage(),
                 lorisHint($e->getMessage()));
@@ -823,7 +830,6 @@ function summariseValues(
         $perVisit[(string) ($st['session'] ?? '?')][(string) ($st['subject'] ?? '?')] = true;
     }
     ksort($perVisit);
-    $declaredLc = array_map('strtolower', $declaredVisits);
     if ($perVisit === []) {
         $f->value('visits', 'no examinations matched to a participant', 'CHECK');
     }
@@ -833,10 +839,10 @@ function summariseValues(
             $f->value('visits', $text . ' - label not letters and digits only (see MUST FIX)', 'FIX');
         } elseif ($declaredVisits === []) {
             $f->value('visits', $text . ' - project.json has no "visits"; checked by LORIS when the session is created', 'LORIS');
-        } elseif (in_array(strtolower($visit), $declaredLc, true)) {
+        } elseif (\LORIS\Utils\VisitLabel::resolve($visit, $projectConfig) !== null) {
             $f->value('visits', $text . ' - in project.json "visits"', 'OK');
         } else {
-            $f->value('visits', $text . ' - NOT in project.json "visits" (' . implode(', ', $declaredVisits) . '): held back', 'HELD');
+            $f->value('visits', $text . ' - ' . \LORIS\Utils\VisitLabel::problem($visit, $projectConfig) . ': held back', 'HELD');
         }
     }
 
@@ -881,8 +887,9 @@ function summariseValues(
         $f->value('in LORIS', sprintf('%d already in LORIS (dob/sex %s), %d new - created at ingestion',
                 ($c['match'] ?? 0) + ($c['differs'] ?? 0),
                 ($c['differs'] ?? 0) > 0 ? ($c['differs'] . ' differ - see MUST FIX') : 'match',
-                $c['new'] ?? 0) . (($c['error'] ?? 0) > 0 ? ' - some could not be checked' : ''),
-            ($c['differs'] ?? 0) > 0 ? 'FIX' : (($c['error'] ?? 0) > 0 ? 'NOT CHECKED' : 'OK'));
+                $c['new'] ?? 0) . (($c['conflict'] ?? 0) > 0 ? " - {$c['conflict']} belong to ANOTHER project (see MUST FIX)" : '')
+                . (($c['error'] ?? 0) > 0 ? ' - some could not be checked' : ''),
+            (($c['differs'] ?? 0) + ($c['conflict'] ?? 0)) > 0 ? 'FIX' : (($c['error'] ?? 0) > 0 ? 'NOT CHECKED' : 'OK'));
     } elseif ($loris === null && $rows !== []) {
         $f->value('in LORIS', 'not checked (offline or LORIS not reachable)', 'NOT CHECKED');
     }
@@ -1335,13 +1342,11 @@ function validateUpload(
         if (str_starts_with($w, 'project.json has no "visits"')) {
             continue;   // shown per visit in the VALUES table
         }
-        if (str_contains($w, 'is not in project.json "visits"')
-            && preg_match("/^visit '([^']*)' \\(([^)]*)\\)/", $w, $vm)
+        if (str_contains($w, 'VISIT MISMATCH')
+            && preg_match('/^(.*) \(([^)]*)\) - VISIT MISMATCH, [^.]*\. (.*), then re-run$/', $w, $vm)
         ) {
-            $f->held('project.json', "ses-{$vm[1]} ({$vm[2]})",
-                "visit '{$vm[1]}' is not in project.json \"visits\" (" . implode(', ', $declaredVisits) . ')'
-                . ' - its examinations are held back (not ingested); everything else goes in',
-                'fix the ses- folder name, or add the visit to "visits" (and set it up in LORIS for the project and cohort)');
+            $f->held('project.json', $vm[2], $vm[1]
+                . ' - its examinations are held back (not ingested); everything else goes in', $vm[3]);
             continue;
         }
         $f->check(str_starts_with($w, 'organize: ') ? 'files' : 'participants', 'dicoms/', preg_replace('/^organize: /', '', $w));
@@ -1408,9 +1413,9 @@ function validateUpload(
         } elseif (isset($excluded[$uid]) || isset($badPn[$uid])) {
             $studiesOut[$uid] = ['line' => $line, 'status' => 'BLOCKED', 'why' => 'see MUST FIX'];
         } elseif ($declaredVisits !== []
-            && !in_array(strtolower((string) ($st['session'] ?? '')), array_map('strtolower', $declaredVisits), true)
+            && \LORIS\Utils\VisitLabel::resolve((string) ($st['session'] ?? ''), $projectConfig) === null
         ) {
-            $studiesOut[$uid] = ['line' => $line, 'status' => 'HELD', 'why' => 'visit not in project.json "visits" - see HELD BACK'];
+            $studiesOut[$uid] = ['line' => $line, 'status' => 'HELD', 'why' => 'visit mismatch - see HELD BACK'];
         } else {
             $studiesOut[$uid] = ['line' => $line, 'status' => 'READY', 'why' => ''];
         }

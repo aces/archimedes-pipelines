@@ -145,6 +145,13 @@ final class PngValidator
             $this->_add($key, self::ERROR, $msg, $fix !== '' ? $fix : $this->_fixFor($msg));
         }
         foreach ($pre['warnings'] as $w) {
+            if (str_starts_with($w, 'VISIT MISMATCH ')) {
+                // folder / sessions.tsv / "visits" differ: that visit is held back, the rest goes in
+                $key = preg_match('/^VISIT MISMATCH sub-([A-Za-z0-9]+)/', $w, $m)
+                    ? $this->_participantSection($m[1], $manifest) : 'tsv';
+                $this->_add($key, self::ERROR, $w, '');
+                continue;
+            }
             if (str_starts_with($w, 'project.json has no "visits"')) {
                 $this->_add('settings', self::WARNING, $w, '');
             }
@@ -157,6 +164,9 @@ final class PngValidator
         foreach ($manifest['visits'] as $v) {
             if ($v['link_status'] !== 'unlinked') {
                 continue;
+            }
+            if (in_array($v['link_reason'], [PngDelivery::NO_SESSIONS_TSV, PngDelivery::NOT_IN_SESSIONS_TSV], true)) {
+                continue;   // a VISIT MISMATCH above
             }
             [$msg, $fix] = explode('; until then', PngDelivery::unlinkedAdvice($v['link_reason'], $v['subject'],
                 $v['session']), 2) + [1 => ''];

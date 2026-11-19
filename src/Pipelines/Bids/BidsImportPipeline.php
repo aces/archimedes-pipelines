@@ -5,6 +5,7 @@ declare(strict_types=1);
 namespace LORIS\Pipelines\Bids;
 
 use LORIS\Pipelines\Shared\FingerprintTracker;
+use LORIS\Pipelines\Shared\ParticipantsTsv;
 use LORIS\Pipelines\Shared\TrackingFile;
 
 use Monolog\Logger;
@@ -311,6 +312,15 @@ class BidsImportPipeline
             $this->_writeError($fault['context'], $fault['message']);
         }
 
+        // Only import what the reidentifier finished. Its output is moved
+        // into place only after a successful run, so a subject it does not
+        // list (or a last run that failed) means the tree is not its finished
+        // output - importing it would load a partial or stale delivery.
+        foreach ($this->_reidentifyFaults($bidsPath) as $fault) {
+            $faults[] = $fault;
+            $this->_writeError('PREFLIGHT', $fault);
+        }
+
         if (empty($faults)) {
             $this->_log('  ✓ Preflight: tree is internally consistent');
             return true;
@@ -519,6 +529,44 @@ class BidsImportPipeline
     // =========================================================================
     //  BIDS DIRECTORY
     // =========================================================================
+
+    /**
+     * Checks the BIDS tree against the reidentifier's record
+     * (processed/bids/.bids_reidentify_tracking.json). No record at all
+     * (a tree placed by hand, or from before the record existed) is allowed,
+     * as before.
+     *
+     * @return string[] Faults; empty when the tree is the reidentifier's
+     *                  finished output.
+     */
+    private function _reidentifyFaults(string $bidsPath): array
+    {
+        $track = rtrim((string) $this->projectPath, '/') . '/processed/bids/.bids_reidentify_tracking.json';
+        if (!is_file($track)) {
+            return [];
+        }
+        $data = json_decode((string) file_get_contents($track), true);
+        if (!is_array($data)) {
+            return ["the reidentifier record {$track} cannot be read - run the reidentifier again"];
+        }
+        $faults = [];
+        $status = $data['last_run']['status'] ?? '';
+        if ($status !== '' && $status !== 'success') {
+            $faults[] = "the last reidentifier run did not finish ({$status}: "
+                . ($data['last_run']['error'] ?? $data['last_run']['detail'] ?? 'see its log')
+                . ') - run the reidentifier again first; nothing is imported until it succeeds';
+        }
+        // The record lists source subjects; the tree holds the LORIS-ID
+        // subjects. Only the count can be compared without the mapping.
+        $done = count($data['subjects'] ?? []);
+        $tree = count(glob(rtrim($bidsPath, '/') . '/sub-*', GLOB_ONLYDIR) ?: []);
+        if ($done > 0 && $tree > $done) {
+            $faults[] = "{$tree} participant folders in {$bidsPath} but the reidentifier finished {$done}"
+                . ' - the extra folders are not its output (left from an interrupted run, or copied in);'
+                . ' remove them, or run the reidentifier with --force to rebuild the tree';
+        }
+        return $faults;
+    }
 
     private function _findBidsDirectory(string $projectPath): ?string
     {
@@ -733,26 +781,76 @@ class BidsImportPipeline
         // Resolve defaults from project.json candidate_defaults
         $defaults = $this->projectConfig['candidate_defaults'] ?? [];
 
-        // Columns to inject if missing — all taken directly from candidate_defaults
-        $requiredCols = [
-            'cohort' => $defaults['cohort'] ?? '',
-            'site'   => $defaults['site']   ?? '',
-            'sex'    => $defaults['sex']    ?? '',
-        ];
+        // What Loris-MRI's bids_import reads (loris_bids_utils
+        // BidsParticipantTsvRow): exact lowercase columns participant_id,
+        // cohort (required to create a session; must be a LORIS cohort), site,
+        // project, sex, dob. Same rules as the participant sync
+        // (ParticipantsTsv): header names in any case and their aliases;
+        // cohort / site / project = candidate_defaults when set (blank or
+        // different values replaced); sex normalised (Utils\Sex).
+        $changes   = [];
+        $canonical = ParticipantsTsv::canonicalColumns($headers);
+        if ($canonical !== $headers) {
+            $map = array_combine($headers, $canonical);
+            foreach ($rows as $k => $row) {
+                $new = [];
+                foreach ($row as $h => $v) {
+                    $new[$map[$h] ?? $h] = $v;
+                }
+                $rows[$k] = $new;
+            }
+            $changes[] = 'column names (' . implode(', ', array_diff($canonical, $headers)) . ')';
+            $headers   = $canonical;
+        }
 
         $addedCols = [];
-        foreach ($requiredCols as $col => $val) {
-            if (!in_array($col, $headers, true) && !empty($val)) {
+        foreach (['cohort', 'site', 'project'] as $col) {
+            $val = trim((string) ($defaults[$col] ?? ''));
+            if ($val === '') {
+                continue;
+            }
+            if (!in_array($col, $headers, true)) {
                 $headers[]       = $col;
                 $addedCols[$col] = $val;
                 $this->_log("  participants.tsv missing '{$col}'"
                     . " — taking value from project.json candidate_defaults: '{$val}'");
+                continue;
+            }
+            $replaced = 0;
+            foreach ($rows as $k => $row) {
+                if (($row[$col] ?? '') !== $val) {
+                    $rows[$k][$col] = $val;
+                    $replaced++;
+                }
+            }
+            if ($replaced > 0) {
+                $changes[] = "{$col} = '{$val}' on {$replaced} row(s) (candidate_defaults)";
+            }
+        }
+        if (!in_array('sex', $headers, true) && trim((string) ($defaults['sex'] ?? '')) !== '') {
+            $headers[]       = 'sex';
+            $addedCols['sex'] = (string) $defaults['sex'];
+        }
+        if (in_array('sex', $headers, true)) {
+            $fixed = 0;
+            foreach ($rows as $k => $row) {
+                $mapped = \LORIS\Utils\Sex::normalize((string) ($row['sex'] ?? ''), $this->projectConfig['sex_mappings'] ?? []);
+                if ($mapped !== null && $mapped !== ($row['sex'] ?? '')) {
+                    $rows[$k]['sex'] = $mapped;
+                    $fixed++;
+                }
+            }
+            if ($fixed > 0) {
+                $changes[] = "sex normalised on {$fixed} row(s)";
             }
         }
 
-        if (empty($addedCols)) {
+        if (empty($addedCols) && $changes === []) {
             $this->_log("  participants.tsv has all required columns — no enrichment needed");
             return $bidsPath;
+        }
+        foreach ($changes as $c) {
+            $this->_log("  participants.tsv for bids_import: {$c}");
         }
 
         // ── Stage a temp BIDS dir ─────────────────────────────────────────
@@ -828,7 +926,7 @@ class BidsImportPipeline
 
         $this->_log("  ✓ participants.tsv enriched in temp staging dir ("
             . count($rows) . " rows, added: "
-            . implode(', ', array_keys($addedCols)) . ")");
+            . (implode(', ', array_keys($addedCols)) ?: 'none') . ")");
         $this->_log("    Staging dir         : {$stagePath}");
         $this->_log("    Persisted audit copy: {$persistedTsv}");
         $this->_log("    Source participants.tsv at {$tsvPath} is untouched");

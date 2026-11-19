@@ -151,6 +151,71 @@ final class SessionsTsv
     }
 
     /**
+     * Visit mismatches across a whole delivery, for DICOM and PNG: for every
+     * sub-<ID>/ses-<visit> folder on disk, the folder, its sessions file
+     * session_id and project.json "visits" (when declared) must be the same
+     * label exactly - ses-V01 / ses-V01 / V01. Each mismatch is flagged and
+     * that visit held back (not ingested); the rest of the delivery goes in.
+     * A dry run lists them all.
+     *
+     * Covers: no sessions file or no session_id column; a folder not listed;
+     * a row with no folder; a folder that is not exactly a declared visit.
+     * acq_date problems are not mismatches and are left to check().
+     *
+     * @param string $deliveryDir   Folder holding the sub-<ID>/ folders.
+     * @param array  $projectConfig Decoded project.json ("visits", optional).
+     *
+     * @return string[] One message per mismatch, with the fix.
+     */
+    public static function visitMismatches(string $deliveryDir, array $projectConfig): array
+    {
+        $out = [];
+        foreach (glob(rtrim($deliveryDir, '/') . '/sub-*', GLOB_ONLYDIR) ?: [] as $subDir) {
+            $subject = substr(basename($subDir), 4);
+            if (!preg_match('/^[A-Za-z0-9]+$/', $subject)) {
+                continue;   // an invalid participant ID is reported elsewhere
+            }
+            $folders = array_map(
+                static fn (string $d): string => substr(basename($d), 4),
+                glob($subDir . '/ses-*', GLOB_ONLYDIR) ?: []
+            );
+            if ($folders === []) {
+                continue;
+            }
+            foreach (self::check($deliveryDir, $subject, $folders) as $p) {
+                if ($p['kind'] === self::BAD_ACQ_DATE) {
+                    continue;
+                }
+                $file = basename(self::path($deliveryDir, $subject));
+                $held = ' - HELD BACK (not ingested; the rest goes in)';
+                $out[] = 'VISIT MISMATCH ' . match ($p['kind']) {
+                    self::NOT_LISTED       => "sub-{$subject}/ses-{$p['visit']}: folder not listed in {$file}{$held}"
+                        . " - add a row with session_id ses-{$p['visit']} (or rename the folder to the listed visit)",
+                    self::LISTED_NO_FOLDER => "sub-{$subject}/ses-{$p['visit']}: {$file} lists ses-{$p['visit']}"
+                        . " but there is no ses-{$p['visit']}/ folder - rename the folder, or fix the row",
+                    self::MISSING          => "sub-{$subject}: no sessions file{$held} - add sub-{$subject}/sessions.tsv"
+                        . ' with one row per ses- folder (session_id ses-<visit>)',
+                    default                => "sub-{$subject}: {$p['message']}{$held} - {$p['fix']}",
+                };
+            }
+            foreach ($folders as $visit) {
+                if (!preg_match('/^[A-Za-z0-9]+$/', $visit)) {
+                    continue;   // reported as an invalid label elsewhere
+                }
+                $why = \LORIS\Utils\VisitLabel::problem($visit, $projectConfig);
+                if ($why !== null) {
+                    $out[] = "VISIT MISMATCH sub-{$subject}/ses-{$visit}: {$why}"
+                        . (\LORIS\Utils\VisitLabel::hint($visit, $projectConfig) !== null
+                            ? ' (the folder and its session_id)'
+                            : ' - fix the folder name and its session_id, or add the visit to "visits" (and set it up in LORIS)')
+                        . ' - HELD BACK (not ingested; the rest goes in)';
+                }
+            }
+        }
+        return $out;
+    }
+
+    /**
      * Every mismatch between the file and the participant's ses- folders.
      *
      * @param string   $deliveryDir  Folder holding the sub-<ID>/ folders.

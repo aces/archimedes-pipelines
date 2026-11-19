@@ -319,6 +319,60 @@ SKIP another PNG run is in progress for this project (run_png_bundle.php, pid 23
 
 ---
 
+## 5a. Running it — every case
+
+`B="php scripts/png/run_png_bundle.php"` · `C="--collection=archimedes --project=ARCHI-TEST"`
+
+**Which projects.** Spell `--collection` / `--project` as in `loris_client_config.json`
+(PNG also accepts another case).
+
+| Scope | Command |
+|---|---|
+| one project | `$B $C --confirm` |
+| every enabled project of a collection | `$B --collection=archimedes --confirm` — projects with no `deidentified-raw/imaging/png/` are skipped (`SKIP … no PNG delivery`) |
+| every enabled project | `$B --all --confirm` |
+| two (or more) specific projects | one run each (below) |
+
+```bash
+for p in ARCHI-TEST CARDIAC-ECHO; do
+  php scripts/png/run_png_bundle.php --collection=archimedes --project=$p --confirm || echo "STOPPED: $p"
+done
+```
+
+`--project` takes one name. For a set you run often, list the projects in a collection of
+their own in `loris_client_config.json` and run `--collection=NAME`.
+
+**Bundle or single steps.**
+
+| I want to… | Command |
+|---|---|
+| preview everything | `$B $C -v` |
+| ingest a new or updated delivery | `$B $C --confirm` |
+| prepare everything, insert nothing | `$B $C --confirm --skip=import` |
+| insert what is already prepared | `$B $C --confirm --steps=import` |
+| ask LORIS to check every visit, insert nothing | `php scripts/png/run_png_import.php $C --validate` |
+| one step on its own | `php scripts/png/run_png_<step>.php $C --confirm` (no data-issue prompt, no stop rule; run sync → reidentify → import in order) |
+| see what was delivered (scan only) | `php scripts/png/run_png_scan.php $C` |
+| unattended, go ahead with the good visits | `$B --all --confirm --continue-good` |
+| cron | `45 2 * * * cd /opt/archimedes-pipelines && php scripts/png/run_png_bundle.php --all --confirm` |
+
+**Dry run and confirm.** Every script previews unless `--confirm` is given; `--dry-run` wins
+over `--confirm`. A dry run creates and inserts nothing (the scan still writes its manifest,
+marked `dry_run`).
+
+**When to use `--force`**
+
+| Situation | Command |
+|---|---|
+| the delivery changed in the last few minutes but the upload is complete (`WAIT`) | `$B $C --confirm --force` |
+| a participant's `external_id` changed and the visits should move to the new candidate | `php scripts/png/run_png_reidentifier.php $C --confirm --force`, then `$B $C --confirm` |
+| send every visit again (e.g. after images were deleted in LORIS) | `$B $C --confirm --force` — safe: images already in LORIS are skipped by hash |
+
+Not needed for new or changed images, new visits, fixed visit folders, failed visits
+(retried automatically) or after a crash (section 6a).
+
+---
+
 ## 6. Incremental deposits — re-run, it catches up
 
 | Deposit | Result on re-run |
@@ -350,6 +404,32 @@ and the FileID of each image. The tracking rules are the same: a fingerprint is 
 after a success, a failed visit is always retried, files are written atomically.
 
 To delete an image from LORIS: LORIS-side tooling (not done by this pipeline).
+
+**Visit mismatches.** The `ses-` folder, its `sessions.tsv` `session_id` and project.json
+`"visits"` (optional) must be the same label exactly (`ses-V01` / `ses-V01` / `V01`). A
+difference — no `sessions.tsv`, a folder not listed, a row with no folder, `ses-v01` when the
+visit is `V01` — is reported as `VISIT MISMATCH` with the rename to make (also in dry runs
+and by `validate_png.php`), and **that visit is held back while the rest goes in**. It goes in
+on the run after it is fixed.
+
+---
+
+## 6a. After a crash or an interruption
+
+**Run the same command again** (`$B $C --confirm`). Nothing needs cleaning by hand and
+nothing is duplicated.
+
+| Interrupted during | State left | On the next run |
+|---|---|---|
+| participant sync | some candidates created | matched (not created twice); the rest created |
+| reidentify, mid-visit | some images copied (each copied to a temp file, checked by md5, then renamed: never a half image); the visit not recorded | the visit is redone |
+| import (the pipeline killed; LORIS keeps inserting) | some images inserted | the visit is sent again; images already in LORIS are skipped by hash |
+| the bundle, anywhere | the steps it finished are recorded | the same bundle command continues |
+| anything, with the project lock held | — | the OS released the lock when the process ended |
+
+The import also checks every reidentified copy byte for byte against the record before
+sending it, so a visit left half-copied is never sent. Tested on a LORIS with Loris-MRI:
+kill during reidentify and during an import job; every rerun ended with the same 5 images.
 
 ---
 

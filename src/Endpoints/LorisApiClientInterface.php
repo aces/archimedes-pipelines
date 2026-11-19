@@ -35,6 +35,13 @@ interface LorisApiClientInterface
     public const VISIT_REFUSED = 4001;
 
     /**
+     * Exception code: the external ID (or PSCID) belongs to a candidate of
+     * ANOTHER LORIS project. Nothing is linked or created; the participant
+     * stops with this message (a second study using the same IDs).
+     */
+    public const PROJECT_CONFLICT = 4002;
+
+    /**
      * Find a candidate by the site's own identifier.
      *
      * @param string $externalId Site identifier (the sub- value).
@@ -51,6 +58,8 @@ interface LorisApiClientInterface
      * @param string|null $dob        Normalised to YYYY-MM-DD before sending
      *                                (day kept if given, else 01).
      * @param string|null $sex        Male, Female or Other.
+     * @param string|null $site       participants.tsv site; null or '' =
+     *                                candidate_defaults.site.
      *
      * @return array{pscid: string, cand_id: string}
      */
@@ -58,7 +67,8 @@ interface LorisApiClientInterface
         string $pscid,
         string $externalId,
         ?string $dob,
-        ?string $sex
+        ?string $sex,
+        ?string $site = null
     ): array;
 
     /**
@@ -67,6 +77,17 @@ interface LorisApiClientInterface
      * @return string[]
      */
     public function getConfiguredVisitLabels(): array;   // project.json "visits" (the LORIS API cannot list configured visits)
+
+    /**
+     * LORIS visit label for a delivered visit (ses- folder): project.json
+     * visit_mappings, then the "visits" spelling (LORIS\Utils\VisitLabel).
+     *
+     * @return string|null Null when "visits" is declared and nothing matches.
+     */
+    public function resolveVisitLabel(string $visit): ?string;
+
+    /** Why a ses- folder name is not a LORIS visit exactly (with the rename), or null. */
+    public function visitProblem(string $visit): ?string;
 
     /**
      * Ensure a session exists for this candidate and visit.

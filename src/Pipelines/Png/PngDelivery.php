@@ -69,6 +69,8 @@ final class PngDelivery
 {
     /** First eight bytes of any PNG file (same check as import_png_dataset.py). */
     public const PNG_SIGNATURE = "\x89PNG\r\n\x1a\n";
+    /** Last 12 bytes of every complete PNG: the IEND chunk (length 0, type, CRC). */
+    public const PNG_END = "\x00\x00\x00\x00IEND\xAE\x42\x60\x82";
 
     /** Identifier after sub- / ses-, matched in full (as the LORIS script does). */
     public const LABEL_REGEX = '/^[A-Za-z0-9]+$/';
@@ -627,6 +629,15 @@ final class PngDelivery
         if ($head !== self::PNG_SIGNATURE) {
             $fix = 'export it as PNG (not renamed from .jpg/.bmp), and send it again if the transfer was cut';
             return 'is not a PNG image (wrong format renamed to .png, or a truncated transfer)';
+        }
+        // A complete PNG ends with the IEND chunk (length 0, "IEND", fixed CRC). A file cut
+        // short by an interrupted upload still starts like a PNG, so check the end too (in
+        // the last KB: some exporters write a few bytes after it, which is harmless).
+        $from = max(0, $size - 1024);
+        $tail = (string) @file_get_contents($path, false, null, $from, $size - $from);
+        if (!str_contains($tail, self::PNG_END)) {
+            $fix = 'send the image again (the upload was probably interrupted)';
+            return 'is incomplete: the PNG end marker is missing (file cut short)';
         }
         return null;
     }

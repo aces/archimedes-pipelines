@@ -55,6 +55,9 @@ class DicomReidentifier
      */
     const PROVENANCE_SUFFIX = '.provenance.json';
 
+    /** Hidden work folder of a study being written (".<study>.reidentify-tmp"). */
+    const WORK_SUFFIX = '.reidentify-tmp';
+
     /** @var LorisApiClientInterface */
     private $api;
 
@@ -197,6 +200,9 @@ class DicomReidentifier
 
         $this->stats['studies_total'] = count($stage1['studies']);
         $this->_ensureTargetDir();
+        if (!$this->dryRun) {
+            $this->_clearWorkDirs();
+        }
 
         $tracking = $this->_readTracking();
         $output   = [];
@@ -306,7 +312,7 @@ class DicomReidentifier
             // series in ARCHI0001_300001_V01_MR would land in ..._MR_2.
             $this->ownDir = $tracked !== null
                 ? basename((string) ($tracked['directory'] ?? ''))
-                : null;
+                : $this->_dirFromProvenance($studyUid);
             $entry = $this->_mapStudy($study, $participantRows);
             $this->ownDir = null;
 
@@ -417,18 +423,16 @@ class DicomReidentifier
         }
 
         if ($visitLabel === null) {
-            // project.json "visits" is declared and this ses- folder matches
-            // none of them. Hold back this study only (warning; not recorded,
-            // so it is retried) - the rest of the delivery goes in. Nothing is
-            // created for it in LORIS.
+            // project.json "visits" is declared and this ses- folder is not
+            // exactly one of them. Hold back this study only (warning; not
+            // recorded, so it is retried) - the rest of the delivery goes in.
+            // Nothing is created for it in LORIS.
             $this->stats['visit_refused']++;
             $this->_problem('warning', $studyUid, sprintf(
-                "VISIT NOT IN project.json %s: not reidentified, not ingested - visit '%s' is not in "
-                . 'project.json "visits" (%s). Fix the ses- folder name, or add the visit to "visits" '
-                . '(and set it up in LORIS), then re-run',
+                'VISIT MISMATCH %s: not reidentified, not ingested - %s. The ses- folder, its sessions.tsv '
+                . 'session_id and project.json "visits" must match exactly; fix it, then re-run',
                 $study['directory_name'] ?? $studyUid,
-                $session,
-                implode(', ', $this->configuredVisits ?? [])
+                (string) $this->api->visitProblem((string) $session)
             ));
             return null;
         }
@@ -477,7 +481,8 @@ class DicomReidentifier
                         $demographics['participant_id'] ?? $externalId,
                         $externalId,
                         $demographics['dob'] ?? null,
-                        $demographics['sex'] ?? null
+                        $demographics['sex'] ?? null,
+                        $demographics['site'] ?? null
                     );
                 } catch (\Throwable $e) {
                     return $this->_reject(
@@ -544,23 +549,34 @@ class DicomReidentifier
         $rewritten = 0;
 
         if (!$this->dryRun) {
-            $this->_copyTree($sourceDir, $targetDir);
+            // Built in a hidden folder next to the study (same disk) and moved
+            // into place only once every header is rewritten: an interrupted
+            // or failed run never leaves a half-copied or half-rewritten study
+            // where the import would pick it up.
+            $workDir = $this->_workDirFor($dirName);
+            $this->_copyTree($sourceDir, $workDir);
 
             try {
                 $rewritten = $this->headerWriter->rewritePatientIdentity(
-                    $targetDir,
+                    $workDir,
                     $lorisName,
                     (string) ($study['patient_name'] ?? '')
                 );
             } catch (\Throwable $e) {
-                // Leave the partial copy in place for inspection rather than
-                // deleting evidence of what went wrong.
+                // Kept (hidden, never imported) for inspection; removed by
+                // the next run.
                 return $this->_reject(
                     $studyUid,
                     'header rewrite failed: ' . $e->getMessage()
+                    . ' - nothing changed in ' . self::STUDY_SUBDIR . "/; the partial copy is {$workDir}"
                 );
             }
 
+            try {
+                $this->_promote($workDir, $targetDir, $studyUid);
+            } catch (\RuntimeException $e) {
+                return $this->_reject($studyUid, $e->getMessage() . ' - run again');
+            }
             $this->stats['files_rewritten'] += $rewritten;
         }
 
@@ -579,11 +595,9 @@ class DicomReidentifier
     }
 
     /**
-     * Match a session identifier against the known visit labels (used in LORIS or
-     * declared in project.json "visits"); an unknown one is returned as is.
-     *
-     * Compared case-insensitively, since site folder naming is inconsistent
-     * and the configured label is authoritative for the returned value.
+     * The LORIS visit for a ses- folder name: the name itself when it is
+     * exactly a project.json "visits" entry (or none are declared), else null
+     * (held back) - LORIS\Utils\VisitLabel.
      *
      * @param string|null $session Session identifier from the folder name.
      *
@@ -594,22 +608,11 @@ class DicomReidentifier
         if ($session === null || $session === '') {
             return null;
         }
+        // Configured visits are still read here for the "held back" messages.
+        $this->configuredVisits ??= $this->api->getConfiguredVisitLabels();
 
-        if ($this->configuredVisits === null) {
-            $this->configuredVisits = $this->api->getConfiguredVisitLabels();
-        }
-
-        foreach ($this->configuredVisits as $label) {
-            if (strcasecmp($label, $session) === 0) {
-                return $label;
-            }
-        }
-
-        // project.json "visits" is declared and this folder matches none of
-        // them: a typo or a visit not set up - held back (caller), never
-        // guessed. Not declared: the folder's label as is; LORIS checks it
-        // against the cohort when the session is created.
-        return $this->configuredVisits === [] ? $session : null;
+        // Exact match only; nothing is renamed on the way in.
+        return $this->api->resolveVisitLabel($session);
     }
 
     /** @var array<string, true> StudyInstanceUIDs excluded by the operator. */
@@ -774,6 +777,60 @@ class DicomReidentifier
      *
      * @return void
      */
+    /** Hidden work folder for a study, beside it in the study root. */
+    private function _workDirFor(string $dirName): string
+    {
+        return $this->_studyRoot() . '/.' . $dirName . self::WORK_SUFFIX;
+    }
+
+    /**
+     * Swap a finished work folder in as the study folder. The provenance
+     * sidecar (with the StudyInstanceUID) is written first, so a run that
+     * stops right after the swap - before the tracking file is updated -
+     * is matched to this folder on the next run (_dirFromProvenance) and
+     * reuses it, instead of creating a second copy (..._2) of the study.
+     */
+    private function _promote(string $workDir, string $targetDir, string $studyUid): void
+    {
+        $this->_atomicWriteJson(rtrim($targetDir, '/') . self::PROVENANCE_SUFFIX, [
+            'archimedes_stage'   => 'dicom_reidentifier',
+            'study_instance_uid' => $studyUid,
+            'summary'            => 'Being written - completed when the run records the study.',
+        ]);
+        if (is_dir($targetDir) && !$this->_deleteTree($targetDir)) {
+            throw new \RuntimeException("Could not remove the previous copy {$targetDir}");
+        }
+        if (!@rename($workDir, $targetDir)) {
+            throw new \RuntimeException("Could not move {$workDir} to {$targetDir}");
+        }
+    }
+
+    /**
+     * Folder of a study copied by a run that stopped before recording it,
+     * found by the StudyInstanceUID in its provenance sidecar.
+     */
+    private function _dirFromProvenance(string $studyUid): ?string
+    {
+        foreach (glob($this->_studyRoot() . '/*' . self::PROVENANCE_SUFFIX) ?: [] as $sidecar) {
+            $data = json_decode((string) @file_get_contents($sidecar), true);
+            if (($data['study_instance_uid'] ?? null) === $studyUid) {
+                $dir = substr($sidecar, 0, -strlen(self::PROVENANCE_SUFFIX));
+                return basename($dir);
+            }
+        }
+        return null;
+    }
+
+    /** Work folders left by a run that stopped: never finished, so removed. */
+    private function _clearWorkDirs(): void
+    {
+        foreach (glob($this->_studyRoot() . '/.*' . self::WORK_SUFFIX, GLOB_ONLYDIR) ?: [] as $dir) {
+            if ($this->_deleteTree($dir)) {
+                $this->_info('  Removed unfinished copy of an earlier run: ' . basename($dir));
+            }
+        }
+    }
+
     private function _copyTree(string $source, string $target): void
     {
         // Start from an empty target: a re-mapped study may have lost files

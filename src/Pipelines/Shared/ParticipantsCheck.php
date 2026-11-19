@@ -30,9 +30,10 @@ declare(strict_types=1);
 
 namespace LORIS\Pipelines\Shared;
 
-use LORIS\Endpoints\LorisApiClientAdapter;
 
 use LORIS\Utils\Dob;
+use LORIS\Utils\Sex;
+use LORIS\Utils\VisitLabel;
 
 final class ParticipantsCheck
 {
@@ -128,7 +129,7 @@ final class ParticipantsCheck
             $row = $roster?->get('sub-' . $subject) ?? $roster?->get($subject);
             if ($row !== null) {
                 $sex = (string) ($row['sex'] ?? '');
-                if (LorisApiClientAdapter::normaliseSexValue($sex, $projectConfig['sex_mappings'] ?? []) === null) {
+                if (Sex::normalize($sex, $projectConfig['sex_mappings'] ?? []) === null) {
                     $issues[] = ['scope' => 'subject', 'subject' => $subject,
                         'message' => "sub-{$subject}: sex '{$sex}' cannot be mapped to Male, Female or Other"
                             . ' - fix it, or add it to project.json sex_mappings'];
@@ -162,6 +163,10 @@ final class ParticipantsCheck
             try {
                 $declaredRaw = array_values(array_map('strval', (array) $visitLabels()));
                 $declared    = array_map('strtolower', $declaredRaw);
+                // The ses- folder must be a declared visit exactly (LORIS\Utils\VisitLabel);
+                // visit_mappings only feeds the rename hint.
+                $visitCfg    = [VisitLabel::VISITS_KEY => $declaredRaw]
+                    + array_intersect_key($projectConfig, [VisitLabel::MAPPINGS_KEY => true]);
                 $seen        = [];
                 $unlisted    = [];
                 foreach ($sessions as $subject => $visits) {
@@ -170,19 +175,20 @@ final class ParticipantsCheck
                             continue;
                         }
                         $seen[$session] = true;
-                        if ($declared !== [] && !in_array(strtolower($session), $declared, true)) {
+                        if ($declared !== [] && VisitLabel::resolve($session, $visitCfg) === null) {
                             $unlisted[$session][] = "sub-{$subject}";
                         }
                     }
                 }
                 foreach ($unlisted as $session => $subjects) {
+                    $hint = VisitLabel::hint($session, $visitCfg);
                     $warnings[] = sprintf(
-                        "visit '%s' (%s) is not in project.json \"visits\" (%s) - its studies are held back "
-                        . '(not ingested; the rest go in). Fix the ses- folder name, or add the visit to "visits" '
-                        . '(and set it up in LORIS), then re-run',
-                        $session,
+                        '%s (%s) - VISIT MISMATCH, its data is held back (not ingested; the rest go in). %s, then re-run',
+                        (string) VisitLabel::problem($session, $visitCfg),
                         implode(', ', array_slice($subjects, 0, 5)) . (count($subjects) > 5 ? ', ...' : ''),
-                        implode(', ', $declaredRaw)
+                        $hint !== null
+                            ? "Rename the ses-{$session} folder (and its sessions.tsv session_id) to ses-{$hint}"
+                            : 'Fix the ses- folder name, or add the visit to project.json "visits" (and set it up in LORIS)'
                     );
                 }
                 if ($declared === [] && $seen !== []) {
@@ -194,6 +200,11 @@ final class ParticipantsCheck
             } catch (\Throwable $e) {
                 $issues[] = ['scope' => 'project', 'message' => 'cannot read the project visits: ' . $e->getMessage()];
             }
+        }
+
+        // --- values normalised that the site should correct (clinical-style notes)
+        foreach ($roster?->notes() ?? [] as $note) {
+            $warnings[] = $note;
         }
 
         // --- rows with no data in this delivery -------------------------------
